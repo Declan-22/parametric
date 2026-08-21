@@ -23,18 +23,11 @@ actions!(
         ZoomIn,
         ZoomOut,
         ZoomToFit,
-        // Object
-        GroupObjects,
-        UngroupObjects,
-        TransformObjects,
         // Arrange
         BringToFront,
         BringForward,
         SendBackward,
         SendToBack,
-        // Constraints
-        AddConstraint,
-        ToggleConstraintsPanel,
         // Help
         ShowKeybindings,
         About,

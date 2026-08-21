@@ -91,29 +91,12 @@ pub fn default_menus() -> Vec<Menu> {
             ],
         },
         Menu {
-            label: "Object".into(),
-            items: vec![
-                MenuItem::entry("Group", GroupObjects).shortcut("Ctrl+G"),
-                MenuItem::entry("Ungroup", UngroupObjects).shortcut("Ctrl+Shift+G"),
-                MenuItem::separator(),
-                MenuItem::entry("Transform…", TransformObjects),
-            ],
-        },
-        Menu {
             label: "Arrange".into(),
             items: vec![
                 MenuItem::entry("Bring to Front", BringToFront).shortcut("]"),
                 MenuItem::entry("Bring Forward", BringForward).shortcut("["),
                 MenuItem::entry("Send Backward", SendBackward).shortcut("Ctrl+["),
                 MenuItem::entry("Send to Back", SendToBack).shortcut("Ctrl+]"),
-            ],
-        },
-        Menu {
-            label: "Constraints".into(),
-            items: vec![
-                MenuItem::entry("Add Constraint…", AddConstraint),
-                MenuItem::separator(),
-                MenuItem::entry("Toggle Constraints Panel", ToggleConstraintsPanel),
             ],
         },
         Menu {

@@ -1,3 +1,5 @@
+pub mod dropdown;
+
 use gpui::{Action, SharedString};
 
 use crate::ui::actions::*;

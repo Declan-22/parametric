@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use gpui::{App, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 
 use gpui_platform::application;
@@ -8,6 +10,7 @@ use crate::ui::shell::Shell;
 
 pub fn run() {
     application().run(|cx: &mut App| {
+        load_fonts(cx);
         theme::init(cx);
         register_action_handlers(cx);
 
@@ -16,7 +19,7 @@ pub fn run() {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(960.), px(640.))),
+                window_min_size: Some(size(px(400.), px(200.))),
                 titlebar: Some(TitlebarOptions {
                     title: Some("Parametric".into()),
                     appears_transparent: true,
@@ -30,6 +33,16 @@ pub fn run() {
 
         cx.activate(true);
     });
+}
+
+fn load_fonts(cx: &mut App) {
+    let fonts: Vec<Cow<'static, [u8]>> = vec![
+        Cow::Borrowed(include_bytes!("../assets/fonts/Geist-VariableFont_wght.ttf")),
+        Cow::Borrowed(include_bytes!("../assets/fonts/DepartureMono-Regular.otf")),
+    ];
+    cx.text_system()
+        .add_fonts(fonts)
+        .expect("failed to load bundled fonts");
 }
 
 fn register_action_handlers(cx: &mut App) {

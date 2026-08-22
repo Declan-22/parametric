@@ -54,9 +54,9 @@ impl AppMenu {
             .px(px(PANEL_PADDING_X))
             .py(px(PANEL_PADDING_Y))
             .gap_y(px(ITEM_GAP))
-            .bg(rgb(t.bg_secondary))
+            .bg(rgb(t.bg_darker))
             .border_1()
-            .border_color(rgb(t.border_color))
+            .border_color(rgb(t.component_border_color))
             .rounded(px(8.))
             .shadow(vec![t.shadow_sm()])
             .opacity(opacity)
@@ -192,9 +192,9 @@ fn render_submenu(
         .px(px(PANEL_PADDING_X))
         .py(px(PANEL_PADDING_Y))
         .gap_y(px(ITEM_GAP))
-        .bg(rgb(t.bg_secondary))
+        .bg(rgb(t.bg_darker))
         .border_1()
-        .border_color(rgb(t.border_color))
+        .border_color(rgb(t.component_border_color))
         .rounded(px(8.))
         .shadow(vec![t.shadow_sm()])
         .opacity(opacity)
@@ -224,7 +224,7 @@ fn render_item(
             .h(px(1.))
             .mx(px(10.))
             .my(px(5.))
-            .bg(rgb(t.border_color))
+            .bg(rgb(t.component_border_color))
             .into_any_element(),
         MenuItem::Entry(entry) => {
             let action = entry.action.boxed_clone();
@@ -245,7 +245,7 @@ fn render_item(
                 .hover(move |s| {
                     s.bg(rgb(t.bg_tertiary))
                         .border_1()
-                        .border_color(rgb(t.border_color))
+                        .border_color(rgb(t.component_border_color))
                         .shadow(vec![t.shadow_sm()])
                 })
                 .on_click(move |_, window, cx| {

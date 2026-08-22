@@ -1,4 +1,4 @@
-use gpui::{App, BorrowAppContext, Global};
+use gpui::{App, BorrowAppContext, Global, WindowAppearance};
 
 use super::theme::{Theme, ThemeMode};
 
@@ -10,9 +10,16 @@ pub struct ThemeState {
 impl Global for ThemeState {}
 
 pub fn init(cx: &mut App) {
+    let mode = match cx.window_appearance() {
+        WindowAppearance::Dark | WindowAppearance::VibrantDark => ThemeMode::Dark,
+        WindowAppearance::Light | WindowAppearance::VibrantLight => ThemeMode::Light,
+    };
     cx.set_global(ThemeState {
-        mode: ThemeMode::Dark,
-        theme: Theme::dark(),
+        mode,
+        theme: match mode {
+            ThemeMode::Light => Theme::light(),
+            ThemeMode::Dark => Theme::dark(),
+        },
     });
 }
 

@@ -1,5 +1,5 @@
 use gpui::{
-    AnyElement, App, MouseButton, WeakEntity, Window, WindowControlArea, div, prelude::*, px, rgb,
+    AnyElement, App, MouseButton, WeakEntity, Window, WindowControlArea, div, prelude::*, px, rgb, rgba,
     svg,
 };
 
@@ -37,7 +37,7 @@ impl RenderOnce for TitleBar {
             .flex()
             .flex_row()
             .items_stretch()
-            .bg(rgb(t.bg_darker))
+            .bg(rgb(t.bg_primary))
             .border_b_1()
             .border_color(rgb(t.component_border_color))
             // Clicking anywhere else on the title bar dismisses the menu.
@@ -70,8 +70,11 @@ impl RenderOnce for TitleBar {
 fn render_menu_button(menu_open: bool, animation: f32, t: Theme, shell: WeakEntity<Shell>) -> AnyElement {
     // Fade between idle and active styling as the menu opens / closes.
     let k = animation.clamp(0., 1.);
-    let bg = lerp_color(t.bg_darker, t.bg_primary, k);
+    let bg = lerp_color(t.bg_primary, t.bg_secondary, k);
     let icon_color = lerp_color(t.empty_text_primary, t.text_secondary, k);
+    // Shadow fades in alongside the rest of the active styling.
+    let mut shadow = t.shadow_sm();
+    shadow.color = rgba(fade_in(t.item_shadow_color, k)).into();
 
     div()
         .id("app-menu-button")
@@ -83,7 +86,10 @@ fn render_menu_button(menu_open: bool, animation: f32, t: Theme, shell: WeakEnti
         .rounded(px(6.))
         .cursor_pointer()
         .bg(rgb(bg))
-        .hover(move |s| s.bg(rgb(t.bg_primary)))
+        .shadow(vec![shadow])
+        .hover(move |s| {
+            s.bg(rgb(t.bg_secondary)).shadow(vec![t.shadow_sm()])
+        })
         .on_mouse_down(MouseButton::Left, move |_, _, cx| {
             let _ = shell.update(cx, |shell, cx| {
                 shell.toggle_menu(cx);
@@ -98,6 +104,13 @@ fn render_menu_button(menu_open: bool, animation: f32, t: Theme, shell: WeakEnti
                 .text_color(rgb(icon_color)),
         )
         .into_any_element()
+}
+
+// Fades an RGBA color in from fully transparent, preserving its target alpha.
+// GPUI colors are 0xRRGGBBAA — alpha lives in the low byte.
+fn fade_in(color: u32, k: f32) -> u32 {
+    let a = ((color & 0xFF) as f32 * k).round() as u32;
+    (color & 0xFFFFFF00) | a
 }
 
 fn lerp_color(from: u32, to: u32, k: f32) -> u32 {

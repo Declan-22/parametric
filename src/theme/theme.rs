@@ -4,6 +4,9 @@ use gpui::{BoxShadow, Point, px, rgba};
 pub const FONT_UI: &str = "Geist";
 pub const FONT_MONO: &str = "Departure Mono";
 
+// Accent color for interactive indicators (selection outlines, handles).
+pub const ACCENT: u32 = 0x4C8DFF;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThemeMode {
     Light,

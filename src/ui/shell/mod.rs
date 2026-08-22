@@ -5,8 +5,11 @@ use gpui::{Context, MouseButton, Point, Window, div, prelude::*, px, rgb};
 use crate::theme::{self, ThemeState};
 pub mod title_bar;
 
+use crate::editor::Editor;
+use crate::ui::canvas::CanvasView;
 use crate::ui::menu::dropdown::AppMenu;
 use crate::ui::shell::title_bar::{TITLE_BAR_HEIGHT, TitleBar};
+use crate::ui::toolbar::Toolbar;
 
 pub struct Shell {
     pub(crate) menu_open: bool,
@@ -15,10 +18,28 @@ pub struct Shell {
     pub(crate) icon_animation: f32,
     pub(crate) cursor_trail: Vec<(Point<gpui::Pixels>, Instant)>,
     pub(crate) hovered_entry: Option<usize>,
+    pub(crate) editor: gpui::Entity<Editor>,
 }
 
 impl Shell {
     pub fn new(cx: &mut Context<Self>) -> Self {
+        let mut editor = Editor::new();
+        // Demo content until the create tool exists.
+        let layer = editor.doc.layers[0].id;
+        editor.create_shape(
+            layer,
+            crate::core::document::ShapeKind::Rectangle,
+            crate::core::geometry::Point2::new(40., 40.),
+            crate::core::geometry::Point2::new(240., 160.),
+        );
+        editor.create_shape(
+            layer,
+            crate::core::document::ShapeKind::Ellipse,
+            crate::core::geometry::Point2::new(280., 40.),
+            crate::core::geometry::Point2::new(440., 200.),
+        );
+        let editor = cx.new(|_| editor);
+
         cx.observe_global::<ThemeState>(|_, cx| cx.notify())
             .detach();
         Self {
@@ -28,6 +49,7 @@ impl Shell {
             icon_animation: 0.0,
             cursor_trail: Vec::new(),
             hovered_entry: None,
+            editor,
         }
     }
 
@@ -141,7 +163,18 @@ impl Render for Shell {
                 icon_animation: self.icon_animation,
                 shell: cx.entity().downgrade(),
             })
-            .child(div().flex_1())
+            .child(
+                div()
+                    .flex_1()
+                    .relative()
+                    .overflow_hidden()
+                    .child(CanvasView {
+                        editor: self.editor.downgrade(),
+                    })
+                    .child(Toolbar {
+                        editor: self.editor.downgrade(),
+                    }),
+            )
             .when(self.menu_open, |d| {
                 let shell = cx.entity().downgrade();
                 d.child(

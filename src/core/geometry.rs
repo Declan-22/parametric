@@ -49,6 +49,14 @@ impl Rect {
             && p.y >= self.origin.y
             && p.y <= self.origin.y + self.size.h
     }
+
+    // Bounds of two opposite corners, normalized to positive width/height.
+    pub fn from_points(a: Point2, b: Point2) -> Self {
+        Self {
+            origin: Point2::new(a.x.min(b.x), a.y.min(b.y)),
+            size: Size2::new((a.x - b.x).abs(), (a.y - b.y).abs()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

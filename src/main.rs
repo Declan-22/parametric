@@ -2,6 +2,7 @@ mod app;
 mod core;
 mod editor;
 mod persistence;
+
 mod theme;
 mod ui;
 

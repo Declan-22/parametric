@@ -180,8 +180,10 @@ impl Editor {
         if self.pan_delta(cursor) {
             return true;
         }
-        if let Some(pending) = &mut self.pending_shape {
-            pending.cursor = self.cursor_doc(cursor);
+        if self.pending_shape.is_some() {
+            let cursor_doc = self.cursor_doc(cursor);
+            let pending = self.pending_shape.as_mut().unwrap();
+            pending.cursor = cursor_doc;
             pending.proportional = shift;
             return true;
         }

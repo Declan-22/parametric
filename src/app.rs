@@ -4,14 +4,18 @@ use gpui::{App, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions
 
 use gpui_platform::application;
 
-use crate::theme;
+use crate::persistence::registry::Registry;
+use crate::theme::{self, ThemeMode};
 use crate::ui::actions::*;
 use crate::ui::shell::Shell;
+
+const PREF_THEME: &str = "theme";
 
 pub fn run() {
     application().run(|cx: &mut App| {
         load_fonts(cx);
-        theme::init(cx);
+        init_registry(cx);
+        theme::init(cx, saved_theme_mode(cx));
         register_action_handlers(cx);
 
         let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
@@ -47,5 +51,33 @@ fn load_fonts(cx: &mut App) {
 
 fn register_action_handlers(cx: &mut App) {
     cx.on_action(|_: &Quit, cx| cx.quit());
-    cx.on_action(|_: &ToggleTheme, cx| theme::toggle(cx));
+    cx.on_action(|_: &ToggleTheme, cx| {
+        theme::toggle(cx);
+        // Persist the choice so it survives restarts.
+        let mode = match theme::mode(cx) {
+            ThemeMode::Light => "light",
+            ThemeMode::Dark => "dark",
+        };
+        if let Some(reg) = cx.try_global::<Registry>() {
+            reg.pref_set(PREF_THEME, mode);
+        }
+    });
+}
+
+fn init_registry(cx: &mut App) {
+    match Registry::open_default() {
+        Ok(reg) => {
+            cx.set_global(reg);
+        }
+        Err(e) => eprintln!("failed to open app registry: {e}"),
+    }
+}
+
+fn saved_theme_mode(cx: &App) -> Option<ThemeMode> {
+    cx.try_global::<Registry>()
+        .and_then(|reg| reg.pref_get(PREF_THEME))
+        .map(|v| match v.as_str() {
+            "light" => ThemeMode::Light,
+            _ => ThemeMode::Dark,
+        })
 }

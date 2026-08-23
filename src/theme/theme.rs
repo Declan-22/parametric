@@ -1,11 +1,30 @@
-use super::colors::*;
-use gpui::{BoxShadow, Point, px, rgba};
+use super::colors::*;use gpui::{BoxShadow, Point, px, rgba};
 
 pub const FONT_UI: &str = "Geist";
 pub const FONT_MONO: &str = "Departure Mono";
 
 // Accent color for interactive indicators (selection outlines, handles).
 pub const ACCENT: u32 = 0x4C8DFF;
+
+// Fades an RGBA color's alpha byte in from transparent (0xRRGGBBAA colors).
+pub fn fade_in(color: u32, k: f32) -> u32 {
+    let a = ((color & 0xFF) as f32 * k).round() as u32;
+    (color & 0xFFFFFF00) | a
+}
+
+// Linear blend of two 0xRRGGBB colors (alpha untouched).
+pub fn lerp_rgb(from: u32, to: u32, k: f32) -> u32 {
+    let ch = |c: u32, shift: u32| ((c >> shift) & 0xFF) as f32;
+    let mix = |shift: u32| (ch(from, shift) + (ch(to, shift) - ch(from, shift)) * k).round() as u32;
+    (mix(16) << 16) | (mix(8) << 8) | mix(0)
+}
+
+// Linear blend of two 0xRRGGBBAA colors including the alpha byte.
+pub fn lerp_rgba(from: u32, to: u32, k: f32) -> u32 {
+    let ch = |c: u32, shift: u32| ((c >> shift) & 0xFF) as f32;
+    let mix = |shift: u32| (ch(from, shift) + (ch(to, shift) - ch(from, shift)) * k).round() as u32;
+    (mix(24) << 24) | lerp_rgb(from & 0xFFFFFF, to & 0xFFFFFF, k)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThemeMode {
@@ -31,6 +50,10 @@ pub struct Theme {
 
     pub shadow_color: u32,
     pub item_shadow_color: u32,
+
+    pub button_background: u32,
+    pub button_text: u32,
+    pub button_border_color: u32,
 }
 
 impl Theme {
@@ -80,6 +103,10 @@ impl Theme {
 
             shadow_color: LIGHT_SHADOW_COLOR,
             item_shadow_color: LIGHT_ITEM_SHADOW_COLOR,
+
+            button_background: LIGHT_BUTTON_BACKGROUND,
+            button_text: LIGHT_BUTTON_TEXT,
+            button_border_color: LIGHT_BUTTON_BORDER_COLOR,
         }
     }
 
@@ -101,6 +128,10 @@ impl Theme {
 
             shadow_color: DARK_SHADOW_COLOR,
             item_shadow_color: DARK_ITEM_SHADOW_COLOR,
+
+            button_background: DARK_BUTTON_BACKGROUND,
+            button_text: DARK_BUTTON_TEXT,
+            button_border_color: DARK_BUTTON_BORDER_COLOR,
         }
     }
 }

@@ -57,6 +57,18 @@ impl Rect {
             size: Size2::new((a.x - b.x).abs(), (a.y - b.y).abs()),
         }
     }
+
+    // Smallest rect containing both.
+    pub fn union(&self, other: &Rect) -> Rect {
+        let min_x = self.origin.x.min(other.origin.x);
+        let min_y = self.origin.y.min(other.origin.y);
+        let max_x = (self.origin.x + self.size.w).max(other.origin.x + other.size.w);
+        let max_y = (self.origin.y + self.size.h).max(other.origin.y + other.size.h);
+        Self {
+            origin: Point2::new(min_x, min_y),
+            size: Size2::new(max_x - min_x, max_y - min_y),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

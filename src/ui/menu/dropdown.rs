@@ -35,17 +35,19 @@ impl RenderOnce for AppMenu {
             .absolute()
             .top(px(TITLE_BAR_HEIGHT as f32 + 2.0))
             .left(px(MENU_LEFT))
-            .child(self.render_panel(&menus, t, opacity))
+            .child(self.render_panel(&menus, t, opacity, cx))
             .children(
                 self.active
                     .and_then(|i| menus.get(i).map(|menu| (i, menu)))
-                    .map(|(i, menu)| render_submenu(i, menu, t, opacity, self.shell.clone())),
+                    .map(|(i, menu)| {
+                        render_submenu(i, menu, t, opacity, self.shell.clone(), cx)
+                    }),
             )
     }
 }
 
 impl AppMenu {
-    fn render_panel(&self, menus: &[Menu], t: Theme, opacity: f32) -> impl IntoElement {
+    fn render_panel(&self, menus: &[Menu], t: Theme, opacity: f32, cx: &App) -> impl IntoElement {
         div()
             .occlude()
             .w(px(PANEL_WIDTH))
@@ -71,13 +73,27 @@ impl AppMenu {
                 menus
                     .iter()
                     .enumerate()
-                    .map(|(i, menu)| self.render_entry(i, menu, t)),
+                    .map(|(i, menu)| self.render_entry(i, menu, t, cx)),
             )
     }
 
-    fn render_entry(&self, index: usize, menu: &Menu, t: Theme) -> impl IntoElement {
+    fn render_entry(&self, index: usize, menu: &Menu, t: Theme, cx: &App) -> impl IntoElement {
+        use crate::theme::{fade_in, lerp_rgb};
+
         let is_active = self.active == Some(index);
         let shell = self.shell.clone();
+
+        // Hover tween blended over the active state.
+        let hov = shell
+            .upgrade()
+            .map(|s| s.read(cx).fade(&format!("menu-entry-{index}")))
+            .unwrap_or(0.0);
+        let k = hov.max(if is_active { 1.0 } else { 0.0 });
+        let bg = lerp_rgb(t.bg_darker, t.bg_tertiary, k);
+        // Alpha-only fade: lerping RGB from black causes a dark flash.
+        let border = fade_in((t.border_color << 8) | 0xFF, k);
+        let mut shadow = t.shadow_sm();
+        shadow.color = rgba(fade_in(t.item_shadow_color, k)).into();
 
         div()
             .id(SharedString::from(format!("app-menu-entry-{index}")))
@@ -90,24 +106,21 @@ impl AppMenu {
             .text_sm()
             .text_color(rgb(t.text_primary))
             .cursor_pointer()
+            .bg(rgb(bg))
             .border_1()
-            .border_color(rgba(0x00000000))
-            .hover(move |s| {
-                s.bg(rgb(t.bg_tertiary))
-                    .border_1()
-                    .border_color(rgb(t.border_color))
-                    .shadow(vec![t.shadow_sm()])
-            })
-            .when(is_active, |d| {
-                d.bg(rgb(t.bg_tertiary))
-                    .border_1()
-                    .border_color(rgb(t.border_color))
-                    .shadow(vec![t.shadow_sm()])
-            })
+            .border_color(rgba(border))
+            .shadow(vec![shadow])
             .on_hover(move |hovered, window, cx| {
                 let cursor = window.mouse_position();
+                // Drive the hover fade tween alongside the menu-aim logic.
+                let fade_target = if *hovered { 1.0 } else { 0.0 };
                 let mut suppressed = false;
                 let _ = shell.update(cx, |shell, cx| {
+                    shell.animate_fade(
+                        &format!("menu-entry-{index}"),
+                        fade_target,
+                        cx,
+                    );
                     shell.record_cursor(cursor);
                     shell.hovered_entry = if *hovered {
                         Some(index)
@@ -178,6 +191,7 @@ fn render_submenu(
     t: Theme,
     opacity: f32,
     shell: WeakEntity<Shell>,
+    cx: &App,
 ) -> impl IntoElement {
     let placement = submenu_placement(index, menu);
 
@@ -209,7 +223,7 @@ fn render_submenu(
             menu.items
                 .iter()
                 .enumerate()
-                .map(|(i, item)| render_item(item, i, t, shell.clone())),
+                .map(|(i, item)| render_item(item, i, t, shell.clone(), cx)),
         )
 }
 
@@ -218,7 +232,10 @@ fn render_item(
     index: usize,
     t: Theme,
     shell: WeakEntity<Shell>,
+    cx: &App,
 ) -> impl IntoElement {
+    use crate::theme::{fade_in, lerp_rgb};
+
     match item {
         MenuItem::Separator => div()
             .h(px(1.))
@@ -228,6 +245,15 @@ fn render_item(
             .into_any_element(),
         MenuItem::Entry(entry) => {
             let action = entry.action.boxed_clone();
+            let k = shell
+                .upgrade()
+                .map(|s| s.read(cx).fade(&format!("submenu-{index}")))
+                .unwrap_or(0.0);
+            let bg = lerp_rgb(t.bg_darker, t.bg_tertiary, k);
+            let border = fade_in((t.border_color << 8) | 0xFF, k);
+            let mut shadow = t.shadow_sm();
+            shadow.color = rgba(fade_in(t.item_shadow_color, k)).into();
+
             div()
                 .id(SharedString::from(format!("submenu-item-{index}")))
                 .flex()
@@ -240,13 +266,21 @@ fn render_item(
                 .text_sm()
                 .text_color(rgb(t.text_primary))
                 .cursor_pointer()
+                .bg(rgb(bg))
                 .border_1()
-                .border_color(rgba(0x00000000))
-                .hover(move |s| {
-                    s.bg(rgb(t.bg_tertiary))
-                        .border_1()
-                        .border_color(rgb(t.component_border_color))
-                        .shadow(vec![t.shadow_sm()])
+                .border_color(rgba(border))
+                .shadow(vec![shadow])
+                .on_hover({
+                    let shell = shell.clone();
+                    move |hovered, _, cx| {
+                        let _ = shell.update(cx, |shell, cx| {
+                            shell.animate_fade(
+                                &format!("submenu-{index}"),
+                                if *hovered { 1.0 } else { 0.0 },
+                                cx,
+                            );
+                        });
+                    }
                 })
                 .on_click(move |_, window, cx| {
                     window.dispatch_action(action.boxed_clone(), cx);
@@ -347,3 +381,6 @@ fn point_in_triangle(
     const TOL: f32 = 0.04;
     l1 >= -TOL && l2 >= -TOL && l3 >= -TOL
 }
+
+
+

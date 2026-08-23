@@ -9,11 +9,11 @@ pub struct ThemeState {
 
 impl Global for ThemeState {}
 
-pub fn init(cx: &mut App) {
-    let mode = match cx.window_appearance() {
+pub fn init(cx: &mut App, saved: Option<ThemeMode>) {
+    let mode = saved.unwrap_or_else(|| match cx.window_appearance() {
         WindowAppearance::Dark | WindowAppearance::VibrantDark => ThemeMode::Dark,
         WindowAppearance::Light | WindowAppearance::VibrantLight => ThemeMode::Light,
-    };
+    });
     cx.set_global(ThemeState {
         mode,
         theme: match mode {

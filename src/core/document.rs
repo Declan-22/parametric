@@ -65,6 +65,25 @@ impl Document {
         self.shapes.get(id).map(|s| s.kind)
     }
 
+    // Moves both corner points so the shape's bounds become `new_bounds`.
+    pub fn set_shape_corners(&mut self, id: ShapeId, new_bounds: Rect) -> bool {
+        let corners = match self.shapes.get(id) {
+            Some(s) => s.corners,
+            None => return false,
+        };
+        let a = Point2::new(
+            new_bounds.origin.x,
+            new_bounds.origin.y,
+        );
+        let b = Point2::new(
+            new_bounds.origin.x + new_bounds.size.w,
+            new_bounds.origin.y + new_bounds.size.h,
+        );
+        self.points.set(corners[0], a.clamped());
+        self.points.set(corners[1], b.clamped());
+        true
+    }
+
     // Translates both corner points of a shape by delta.
     pub fn translate_shape(&mut self, id: ShapeId, delta: Point2) -> bool {
         let corners = match self.shapes.get(id) {

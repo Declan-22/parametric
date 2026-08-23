@@ -201,6 +201,54 @@ impl Database {
         let _ = self.conn.execute_batch("COMMIT");
     }
 
+    // -- saving --
+
+    // Full-document save: wipes and rewrites all content in one transaction.
+    // Called on session end / view switch; fine-grained op-stream autosave
+    // comes later via the writer thread.
+    pub fn save_document(&self, doc: &Document) -> rusqlite::Result<()> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            self.conn.execute_batch(
+                "DELETE FROM constraints;
+                 DELETE FROM shapes;
+                 DELETE FROM points;
+                 DELETE FROM layers;",
+            )?;
+            for (index, layer) in doc.layers.iter().enumerate() {
+                self.conn.execute(
+                    "INSERT INTO layers(id, name, order_index) VALUES(?1, ?2, ?3)",
+                    rusqlite::params![layer.id as i64, layer.name, index as i64],
+                )?;
+                for &sid in &layer.shape_ids {
+                    // Arena slots aren't stored, so re-materialize each shape's
+                    // corners as fresh point rows.
+                    let Some(bounds) = doc.shape_bounds(sid) else {
+                        continue;
+                    };
+                    let Some(kind) = doc.shape_kind(sid) else {
+                        continue;
+                    };
+                    let p1 = self.insert_point(bounds.origin)?;
+                    let p2 = self.insert_point(Point2::new(
+                        bounds.origin.x + bounds.size.w,
+                        bounds.origin.y + bounds.size.h,
+                    ))?;
+                    self.insert_shape(layer.id, kind, [p1, p2])?;
+                }
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => self.conn.execute_batch("COMMIT")?,
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
     pub fn load_document(&self) -> rusqlite::Result<Document> {
         let mut doc = Document::new();
 
@@ -256,6 +304,8 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::constraints::{Constraint, ConstraintKind};
+    use crate::core::ids::PointId;
 
     #[test]
     fn roundtrip() {
@@ -287,5 +337,37 @@ mod tests {
         };
         db.insert_constraint(c, [p1, p2]).unwrap();
         assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+    }
+
+    // Proves save_document -> load_document round-trips through a real file.
+    #[test]
+    fn save_load_file_roundtrip() {
+        let path = std::env::temp_dir().join(format!(
+            "parametric_test_{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let db = Database::open(path.to_str().unwrap()).unwrap();
+            let layer = db.insert_layer("Layer 1").unwrap();
+            let mut doc = Document::new();
+            doc.layers.push(Layer {
+                id: layer,
+                name: "Layer 1".into(),
+                shape_ids: Vec::new(),
+            });
+            let pa = doc.add_point(Point2::new(10., 20.));
+            let pb = doc.add_point(Point2::new(110., 120.));
+            doc.add_shape(layer, ShapeKind::Rectangle, [pa, pb]);
+            db.save_document(&doc).unwrap();
+        }
+        {
+            let db = Database::open(path.to_str().unwrap()).unwrap();
+            let doc = db.load_document().unwrap();
+            assert_eq!(doc.layers[0].shape_ids.len(), 1);
+            let b = doc.shape_bounds(doc.layers[0].shape_ids[0]).unwrap();
+            assert_eq!(b.size.w, 100.);
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }

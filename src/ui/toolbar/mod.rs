@@ -1,6 +1,6 @@
-use gpui::{App, IntoElement, MouseButton, RenderOnce, WeakEntity, Window, div, prelude::*, px, rgb, svg};
+use gpui::{App, IntoElement, MouseButton, RenderOnce, Window, div, prelude::*, px, rgb, rgba, svg};
 
-use crate::editor::{Editor, Tool};
+use crate::editor::Tool;
 use crate::theme::Theme;
 
 // Bottom toolbar: one centered row — mode tools (Move / Pan), a divider,
@@ -32,7 +32,8 @@ const ICON_ELLIPSE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1
 
 #[derive(IntoElement)]
 pub struct Toolbar {
-    pub editor: WeakEntity<Editor>,
+    pub editor: gpui::WeakEntity<crate::editor::Editor>,
+    pub shell: gpui::WeakEntity<crate::ui::shell::Shell>,
 }
 
 impl RenderOnce for Toolbar {
@@ -64,11 +65,11 @@ impl RenderOnce for Toolbar {
                     .border_1()
                     .border_color(rgb(t.component_border_color))
                     .shadow(vec![t.shadow_sm()])
-                    .child(self.tool_button(Tool::Move, ICON_MOVE, active_tool, t))
-                    .child(self.tool_button(Tool::Pan, ICON_PAN, active_tool, t))
+                    .child(self.tool_button(Tool::Move, ICON_MOVE, active_tool, t, cx))
+                    .child(self.tool_button(Tool::Pan, ICON_PAN, active_tool, t, cx))
                     .child(divider(t))
-                    .child(self.tool_button(Tool::Rectangle, ICON_RECTANGLE, active_tool, t))
-                    .child(self.tool_button(Tool::Ellipse, ICON_ELLIPSE, active_tool, t)),
+                    .child(self.tool_button(Tool::Rectangle, ICON_RECTANGLE, active_tool, t, cx))
+                    .child(self.tool_button(Tool::Ellipse, ICON_ELLIPSE, active_tool, t, cx)),
             )
     }
 }
@@ -80,10 +81,29 @@ impl Toolbar {
         icon: &'static [u8],
         active_tool: Tool,
         t: Theme,
+        cx: &gpui::App,
     ) -> impl IntoElement {
+        use crate::theme::{fade_in, lerp_rgb};
+
         let editor = self.editor.clone();
         let is_active = active_tool == tool;
+        // Hover tween: idle bg_secondary -> hover bg_primary + shadow.
+        let key = format!("tb-{}", tool_debug_name(tool));
+        let k = if is_active {
+            1.0
+        } else {
+            self.shell
+                .upgrade()
+                .map(|s| s.read(cx).fade(&key))
+                .unwrap_or(0.0)
+        };
+        let bg = lerp_rgb(t.bg_secondary, t.bg_primary, k);
+        let border = fade_in((t.border_color << 8) | 0xFF, k);
+        let mut shadow = t.shadow_sm();
+        shadow.color = gpui::rgba(fade_in(t.item_shadow_color, k)).into();
+        let icon_color = lerp_rgb(t.text_secondary, t.text_primary, k.max(if is_active { 1.0 } else { 0.0 }));
 
+        let shell_hover = self.shell.clone();
         div()
             .id(tool_debug_name(tool))
             .w(px(30.))
@@ -93,15 +113,14 @@ impl Toolbar {
             .flex()
             .items_center()
             .justify_center()
-            // Idle and hover states.
-            .when(is_active, |d| {
-                d.bg(rgb(t.bg_tertiary))
-                    .border_1()
-                    .border_color(rgb(t.border_color))
-                    .shadow(vec![t.shadow_sm()])
-            })
-            .when(!is_active, |d| {
-                d.bg(rgb(t.bg_secondary)).hover(move |s| s.bg(rgb(t.bg_primary)))
+            .bg(rgb(bg))
+            .border_1()
+            .border_color(rgba(border))
+            .shadow(vec![shadow])
+            .on_hover(move |hovered, _, cx| {
+                let _ = shell_hover.update(cx, |shell, cx| {
+                    shell.animate_fade(&key, if *hovered { 1.0 } else { 0.0 }, cx);
+                });
             })
             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                 let _ = editor.update(cx, |ed, cx| {
@@ -110,17 +129,7 @@ impl Toolbar {
                     }
                 });
             })
-            .child(
-                svg()
-                    .data(icon)
-                    .w(px(15.))
-                    .h(px(15.))
-                    .text_color(rgb(if is_active {
-                        t.text_primary
-                    } else {
-                        t.text_secondary
-                    })),
-            )
+            .child(svg().data(icon).w(px(15.)).h(px(15.)).text_color(rgb(icon_color)))
     }
 }
 
@@ -136,3 +145,7 @@ fn tool_debug_name(tool: Tool) -> &'static str {
         Tool::Ellipse => "tool-ellipse",
     }
 }
+
+
+
+

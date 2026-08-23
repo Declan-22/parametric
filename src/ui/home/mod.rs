@@ -112,7 +112,7 @@ impl RenderOnce for DesignCard {
                 let t = *crate::theme::active(cx);
                 match shell.read(cx).thumb_snapshot(meta_id) {
                     Some((doc, camera)) => {
-                        paint::build_draw_list(&doc, &camera, bounds.size, t, None, None, None)
+                        paint::build_draw_list(&doc, &camera, bounds.size, t, None, None, None, &[])
                     }
                     None => Vec::new(),
                 }
@@ -131,6 +131,7 @@ impl RenderOnce for DesignCard {
                             }
                         }
                         paint::Primitive::Outline { bounds: _ } => {}
+                        paint::Primitive::Circle { .. } => {}
                         paint::Primitive::CornerHandle { .. } => {}
                     }
                 }

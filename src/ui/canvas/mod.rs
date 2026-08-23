@@ -45,7 +45,8 @@ impl RenderOnce for CanvasView {
             .on_modifiers_changed(move |e: &gpui::ModifiersChangedEvent, _, cx| {
                 let shift = e.modifiers.shift;
                 let _ = editor_mods.update(cx, |ed, cx| {
-                    if ed.shift != shift {
+                    if ed.alt_down != e.modifiers.alt || ed.shift != shift {
+                        ed.alt_down = e.modifiers.alt;
                         ed.shift = shift;
                         if let Some(c) = ed.last_cursor {
                             ed.canvas_drag(c, shift);
@@ -73,6 +74,7 @@ impl RenderOnce for CanvasView {
             .on_mouse_move(move |e: &MouseMoveEvent, _, cx| {
                 let shift = e.modifiers.shift;
                 let _ = editor_move.update(cx, |ed, cx| {
+                    ed.alt_down = e.modifiers.alt;
                     ed.update_dim_geom();
                     let mut changed = false;
                     // While idle, track which resize handle is under the
@@ -331,6 +333,7 @@ impl CanvasView {
                 pending,
                 ed.selection,
                 ed.dim_geom,
+                &ed.snap_guides,
             );
             (list, hitbox)
         };
@@ -360,6 +363,20 @@ impl CanvasView {
                             0.,
                             gpui::transparent_black(),
                             gpui::Edges::all(px(2.)),
+                            rgb(crate::theme::ACCENT),
+                            gpui::BorderStyle::Solid,
+                        ));
+                    }
+                    paint::Primitive::Circle { center, radius } => {
+                        let r = radius;
+                        window.paint_quad(gpui::quad(
+                            Bounds {
+                                origin: Point { x: center.x - r, y: center.y - r },
+                                size: Size { width: r * 2., height: r * 2. },
+                            },
+                            r,
+                            rgb(0xFFFFFF),
+                            gpui::Edges::all(px(1.)),
                             rgb(crate::theme::ACCENT),
                             gpui::BorderStyle::Solid,
                         ));
@@ -395,6 +412,8 @@ impl CanvasView {
 
 // Layout offset where the canvas starts below the title bar (for overlays).
 pub const CANVAS_TOP_INSET: Pixels = px(TITLE_BAR_HEIGHT);
+
+
 
 
 

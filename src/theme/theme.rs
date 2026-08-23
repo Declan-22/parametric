@@ -6,6 +6,9 @@ pub const FONT_MONO: &str = "Departure Mono";
 // Accent color for interactive indicators (selection outlines, handles).
 pub const ACCENT: u32 = 0x4C8DFF;
 
+// Snap indicator color (guides + snap marker) — distinct from accent.
+pub const SNAP: u32 = 0xFF9500;
+
 // Fades an RGBA color's alpha byte in from transparent (0xRRGGBBAA colors).
 pub fn fade_in(color: u32, k: f32) -> u32 {
     let a = ((color & 0xFF) as f32 * k).round() as u32;

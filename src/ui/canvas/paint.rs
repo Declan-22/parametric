@@ -26,6 +26,11 @@ pub enum Primitive {
     CornerHandle {
         center: Point<Pixels>,
     },
+    // Snap target marker: white circle, 1px accent outline.
+    Circle {
+        center: Point<Pixels>,
+        radius: Pixels,
+    },
 }
 
 const ELLIPSE_KAPPA: f32 = 0.552_284_75;
@@ -38,6 +43,7 @@ pub fn build_draw_list(
     pending: Option<(ShapeKind, Rect)>,
     selection: Option<crate::core::ids::ShapeId>,
     dim_geom: Option<crate::editor::DimGeom>,
+    snap_guides: &[crate::editor::SnapGuide],
 ) -> Vec<Primitive> {
     let min = camera.screen_to_unit(Point2::new(0., 0.));
     let max = camera.screen_to_unit(Point2::new(
@@ -68,6 +74,19 @@ pub fn build_draw_list(
         }
     }
 
+    // Snap feedback: just the marker circle on edge snaps � no guide lines.
+    for g in snap_guides {
+        if g.kind == crate::editor::SnapKind::Edge {
+            circle(
+                &mut list,
+                Point {
+                    x: px(g.to.x as f32),
+                    y: px(g.to.y as f32),
+                },
+                4.,
+            );
+        }
+    }
     // Selection overlay drawn AFTER every shape fill so nothing can cover
     // the outline, dimension lines, or handles.
     if let Some(sel) = selection
@@ -102,6 +121,14 @@ pub fn build_draw_list(
         }
     }
     list
+}
+
+// White-filled circle with a 1px accent outline (snap target marker).
+fn circle(list: &mut Vec<Primitive>, center: Point<Pixels>, r: f32) {
+    list.push(Primitive::Circle {
+        center,
+        radius: px(r),
+    });
 }
 
 fn overlaps(a: Rect, b: Rect) -> bool {
@@ -164,7 +191,7 @@ pub fn extension_offset(zoom: f64) -> f32 {
 }
 const DASH: f32 = 6.;
 const GAP: f32 = 4.;
-const LINE_W: f32 = 2.;
+const LINE_W: f32 = 1.;
 
 fn dashed_h(list: &mut Vec<Primitive>, x0: f32, x1: f32, y: f32, color: gpui::Background) {
     let (a, b) = if x0 <= x1 { (x0, x1) } else { (x1, x0) };
@@ -264,6 +291,8 @@ pub fn ellipse_path(center: Point<Pixels>, radii: Size<Pixels>) -> Option<Path<P
     b.close();
     b.build().ok()
 }
+
+
 
 
 

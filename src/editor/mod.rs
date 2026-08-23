@@ -103,14 +103,55 @@ pub struct Editor {
     // Selection dimension geometry, computed once per frame in screen space.
     // Single source of truth for both the painted lines and the label DOM.
     pub dim_geom: Option<DimGeom>,
+    // Active snap connections: from the dragged shape's key point to the
+    // matched target, rendered as segment + markers.
+    pub snap_guides: Vec<SnapGuide>,
     // Last known cursor + shift state, so modifier changes can re-derive
     // the pending drag/resize instantly.
     pub last_cursor: Option<gpui::Point<gpui::Pixels>>,
     pub shift: bool,
+    pub alt_down: bool,
     dragging: Option<SelectionDrag>,
     resizing: Option<ResizeState>,
     next_layer_id: u64,
     pan_start: Option<(gpui::Pixels, gpui::Pixels, Camera)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapKind {
+    Corner,
+    Midpoint,
+    Center,
+    Edge,
+}
+
+// A visual snap connection: what locked onto what. Edge snaps carry the
+// target's full span so rendering can trace the entire side.
+#[derive(Clone, Copy, Debug)]
+pub struct SnapGuide {
+    pub vertical: bool,
+    pub from: Point2,
+    pub to: Point2,
+    pub kind: SnapKind,
+    pub span_is_x: bool,
+    pub span_lo: f64,
+    pub span_hi: f64,
+}
+
+// One candidate location other shapes expose for snapping. Corners are
+// points; edges carry a span along their axis so any position along the
+// edge can snap (point-on-edge).
+#[derive(Clone, Copy, Debug)]
+pub struct SnapTarget {
+    pub x: f64,
+    pub y: f64,
+    pub kind: SnapKind,
+    pub snap_x: bool,
+    pub snap_y: bool,
+    pub has_span: bool,
+    pub span_lo: f64,
+    pub span_hi: f64,
+    pub span_is_x: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -141,8 +182,10 @@ impl Editor {
             selection: None,
             hover_handle: None,
             dim_geom: None,
+            snap_guides: Vec::new(),
             last_cursor: None,
             shift: false,
+            alt_down: false,
             dragging: None,
             resizing: None,
             next_layer_id: next_layer_id.max(2),
@@ -185,7 +228,8 @@ impl Editor {
                         Tool::Rectangle => ShapeKind::Rectangle,
                         _ => ShapeKind::Ellipse,
                     };
-                    let at = self.cursor_doc(cursor);
+                    let (at, guides) = self.snap_point(self.cursor_doc(cursor), None);
+                    self.snap_guides = guides;
                     self.pending_shape = Some(PendingShape {
                         kind,
                         start: at,
@@ -252,10 +296,16 @@ impl Editor {
         self.last_cursor = Some(cursor);
         self.shift = shift;
         if self.pan_delta(cursor) {
+            self.snap_guides.clear();
             return true;
         }
+        if self.pending_shape.is_none() && self.dragging.is_none() && self.resizing.is_none() {
+            self.snap_guides.clear();
+            return false;
+        }
         if self.pending_shape.is_some() {
-            let cursor_doc = self.cursor_doc(cursor);
+            let (cursor_doc, guides) = self.snap_point(self.cursor_doc(cursor), None);
+            self.snap_guides = guides;
             let pending = self.pending_shape.as_mut().unwrap();
             pending.cursor = cursor_doc;
             pending.proportional = shift;
@@ -273,18 +323,25 @@ impl Editor {
             if delta.x == 0. && delta.y == 0. {
                 return false;
             }
+            // Snap: try aligning any key point of the moving shape with a
+            // target; apply the smallest correction.
+            let (delta, guides) = self.snap_move_delta(drag.id, b, delta);
+            self.snap_guides = guides;
             return self.doc.translate_shape(drag.id, delta);
         }
         // Corner/side resize of the selection.
         if let Some(rs) = self.resizing {
             let p = self.cursor_doc(cursor);
+            // Snap the moving corner/edge to nearby targets.
+            let (sp, guides) = self.snap_point(p, Some(rs.id));
+            self.snap_guides = guides;
             let mut left = rs.orig.origin.x;
             let mut top = rs.orig.origin.y;
             let mut right = left + rs.orig.size.w;
             let mut bottom = top + rs.orig.size.h;
             const EPS: f64 = 1e-6;
-            let px_ = p.x;
-            let py_ = p.y;
+            let px_ = sp.x;
+            let py_ = sp.y;
             match rs.handle {
                 // West edge moves, east edge fixed.
                 Handle::Nw | Handle::W | Handle::Sw => {
@@ -354,6 +411,249 @@ impl Editor {
         Some((b.size.w, b.size.h))
     }
 
+    // -- snapping --
+
+    fn snap_tolerance(&self) -> f64 {
+        6.0 / self.camera.zoom
+    }
+
+    // Snapping is suppressed while Alt is held — the standard escape hatch
+    // when you want free placement.
+    fn snapping_active(&self) -> bool {
+        !self.alt_down
+    }
+
+    // All snap locations exposed by shapes other than `exclude`.
+    // Point targets (corners, center) offer both axes. Edge targets snap
+    // only their normal axis and require the point to lie within the
+    // edge's span on the other axis — that's what makes sides snappable.
+    fn snap_targets(&self, exclude: Option<ShapeId>) -> Vec<SnapTarget> {
+        let mut out = Vec::new();
+        for layer in &self.doc.layers {
+            for &sid in &layer.shape_ids {
+                if Some(sid) == exclude {
+                    continue;
+                }
+                let Some(b) = self.doc.shape_bounds(sid) else {
+                    continue;
+                };
+                let (l, t) = (b.origin.x, b.origin.y);
+                let (r, bm) = (l + b.size.w, t + b.size.h);
+                // Representative marker positions on each edge.
+                let mx = l + b.size.w / 2.;
+                let my = t + b.size.h / 2.;
+
+                // Point targets: corners.
+                for (x, y, k) in [
+                    (l, t, SnapKind::Corner),
+                    (r, t, SnapKind::Corner),
+                    (r, bm, SnapKind::Corner),
+                    (l, bm, SnapKind::Corner),
+                ] {
+                    out.push(SnapTarget {
+                        x,
+                        y,
+                        kind: k,
+                        snap_x: true,
+                        snap_y: true,
+                        has_span: false,
+                        span_lo: 0.,
+                        span_hi: 0.,
+                        span_is_x: false,
+                    });
+                }
+
+                // Edge targets: top/bottom edges snap Y within an X span;
+                // left/right edges snap X within a Y span.
+                for (x, y, sx, sy, lo, hi, is_x) in [
+                    (mx, t, false, true, l, r, true),
+                    (mx, bm, false, true, l, r, true),
+                    (l, my, true, false, t, bm, false),
+                    (r, my, true, false, t, bm, false),
+                ] {
+                    out.push(SnapTarget {
+                        x,
+                        y,
+                        kind: SnapKind::Edge,
+                        snap_x: sx,
+                        snap_y: sy,
+                        has_span: true,
+                        span_lo: lo,
+                        span_hi: hi,
+                        span_is_x: is_x,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    // Span constraint: the point must lie along the edge's axis range.
+    fn span_ok(t: &SnapTarget, p: Point2) -> bool {
+        if !t.has_span {
+            return true;
+        }
+        let (lo, hi) = (t.span_lo.min(t.span_hi), t.span_lo.max(t.span_hi));
+        if t.span_is_x {
+            p.x >= lo && p.x <= hi
+        } else {
+            p.y >= lo && p.y <= hi
+        }
+    }
+
+    // Snaps a point to the SINGLE best target. Edge targets match only on
+    // their normal axis while the point lies within their span; only axes
+    // that are genuinely close adjust, so one alignment = one guide and
+    // the other axis stays free.
+    fn snap_point(&self, p: Point2, exclude: Option<ShapeId>) -> (Point2, Vec<SnapGuide>) {
+        if !self.snapping_active() {
+            return (p, Vec::new());
+        }
+        let tol = self.snap_tolerance();
+        let targets = self.snap_targets(exclude);
+
+        let mut best: Option<(f64, f64, f64, bool, bool)> = None; // (score, x, y, hit_x, hit_y)
+        let mut best_kind = SnapKind::Corner;
+        let mut best_span = (false, 0., 0.);
+        for tgt in &targets {
+            let dx = tgt.x - p.x;
+            let dy = tgt.y - p.y;
+            let hit_x = tgt.snap_x && dx.abs() <= tol && Self::span_ok(tgt, p);
+            let hit_y = tgt.snap_y && dy.abs() <= tol && Self::span_ok(tgt, p);
+            if !hit_x && !hit_y {
+                continue;
+            }
+            let score = dx.abs() + dy.abs();
+            if best.map_or(true, |(s, _, _, _, _)| score < s) {
+                best = Some((score, tgt.x, tgt.y, hit_x, hit_y));
+                best_kind = tgt.kind;
+                best_span = (tgt.span_is_x, tgt.span_lo, tgt.span_hi);
+            }
+        }
+
+        let Some((_, tx, ty, hit_x, hit_y)) = best else {
+            return (p, Vec::new());
+        };
+        // Project the marker onto the actual snap location along edges.
+        let mut tx = tx;
+        let mut ty = ty;
+        if best_kind == SnapKind::Edge {
+            if !hit_x {
+                tx = p.x;
+            }
+            if !hit_y {
+                ty = p.y;
+            }
+        }
+        let is_edge = best_kind == SnapKind::Edge;
+        let mut out = p;
+        let mut guides = Vec::new();
+        if hit_x {
+            out.x = tx;
+            guides.push(SnapGuide {
+                vertical: true,
+                from: p,
+                to: Point2::new(tx, p.y),
+                kind: best_kind,
+                span_is_x: best_span.0,
+                span_lo: best_span.1,
+                span_hi: best_span.2,
+            });
+        }
+        if hit_y {
+            out.y = ty;
+            guides.push(SnapGuide {
+                vertical: false,
+                from: p,
+                to: Point2::new(p.x, ty),
+                kind: if is_edge { SnapKind::Edge } else { best_kind },
+                span_is_x: best_span.0,
+                span_lo: best_span.1,
+                span_hi: best_span.2,
+            });
+        }
+        (out, guides)
+    }
+
+    // Snaps a moving shape: tries each of its key points (corners + center)
+    // against the target set and applies the smallest correction to the
+    // motion delta. Guides run from the key point to the matched target.
+    fn snap_move_delta(&self, id: ShapeId, b: Rect, delta: Point2) -> (Point2, Vec<SnapGuide>) {
+        if !self.snapping_active() {
+            return (delta, Vec::new());
+        }
+        let tol = self.snap_tolerance();
+        let targets = self.snap_targets(Some(id));
+        let (l, t) = (b.origin.x, b.origin.y);
+        let keys = [
+            (l, t),
+            (l + b.size.w, t),
+            (l + b.size.w, t + b.size.h),
+            (l, t + b.size.h),
+        ];
+
+        let mut best: Option<(f64, usize, f64, f64)> = None; // (score, key_idx, dx, dy)
+        let mut best_kind = SnapKind::Corner;
+        let mut best_span = (false, 0., 0.);
+        for (ki, (kx, ky)) in keys.iter().enumerate() {
+            let px_ = kx + delta.x;
+            let py_ = ky + delta.y;
+            for tgt in &targets {
+                let dx = tgt.x - px_;
+                let dy = tgt.y - py_;
+                let hit_x = tgt.snap_x && dx.abs() <= tol;
+                let hit_y = tgt.snap_y && dy.abs() <= tol;
+                if !hit_x && !hit_y {
+                    continue;
+                }
+                if !Self::span_ok(tgt, Point2::new(px_, py_)) {
+                    continue;
+                }
+                let score = dx.abs() + dy.abs();
+                if best.map_or(true, |(s, _, _, _)| score < s) {
+                    best = Some((score, ki, dx, dy));
+                    best_kind = tgt.kind;
+                    best_span = (tgt.span_is_x, tgt.span_lo, tgt.span_hi);
+                }
+            }
+        }
+
+        match best {
+            Some((_, ki, dx, dy)) => {
+                let (kx, ky) = keys[ki];
+                let from = Point2::new(kx + delta.x, ky + delta.y);
+                let mut guides = Vec::new();
+                let mut adj_x = 0.;
+                let mut adj_y = 0.;
+                if dx.abs() <= tol {
+                    adj_x = dx;
+                    guides.push(SnapGuide {
+                        vertical: true,
+                        from,
+                        to: Point2::new(from.x + dx, from.y),
+                        kind: best_kind,
+                        span_is_x: best_span.0,
+                        span_lo: best_span.1,
+                        span_hi: best_span.2,
+                    });
+                }
+                if dy.abs() <= tol {
+                    adj_y = dy;
+                    guides.push(SnapGuide {
+                        vertical: false,
+                        from,
+                        to: Point2::new(from.x, from.y + dy),
+                        kind: best_kind,
+                        span_is_x: best_span.0,
+                        span_lo: best_span.1,
+                        span_hi: best_span.2,
+                    });
+                }
+                (Point2::new(delta.x + adj_x, delta.y + adj_y), guides)
+            }
+            None => (delta, Vec::new()),
+        }
+    }
     // Recomputes the selection's dimension geometry (screen space). Called
     // once per frame before painting; lines and labels both read this.
     pub fn update_dim_geom(&mut self) {
@@ -413,6 +713,7 @@ impl Editor {
         }
         self.dragging = None;
         self.resizing = None;
+        self.snap_guides.clear();
         let Some(pending) = self.pending_shape.take() else {
             return false;
         };
@@ -541,4 +842,5 @@ pub fn handle_at(b: Rect, p: Point2, tol: f64) -> Option<Handle> {
         None
     }
 }
+
 

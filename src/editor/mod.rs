@@ -109,11 +109,14 @@ pub struct Editor {
     pub camera: Camera,
     pub tool: Tool,
     pub pending_shape: Option<PendingShape>,
-    pub selection: Option<ShapeId>,
+    pub selection: Vec<ShapeId>,
+    // Edge/corner sub-selections: these shapes scale per their selected
+    // sides during group moves instead of translating.
+    pub selected_handles: Vec<(ShapeId, Handle)>,
+    // Rubber-band marquee: (start doc, current doc).
+    pub marquee: Option<(Point2, Point2)>,
     pub hover: Option<HoverInfo>,
-    // Independently selectable edge/corner: persists across mouse-up and
-    // is independent of shape selection.
-    pub selected_handle: Option<(ShapeId, Handle)>,
+    pub group_drag_last: Option<Point2>,
     // Pending shape created by a single click (commit on next click, not
     // on mouse-up).
     pub pending_via_click: bool,
@@ -199,10 +202,12 @@ impl Editor {
             camera: Camera::new(),
             tool: Tool::Move,
             pending_shape: None,
-            selection: None,
+            selection: Vec::new(),
             hover: None,
             pending_via_click: false,
-            selected_handle: None,
+            selected_handles: Vec::new(),
+            marquee: None,
+            group_drag_last: None,
             dim_geom: None,
             edge_dim: None,
             snap_guides: Vec::new(),
@@ -223,8 +228,10 @@ impl Editor {
         self.tool = tool;
         self.pending_shape = None;
         self.pending_via_click = false;
-        self.selection = None;
-        self.selected_handle = None;
+        self.selection.clear();
+        self.selected_handles.clear();
+        self.marquee = None;
+        self.group_drag_last = None;
         self.dragging = None;
         true
     }
@@ -268,7 +275,7 @@ impl Editor {
                                     bounds.origin.y + bounds.size.h,
                                 ),
                             );
-                            self.selection = Some(id);
+                            self.selection = vec![id];
                         }
                         return true;
                     }
@@ -287,27 +294,34 @@ impl Editor {
                 Tool::Move => {
                     let p = self.cursor_doc(cursor);
                     let tol = self.handle_tolerance();
+                    let in_group = |id: ShapeId| {
+                        self.selection.contains(&id)
+                            || self.selected_handles.iter().any(|(s, _)| *s == id)
+                    };
 
-                    // 1) Hover-driven resize: corner/side of ANY shape,
-                    //    no pre-selection required. For UNSELECTED shapes,
-                    //    the edge/corner itself becomes selected and stays
-                    //    highlighted; a FULLY selected shape is just
-                    //    resized without touching edge/corner selection.
+                    // 1) Hover-driven resize: corner/side of ANY shape.
+                    //    Shapes already in the selection (fully or via
+                    //    handles) become group moves instead — grabbing an
+                    //    already-selected edge must never deselect the
+                    //    other selected edges.
                     if let Some(hi) = self.hover
                         && let Some(handle) = hi.handle
                         && let Some(b) = self.doc.shape_bounds(hi.shape)
                     {
-                        let was_selected = self.selection == Some(hi.shape);
+                        let was_selected = in_group(hi.shape);
                         if !was_selected {
-                            self.selected_handle = Some((hi.shape, handle));
+                            self.selected_handles = vec![(hi.shape, handle)];
+                            self.resizing = Some(ResizeState {
+                                id: hi.shape,
+                                handle,
+                                orig: b,
+                                start_cursor: p,
+                                moved: false,
+                            });
+                            return true;
                         }
-                        self.resizing = Some(ResizeState {
-                            id: hi.shape,
-                            handle,
-                            orig: b,
-                            start_cursor: p,
-                            moved: false,
-                        });
+                        // Group member: start a group move.
+                        self.group_drag_last = Some(p);
                         return true;
                     }
 
@@ -327,10 +341,15 @@ impl Editor {
                         }
                     }
                     match hit {
+                        // Clicking a member keeps the group: group move.
+                        Some(id) if in_group(id) => {
+                            self.group_drag_last = Some(p);
+                            true
+                        }
                         Some(id) => {
                             let b = self.doc.shape_bounds(id).unwrap();
-                            self.selection = Some(id);
-                            self.selected_handle = None;
+                            self.selection = vec![id];
+                            self.selected_handles.clear();
                             self.dragging = Some(SelectionDrag {
                                 id,
                                 grab_offset: Point2::new(
@@ -341,10 +360,10 @@ impl Editor {
                             true
                         }
                         None => {
-                            let had = self.selection.is_some() || self.selected_handle.is_some();
-                            self.selection = None;
-                            self.selected_handle = None;
-                            had
+                            self.selection.clear();
+                            self.selected_handles.clear();
+                            self.marquee = Some((p, p));
+                            true
                         }
                     }
                 }
@@ -361,6 +380,24 @@ impl Editor {
             return true;
         }
         if self.pending_shape.is_none() && self.dragging.is_none() && self.resizing.is_none() {
+            // Group move?
+            if let Some(last) = self.group_drag_last {
+                let cur = self.cursor_doc(cursor);
+                let dx = cur.x - last.x;
+                let dy = cur.y - last.y;
+                if dx != 0. || dy != 0. {
+                    self.apply_group_move(dx, dy);
+                    self.group_drag_last = Some(cur);
+                    return true;
+                }
+                return false;
+            }
+            // Marquee band update.
+            let p = self.cursor_doc(cursor);
+            if let Some((start, cur)) = self.marquee.as_mut() {
+                *cur = p;
+                return true;
+            }
             self.snap_guides.clear();
             return false;
         }
@@ -377,7 +414,7 @@ impl Editor {
             let Some(b) = self.doc.shape_bounds(drag.id) else {
                 return false;
             };
-            // Free movement in document units ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â sub-pixel precision allowed.
+            // Free movement in document units — sub-pixel precision allowed.
             let target_x = p.x - drag.grab_offset.x;
             let target_y = p.y - drag.grab_offset.y;
             let delta = Point2::new(target_x - b.origin.x, target_y - b.origin.y);
@@ -724,7 +761,7 @@ impl Editor {
         // only once the handle has physically moved... unless the shape is
         // fully selected, in which case they show immediately.
         if let Some(rs) = &self.resizing {
-            let fully_selected = Some(rs.id) == self.selection;
+            let fully_selected = self.selection.contains(&rs.id);
             if !rs.moved && !fully_selected {
                 return None;
             }
@@ -738,10 +775,115 @@ impl Editor {
             let b = p.bounds();
             return if b.size.w > 0. && b.size.h > 0. { Some(b) } else { None };
         }
-        let b = self
-            .selection
-            .and_then(|sel| self.doc.shape_bounds(sel))?;
+        // Dims for multiple selection: bounding box of the whole group.
+        if self.selection.len() > 1 {
+            let mut acc: Option<Rect> = None;
+            for &sid in &self.selection {
+                if let Some(b) = self.doc.shape_bounds(sid) {
+                    acc = Some(match acc {
+                        Some(a) => a.union(&b),
+                        None => b,
+                    });
+                }
+            }
+            return acc.filter(|b| b.size.w > 0. && b.size.h > 0.);
+        }
+        let sel = *self.selection.first()?;
+        let b = self.doc.shape_bounds(sel)?;
         (b.size.w > 0. && b.size.h > 0.).then_some(b)
+    }
+
+    // Group move: fully-selected shapes translate; handle-partial shapes
+    // scale along the axes where they don't have both opposing sides.
+    fn apply_group_move(&mut self, dx: f64, dy: f64) {
+        use std::collections::HashMap;
+        // Per-shape selected side flags for partial selections.
+        let mut sides: HashMap<ShapeId, (bool, bool, bool, bool)> = HashMap::new(); // (e,w,n,s)
+        for (sid, h) in &self.selected_handles {
+            let e = sides.entry(*sid).or_insert((false, false, false, false));
+            match h {
+                Handle::E => e.0 = true,
+                Handle::W => e.1 = true,
+                Handle::N => e.2 = true,
+                _ => e.3 = true,
+            }
+        }
+
+        let ids: Vec<ShapeId> = self.selection.clone();
+        for id in &ids {
+            if !self.doc.translate_shape(*id, Point2::new(dx, dy)) {
+                continue;
+            }
+            // Fully-selected members also carry their handle-sub-selections.
+            let (mut he, mut hw, mut hn, mut hs) = (false, false, false, false);
+            for (sid, h) in &self.selected_handles {
+                if sid == id {
+                    match h {
+                        Handle::E => he = true,
+                        Handle::W => hw = true,
+                        Handle::N => hn = true,
+                        _ => hs = true,
+                    }
+                }
+            }
+            if he || hw || hn || hs {
+                self.scale_member(*id, dx, dy, he, hw, hn, hs);
+            }
+        }
+
+        // Partial shapes: scale along axes missing an opposing side.
+        for (sid, (e, w, n, s)) in &sides {
+            if self.selection.contains(sid) {
+                continue;
+            }
+            self.scale_member(*sid, dx, dy, *e, *w, *n, *s);
+        }
+    }
+
+    // Moves the selected edges of a shape by (dx,dy), anchoring opposite
+    // edges; a side with no opposing counterpart scales the shape.
+    fn scale_member(
+        &mut self,
+        id: ShapeId,
+        dx: f64,
+        dy: f64,
+        e: bool,
+        w: bool,
+        n: bool,
+        s: bool,
+    ) {
+        let Some(b) = self.doc.shape_bounds(id) else {
+            return;
+        };
+        let mut l = b.origin.x;
+        let mut t = b.origin.y;
+        let mut r = l + b.size.w;
+        let mut bt = t + b.size.h;
+        match (e, w) {
+            (true, true) => {
+                r += dx;
+                l += dx;
+            }
+            (true, false) => r += dx,
+            (false, true) => l += dx,
+            _ => {}
+        }
+        match (n, s) {
+            (true, true) => {
+                t += dy;
+                bt += dy;
+            }
+            (true, false) => t += dy,
+            (false, true) => bt += dy,
+            _ => {}
+        }
+        self.doc.set_shape_corners(
+            id,
+            Rect::from_points(
+                Point2::new(l.min(r), t.min(bt)),
+                Point2::new(l.max(r), t.max(bt)),
+            ),
+        );
     }
 
     fn screen_dim_geom(&self, b: Rect) -> DimGeom {
@@ -764,7 +906,7 @@ impl Editor {
         // dimension Ã¢â‚¬â€ the changing axis. Shows immediately for a fully
         // selected shape; otherwise only once the handle has moved.
         if let Some(rs) = &self.resizing
-            && (rs.moved || Some(rs.id) == self.selection)
+            && (rs.moved || self.selection.contains(&rs.id))
             && matches!(
                 rs.handle,
                 Handle::N | Handle::S | Handle::E | Handle::W
@@ -855,7 +997,7 @@ impl Editor {
         let on_selected_handler = self
             .hover
             .as_ref()
-            .filter(|h| Some(h.shape) == self.selection)
+            .filter(|h| self.selection.contains(&h.shape))
             .and_then(|h| h.handle)
             .is_some();
         if !on_selected_handler {
@@ -880,6 +1022,47 @@ impl Editor {
         self.dragging = None;
         self.resizing = None;
         self.snap_guides.clear();
+        self.group_drag_last = None;
+        // Marquee finalize: shapes fully inside become fully selected;
+        // crossed shapes get their intersected SIDES selected.
+        if let Some((a, b)) = self.marquee.take() {
+            let band = Rect::from_points(a, b);
+            let (bx0, by0) = (band.origin.x, band.origin.y);
+            let (bx1, by1) = (bx0 + band.size.w, by0 + band.size.h);
+            for layer in &self.doc.layers {
+                for &sid in &layer.shape_ids {
+                    let Some(b) = self.doc.shape_bounds(sid) else {
+                        continue;
+                    };
+                    let (l, t) = (b.origin.x, b.origin.y);
+                    let (r, bm) = (l + b.size.w, t + b.size.h);
+                    let x_over = l <= bx1 && bx0 <= r;
+                    let y_over = t <= by1 && by0 <= bm;
+                    if !x_over || !y_over {
+                        continue;
+                    }
+                    if l >= bx0 && r <= bx1 && t >= by0 && bm <= by1 {
+                        if !self.selection.contains(&sid) {
+                            self.selection.push(sid);
+                        }
+                        continue;
+                    }
+                    // Partial: pick up the sides the band crosses.
+                    if l >= bx0 && l <= bx1 && y_over {
+                        self.selected_handles.push((sid, Handle::W));
+                    }
+                    if r >= bx0 && r <= bx1 && y_over {
+                        self.selected_handles.push((sid, Handle::E));
+                    }
+                    if t >= by0 && t <= by1 && x_over {
+                        self.selected_handles.push((sid, Handle::N));
+                    }
+                    if bm >= by0 && bm <= by1 && x_over {
+                        self.selected_handles.push((sid, Handle::S));
+                    }
+                }
+            }
+        }
         // Ending a pan-mode drag must release the pan state, otherwise
         // mouse movement keeps panning forever.
         if button == gpui::MouseButton::Left && self.end_pan() {
@@ -910,7 +1093,7 @@ impl Editor {
                 bounds.origin,
                 Point2::new(bounds.origin.x + bounds.size.w, bounds.origin.y + bounds.size.h),
             );
-            self.selection = Some(id);
+            self.selection = vec![id];
         }
         true
     }

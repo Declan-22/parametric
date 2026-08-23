@@ -430,7 +430,10 @@ impl Shell {
     fn clipboard_data(&self, cx: &Context<Self>) -> Option<String> {
         let ed = self.editor.as_ref()?;
         let e = ed.read(cx);
-        let sel = e.selection?;
+        if e.selection.len() != 1 {
+            return None;
+        }
+        let sel = e.selection[0];
         let b = e.doc.shape_bounds(sel)?;
         let kind = e.doc.shape_kind(sel)?.as_str();
         Some(format!(
@@ -474,8 +477,8 @@ impl Shell {
             let b = Point2::new(nums[0] + OFFSET + nums[2], nums[1] + OFFSET + nums[3]);
             let layer_id = ed.doc.layers[0].id;
             let id = ed.create_shape(layer_id, ShapeKind::Rectangle, a, b);
-            ed.selection = Some(id);
-            ed.selected_handle = None;
+            ed.selection = vec![id];
+            ed.selected_handles.clear();
             ed.update_dim_geom();
             cx.notify();
         });
@@ -486,12 +489,15 @@ impl Shell {
             return;
         };
         let removed = ed.update(cx, |ed, _| {
-            let Some(sel) = ed.selection else {
+            if ed.selection.is_empty() {
                 return false;
-            };
-            ed.selection = None;
-            ed.selected_handle = None;
-            ed.doc.remove_shape(sel)
+            }
+            let sels = std::mem::take(&mut ed.selection);
+            ed.selected_handles.clear();
+            for sid in &sels {
+                ed.doc.remove_shape(*sid);
+            }
+            true
         });
         if removed {
             self.invalidate_thumbs_all();

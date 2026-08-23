@@ -36,12 +36,13 @@ pub fn build_draw_list(
     viewport: Size<Pixels>,
     t: Theme,
     pending: Option<(ShapeKind, Rect)>,
-    selection: Option<crate::core::ids::ShapeId>,
+    selection: &[crate::core::ids::ShapeId],
     dim_geom: Option<crate::editor::DimGeom>,
     snap_guides: &[crate::editor::SnapGuide],
     hover: Option<(crate::core::ids::ShapeId, Option<crate::editor::Handle>)>,
-    selected_handle: Option<(crate::core::ids::ShapeId, crate::editor::Handle)>,
+    selected_handle: &[(crate::core::ids::ShapeId, crate::editor::Handle)],
     edge_dim: Option<(crate::editor::DimGeom, bool)>,
+    marquee: Option<(crate::core::geometry::Point2, crate::core::geometry::Point2)>,
 ) -> Vec<Primitive> {
     let min = camera.screen_to_unit(Point2::new(0., 0.));
     let max = camera.screen_to_unit(Point2::new(
@@ -139,7 +140,7 @@ pub fn build_draw_list(
     };
 
     if let Some((sid, handle)) = hover
-        && Some(sid) != selection
+        && !selection.contains(&sid)
     {
         match handle {
             Some(hd) => handle_highlight(&mut list, doc, camera, sid, hd),
@@ -160,10 +161,11 @@ pub fn build_draw_list(
     // Persistent highlight for the selected edge/corner — only meaningful
     // while its shape is NOT fully selected (a selected shape shows the
     // full handle set instead).
-    if let Some((sid, handle)) = selected_handle
-        && Some(sid) != selection
-    {
-        handle_highlight(&mut list, doc, camera, sid, handle);
+    for (sid, handle) in selected_handle {
+        if selection.contains(sid) {
+            continue;
+        }
+        handle_highlight(&mut list, doc, camera, *sid, *handle);
     }
 
     // Dimension lines render whenever there's an active dimension source
@@ -190,10 +192,11 @@ pub fn build_draw_list(
     }
 
     // Selection overlay drawn AFTER every shape fill so nothing can cover
-    // the outline or handles.
-    if let Some(sel) = selection
-        && let Some(unit) = doc.shape_bounds(sel)
-    {
+    // the outline or handles. One outline per fully-selected shape.
+    for &sel in selection {
+        let Some(unit) = doc.shape_bounds(sel) else {
+            continue;
+        };
         let (x, y, w, h) = screen_rect(unit, camera);
         // 2px selection outline.
         list.push(Primitive::Outline {
@@ -208,6 +211,25 @@ pub fn build_draw_list(
                 center: Point { x: px(hx), y: px(hy) },
             });
         }
+    }
+
+    // Marquee band: low-opacity accent fill + 2px accent border.
+    if let Some((a, b)) = marquee {
+        let band = Rect::from_points(a, b);
+        let (x, y, w, h) = screen_rect(band, camera);
+        list.push(Primitive::Rect {
+            bounds: Bounds {
+                origin: Point { x: px(x), y: px(y) },
+                size: Size { width: px(w), height: px(h) },
+            },
+            color: rgba((t.accent << 8) | 0x1A).into(),
+        });
+        list.push(Primitive::Outline {
+            bounds: Bounds {
+                origin: Point { x: px(x), y: px(y) },
+                size: Size { width: px(w), height: px(h) },
+            },
+        });
     }
 
     // In-progress shape being dragged out (on top of fills), plus an

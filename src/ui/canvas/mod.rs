@@ -369,14 +369,15 @@ impl CanvasView {
                 bounds.size,
                 t,
                 pending,
-                ed.selection,
+                &ed.selection,
                 ed.dim_geom,
                 &ed.snap_guides,
                 ed.hover
                     .map(|h| (h.shape, h.handle))
                     .filter(|_| ed.resizing.is_none() && ed.dragging.is_none()),
-                ed.selected_handle,
+                ed.selected_handles.as_slice(),
                 ed.edge_dim,
+                ed.marquee,
             );
             (list, hitbox)
         };

@@ -2,7 +2,7 @@ use super::geometry::{Point2, Rect};
 use super::ids::{PointId, ShapeId};
 
 // The permanent design. "What exists in the document?"
-// No GPUI types here — the engine is UI-independent.
+// No GPUI types here â€” the engine is UI-independent.
 //
 // Storage model: flat arenas (Vec slots + generation counters) instead of
 // nested ownership. Points are first-class entities so constraints can bind
@@ -13,6 +13,15 @@ pub struct Document {
     pub layers: Vec<Layer>,
     points: PointArena,
     shapes: ShapeArena,
+    // Dimension constraints: locked width/height per shape.
+    pub dim_constraints: Vec<DimConstraint>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DimConstraint {
+    pub shape: ShapeId,
+    pub width: bool,
+    pub value: f64,
 }
 
 impl Document {
@@ -98,12 +107,57 @@ impl Document {
         }
         true
     }
+
+    pub fn dim_lock(&mut self, shape: ShapeId, width: bool, value: f64) {
+        if let Some(c) = self
+            .dim_constraints
+            .iter_mut()
+            .find(|c| c.shape == shape && c.width == width)
+        {
+            c.value = value;
+        } else {
+            self.dim_constraints.push(DimConstraint { shape, width, value });
+        }
+    }
+
+    pub fn dim_unlock(&mut self, shape: ShapeId, width: bool) {
+        self.dim_constraints
+            .retain(|c| !(c.shape == shape && c.width == width));
+    }
+
+    pub fn dim_value(&self, shape: ShapeId, width: bool) -> Option<f64> {
+        self.dim_constraints
+            .iter()
+            .find(|c| c.shape == shape && c.width == width)
+            .map(|c| c.value)
+    }
+
+    // Removes a shape entirely: layer entry, arena slot (freed with a
+    // generation bump), and any dimension constraints referencing it.
+    pub fn remove_shape(&mut self, id: ShapeId) -> bool {
+        let Some(slot) = self.shapes.data.get_mut(id.idx as usize) else {
+            return false;
+        };
+        if slot.generation != id.generation {
+            return false;
+        }
+        let Some(shape) = slot.shape.take() else {
+            return false;
+        };
+        slot.generation += 1;
+        self.shapes.free.push(id.idx);
+        self.dim_constraints.retain(|c| c.shape != id);
+        let layer_id = shape.layer;
+        if let Some(layer) = self.layers.iter_mut().find(|l| l.id == layer_id) {
+            layer.shape_ids.retain(|&s| s != id);
+        }
+        true
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShapeKind {
     Rectangle,
-    Ellipse,
 }
 
 impl ShapeKind {
@@ -111,14 +165,12 @@ impl ShapeKind {
     pub fn as_str(self) -> &'static str {
         match self {
             ShapeKind::Rectangle => "rectangle",
-            ShapeKind::Ellipse => "ellipse",
         }
     }
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "rectangle" => Some(ShapeKind::Rectangle),
-            "ellipse" => Some(ShapeKind::Ellipse),
             _ => None,
         }
     }

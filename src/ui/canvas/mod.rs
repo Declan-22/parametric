@@ -128,6 +128,30 @@ impl CanvasView {
                 return Vec::new();
             };
             let ed = editor.read(cx);
+            let t = *crate::theme::active(cx);
+
+            // Edge-resize: one label for the changing axis.
+            if let Some((geom, is_width)) = ed.edge_dim {
+                let Some(rid) = ed.resizing.as_ref().map(|rs| rs.id) else {
+                    return Vec::new();
+                };
+                let Some(b) = ed.doc.shape_bounds(rid) else {
+                    return Vec::new();
+                };
+                let value = if is_width { b.size.w } else { b.size.h };
+                let centers =
+                    paint::dimension_label_centers(geom.x, geom.y, geom.w, geom.h, geom.ext);
+                let (cx_, cy_) = centers[if is_width { 0 } else { 1 }];
+                return vec![make_label(
+                    window,
+                    format!("{value:.2}"),
+                    cx_,
+                    cy_,
+                    rgb(t.bg_primary).into(),
+                    rgb(t.accent).into(),
+                )];
+            }
+
             let Some(geom) = ed.dim_geom else {
                 return Vec::new();
             };
@@ -143,30 +167,12 @@ impl CanvasView {
                 geom.h,
                 geom.ext,
             );
-            let font_size = px(11.);
-            let font = label_font();
-            let color: gpui::Hsla = rgb(crate::theme::ACCENT).into();
+            let color: gpui::Hsla = rgb(t.accent).into();
 
             [(format!("{sw:.2}"), centers[0]), (format!("{sh:.2}"), centers[1])]
                 .into_iter()
                 .map(|(text, (cx_, cy_))| {
-                    let runs = [gpui::TextRun {
-                        len: text.len(),
-                        font: font.clone(),
-                        color,
-                        background_color: None,
-                        underline: None,
-                        strikethrough: None,
-                    }];
-                    let line = window
-                        .text_system()
-                        .shape_line(text.into(), font_size, &runs, None);
-                    LabelPrim {
-                        line,
-                        center_x: cx_,
-                        center_y: cy_,
-                        bg: rgb(t.bg_primary).into(),
-                    }
+                    make_label(window, text, cx_, cy_, rgb(t.bg_primary).into(), color)
                 })
                 .collect::<Vec<_>>()
         };
@@ -191,7 +197,8 @@ impl CanvasView {
                         x: px(l.center_x - box_w / 2. + PAD_X + BORDER / 2.),
                         y: px(l.center_y - line_h.as_f32() / 2. + OPTICAL_NUDGE),
                     };
-                    // Container background + accent border.
+                    // Container background + border: sized to the measured
+                    // text (adaptable width) via padding, not fixed.
                     window.paint_quad(gpui::quad(
                         Bounds {
                             origin: Point {
@@ -203,7 +210,7 @@ impl CanvasView {
                         px(6.),
                         l.bg,
                         gpui::Edges::all(px(2.)),
-                        rgb(crate::theme::ACCENT),
+                        rgb(crate::theme::active(cx).accent),
                         gpui::BorderStyle::Solid,
                     ));
                     let _ = l.line.paint(
@@ -231,8 +238,39 @@ struct LabelPrim {
     bg: gpui::Background,
 }
 
+fn make_label(
+    window: &mut Window,
+    text: String,
+    center_x: f32,
+    center_y: f32,
+    bg: gpui::Background,
+    accent: gpui::Hsla,
+) -> LabelPrim {
+    let font_size = px(11.);
+    let runs = [gpui::TextRun {
+        len: text.len(),
+        font: label_font(),
+        color: accent,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    }];
+    let line = window
+        .text_system()
+        .shape_line(text.into(), font_size, &runs, None);
+    LabelPrim { line, center_x, center_y, bg }
+}
+
 fn font_size_px() -> gpui::Pixels {
     px(13.)
+}
+
+// Two-decimal precision without the ugly trailing zeros: 100.00 -> "100",
+// 37.50 -> "37.5", 12.34 stays "12.34".
+pub fn fmt_dim(v: f64) -> String {
+    let s = format!("{v:.2}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    s.to_string()
 }
 
 fn label_font() -> gpui::Font {
@@ -257,8 +295,8 @@ impl CanvasView {
         let Some((sw, sh)) = ed.selection_size() else {
             return Vec::new();
         };
-        let width_text = format!("{:.2}", sw);
-        let height_text = format!("{:.2}", sh);
+        let width_text = fmt_dim(sw);
+        let height_text = fmt_dim(sh);
         let centers = paint::dimension_label_centers(geom.x, geom.y, geom.w, geom.h, geom.ext);
         let texts = [(width_text, 0), (height_text, 1)];
 
@@ -296,12 +334,12 @@ impl CanvasView {
                     .h(px(BOX_H))
                     .bg(rgb(t.bg_primary))
                     .border_2()
-                    .border_color(rgb(crate::theme::ACCENT))
+                    .border_color(rgb(t.accent))
                     .rounded(px(6.))
                     .font_family(crate::theme::FONT_UI)
                     .text_size(font_size)
                     .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(rgb(crate::theme::ACCENT))
+                    .text_color(rgb(t.accent))
                     .child(text)
                     .into_any_element()
             })
@@ -334,6 +372,11 @@ impl CanvasView {
                 ed.selection,
                 ed.dim_geom,
                 &ed.snap_guides,
+                ed.hover
+                    .map(|h| (h.shape, h.handle))
+                    .filter(|_| ed.resizing.is_none() && ed.dragging.is_none()),
+                ed.selected_handle,
+                ed.edge_dim,
             );
             (list, hitbox)
         };
@@ -352,18 +395,13 @@ impl CanvasView {
                     paint::Primitive::Rect { bounds, color } => {
                         window.paint_quad(fill(bounds, color));
                     }
-                    paint::Primitive::Ellipse { center, radii, color } => {
-                        if let Some(path) = paint::ellipse_path(center, radii) {
-                            window.paint_path(path, color);
-                        }
-                    }
                     paint::Primitive::Outline { bounds } => {
                         window.paint_quad(gpui::quad(
                             bounds,
                             0.,
                             gpui::transparent_black(),
                             gpui::Edges::all(px(2.)),
-                            rgb(crate::theme::ACCENT),
+                            rgb(crate::theme::active(cx).accent),
                             gpui::BorderStyle::Solid,
                         ));
                     }
@@ -377,7 +415,7 @@ impl CanvasView {
                             r,
                             rgb(0xFFFFFF),
                             gpui::Edges::all(px(1.)),
-                            rgb(crate::theme::ACCENT),
+                            rgb(crate::theme::active(cx).accent),
                             gpui::BorderStyle::Solid,
                         ));
                     }
@@ -395,7 +433,7 @@ impl CanvasView {
                             1.,
                             rgb(0xFFFFFF),
                             gpui::Edges::all(px(1.)),
-                            rgb(crate::theme::ACCENT),
+                            rgb(crate::theme::active(cx).accent),
                             gpui::BorderStyle::Solid,
                         ));
                     }

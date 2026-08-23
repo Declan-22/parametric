@@ -4,7 +4,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{App, Context, Entity, MouseButton, Point, Window, div, prelude::*, px, rgb};
 
-use crate::core::document::{Document, Layer};
+use crate::core::geometry::Point2;
+use crate::core::document::{Document, Layer, ShapeKind};
 use crate::editor::{Camera, Editor};
 use crate::persistence::database::Database;
 use crate::persistence::paths;
@@ -424,6 +425,84 @@ impl Shell {
         .detach();
     }
 
+    // -- edit operations (copy / cut / paste / delete) --
+
+    fn clipboard_data(&self, cx: &Context<Self>) -> Option<String> {
+        let ed = self.editor.as_ref()?;
+        let e = ed.read(cx);
+        let sel = e.selection?;
+        let b = e.doc.shape_bounds(sel)?;
+        let kind = e.doc.shape_kind(sel)?.as_str();
+        Some(format!(
+            "parametric/{kind}:{},{},{},{}",
+            b.origin.x,
+            b.origin.y,
+            b.size.w,
+            b.size.h
+        ))
+    }
+
+    pub(crate) fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        if let Some(data) = self.clipboard_data(cx) {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(data));
+        }
+    }
+
+    pub(crate) fn cut_selection(&mut self, cx: &mut Context<Self>) {
+        self.copy_selection(cx);
+        self.delete_selection(cx);
+    }
+
+    pub(crate) fn paste_clipboard(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) else {
+            return;
+        };
+        let Some(rest) = text.strip_prefix("parametric/rectangle:") else {
+            return;
+        };
+        let nums: Vec<f64> = rest.split(',').filter_map(|s| s.parse().ok()).collect();
+        if nums.len() != 4 {
+            return;
+        }
+        let Some(ed) = self.editor.as_ref() else {
+            return;
+        };
+        ed.update(cx, |ed, cx| {
+            // Paste slightly offset so it doesn't land exactly on the copy.
+            const OFFSET: f64 = 12.;
+            let a = Point2::new(nums[0] + OFFSET, nums[1] + OFFSET);
+            let b = Point2::new(nums[0] + OFFSET + nums[2], nums[1] + OFFSET + nums[3]);
+            let layer_id = ed.doc.layers[0].id;
+            let id = ed.create_shape(layer_id, ShapeKind::Rectangle, a, b);
+            ed.selection = Some(id);
+            ed.selected_handle = None;
+            ed.update_dim_geom();
+            cx.notify();
+        });
+    }
+
+    pub(crate) fn delete_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(ed) = self.editor.as_ref() else {
+            return;
+        };
+        let removed = ed.update(cx, |ed, _| {
+            let Some(sel) = ed.selection else {
+                return false;
+            };
+            ed.selection = None;
+            ed.selected_handle = None;
+            ed.doc.remove_shape(sel)
+        });
+        if removed {
+            self.invalidate_thumbs_all();
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn invalidate_thumbs_all(&mut self) {
+        self.thumbs.clear();
+    }
+
     pub(crate) fn close_menu(&mut self, cx: &mut Context<Self>) {
         if !self.menu_open {
             return;
@@ -498,6 +577,18 @@ impl Render for Shell {
 
         div()
             .track_focus(&self.rename_focus)
+            .on_action(cx.listener(|shell, _: &crate::ui::actions::Copy, _, cx| {
+                shell.copy_selection(cx);
+            }))
+            .on_action(cx.listener(|shell, _: &crate::ui::actions::Cut, _, cx| {
+                shell.cut_selection(cx);
+            }))
+            .on_action(cx.listener(|shell, _: &crate::ui::actions::Paste, _, cx| {
+                shell.paste_clipboard(cx);
+            }))
+            .on_action(cx.listener(|shell, _: &crate::ui::actions::DeleteSelection, _, cx| {
+                shell.delete_selection(cx);
+            }))
             .on_key_down(move |e: &gpui::KeyDownEvent, _, cx| {
                 // Only capture keys while the inline rename input is active.
                 if shell_keys.upgrade().and_then(|s| Some(s.read(cx).renaming.is_some())) != Some(true) {

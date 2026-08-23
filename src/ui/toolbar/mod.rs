@@ -1,10 +1,12 @@
-use gpui::{App, IntoElement, MouseButton, RenderOnce, Window, div, prelude::*, px, rgb, rgba, svg};
+use gpui::{
+    App, IntoElement, MouseButton, RenderOnce, Window, div, prelude::*, px, rgb, rgba, svg,
+};
 
 use crate::editor::Tool;
 use crate::theme::Theme;
 
-// Bottom toolbar: one centered row — mode tools (Move / Pan), a divider,
-// then shape tools (Rectangle / Ellipse).
+// Bottom toolbar: one centered row â€” mode tools (Move / Pan), a divider,
+// then shape tools (Rectangle).
 
 const ICON_MOVE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
 	<path d="M0 0h24v24H0z" fill="none" />
@@ -18,15 +20,10 @@ const ICON_PAN: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" 
 </svg>
 "#;
 
-const ICON_RECTANGLE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+const ICON_RECTANGLE: &[u8] =
+    br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
 	<path d="M0 0h24v24H0z" fill="none" />
 	<path fill="currentColor" d="M3 19V5h18v14zm1-1h16V6H4zm0 0V6z" />
-</svg>
-"#;
-
-const ICON_ELLIPSE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 2048 2048">
-	<path d="M0 0h2048v2048H0z" fill="none" />
-	<path fill="currentColor" d="M1024 256q131 0 268 27t264 85t233 144t175 206q41 71 62 147t22 159q0 82-21 158t-63 148q-68 119-174 206t-233 144t-264 84t-269 28q-131 0-268-27t-264-85t-233-144t-175-206q-41-71-62-147T0 1024q0-82 21-158t63-148q68-119 174-206t233-144t264-84t269-28m0 1408q84 0 169-11t167-36t159-60t146-87q54-40 101-88t81-105t53-120t20-133q0-70-19-133t-54-119t-81-105t-101-89q-68-50-145-86t-160-61t-167-35t-169-12q-84 0-169 11t-167 36t-159 60t-146 87q-54 40-101 88t-81 105t-53 120t-20 133q0 70 19 133t54 119t81 105t101 89q68 50 145 86t160 61t167 35t169 12" />
 </svg>
 "#;
 
@@ -46,31 +43,26 @@ impl RenderOnce for Toolbar {
             .unwrap_or(Tool::Move);
 
         div()
-            // Centered row pinned near the bottom; width fits the buttons.
+            // Single column, flush against the far-left edge, full height
+            // of the canvas area.
             .absolute()
             .left_0()
-            .right_0()
-            .bottom(px(12.))
+            .top_0()
+            .bottom_0()
             .flex()
-            .justify_center()
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(2.))
-                    .p(px(3.))
-                    .rounded(px(8.))
-                    .bg(rgb(t.bg_secondary))
-                    .border_1()
-                    .border_color(rgb(t.component_border_color))
-                    .shadow(vec![t.shadow_sm()])
-                    .child(self.tool_button(Tool::Move, ICON_MOVE, active_tool, t, cx))
-                    .child(self.tool_button(Tool::Pan, ICON_PAN, active_tool, t, cx))
-                    .child(divider(t))
-                    .child(self.tool_button(Tool::Rectangle, ICON_RECTANGLE, active_tool, t, cx))
-                    .child(self.tool_button(Tool::Ellipse, ICON_ELLIPSE, active_tool, t, cx)),
-            )
+            .flex_col()
+            .items_center()
+            .py(px(6.))
+            .px(px(4.))
+            .gap(px(2.))
+            .bg(rgb(t.bg_primary))
+            // Right-edge border separates the rail from the canvas.
+            .border_r_1()
+            .border_color(rgb(t.component_border_color))
+            .child(self.tool_button(Tool::Move, ICON_MOVE, active_tool, t, cx))
+            .child(self.tool_button(Tool::Pan, ICON_PAN, active_tool, t, cx))
+            .child(divider(t))
+            .child(self.tool_button(Tool::Rectangle, ICON_RECTANGLE, active_tool, t, cx))
     }
 }
 
@@ -87,7 +79,6 @@ impl Toolbar {
 
         let editor = self.editor.clone();
         let is_active = active_tool == tool;
-        // Hover tween: idle bg_secondary -> hover bg_primary + shadow.
         let key = format!("tb-{}", tool_debug_name(tool));
         let k = if is_active {
             1.0
@@ -97,11 +88,24 @@ impl Toolbar {
                 .map(|s| s.read(cx).fade(&key))
                 .unwrap_or(0.0)
         };
-        let bg = lerp_rgb(t.bg_secondary, t.bg_primary, k);
+
+        // Hover: plain bg fade to bg_secondary. Active: identical to the
+        // home button — bg_tertiary + border + shadow_sm. Invisible border
+        // when idle so nothing shifts.
+        let bg = lerp_rgb(t.bg_primary, t.bg_secondary, k);
+        let active_bg = t.bg_tertiary;
+        let bg = if is_active { active_bg } else { bg };
         let border = fade_in((t.border_color << 8) | 0xFF, k);
+        // Shadow belongs to the active state only (home-button contract).
         let mut shadow = t.shadow_sm();
-        shadow.color = gpui::rgba(fade_in(t.item_shadow_color, k)).into();
-        let icon_color = lerp_rgb(t.text_secondary, t.text_primary, k.max(if is_active { 1.0 } else { 0.0 }));
+        if !is_active {
+            shadow.color = gpui::rgba(0x00000000).into();
+        }
+        let icon_color = lerp_rgb(
+            t.text_secondary,
+            t.text_primary,
+            k.max(if is_active { 1.0 } else { 0.0 }),
+        );
 
         let shell_hover = self.shell.clone();
         div()
@@ -113,28 +117,43 @@ impl Toolbar {
             .flex()
             .items_center()
             .justify_center()
-            .bg(rgb(bg))
+            // Constant geometry; only colors tween.
             .border_1()
             .border_color(rgba(border))
+            .bg(rgb(bg))
             .shadow(vec![shadow])
             .on_hover(move |hovered, _, cx| {
                 let _ = shell_hover.update(cx, |shell, cx| {
                     shell.animate_fade(&key, if *hovered { 1.0 } else { 0.0 }, cx);
                 });
             })
-            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+            .on_mouse_down(MouseButton::Left, move |_: &gpui::MouseDownEvent, _, cx| {
+                // Don't let tool clicks leak into the canvas beneath the
+                // rail (they'd register as canvas clicks).
+                cx.stop_propagation();
                 let _ = editor.update(cx, |ed, cx| {
                     if ed.set_tool(tool) {
                         cx.notify();
                     }
                 });
             })
-            .child(svg().data(icon).w(px(15.)).h(px(15.)).text_color(rgb(icon_color)))
+            .child(
+                svg()
+                    .data(icon)
+                    .w(px(17.))
+                    .h(px(17.))
+                    .text_color(rgb(icon_color)),
+            )
     }
 }
 
 fn divider(t: Theme) -> impl IntoElement {
-    div().w(px(1.)).h(px(18.)).mx(px(3.)).bg(rgb(t.component_border_color))
+    // Horizontal divider for the vertical rail.
+    div()
+        .h(px(2.))
+        .w(px(18.))
+        .my(px(3.))
+        .bg(rgb(t.border_color))
 }
 
 fn tool_debug_name(tool: Tool) -> &'static str {
@@ -142,10 +161,5 @@ fn tool_debug_name(tool: Tool) -> &'static str {
         Tool::Move => "tool-move",
         Tool::Pan => "tool-pan",
         Tool::Rectangle => "tool-rectangle",
-        Tool::Ellipse => "tool-ellipse",
     }
 }
-
-
-
-

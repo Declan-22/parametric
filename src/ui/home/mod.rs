@@ -1,8 +1,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    App, Bounds, IntoElement, MouseButton, Pixels, RenderOnce, WeakEntity, Window, canvas,
-    div, fill, prelude::*, px, rgb, rgba,
+    App, Bounds, IntoElement, MouseButton, Pixels, RenderOnce, WeakEntity, Window, canvas, div,
+    fill, prelude::*, px, rgb, rgba,
 };
 
 use crate::persistence::registry::DesignMeta;
@@ -45,10 +45,10 @@ impl RenderOnce for HomeView {
             .rounded(px(6.))
             .cursor_pointer()
             // High-contrast action button; hover fades it to 80% opacity.
-            .bg(rgb(t.button_background))
+            .bg(rgb(t.accent))
             .text_sm()
             .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(rgb(t.button_text))
+            .text_color(rgb(0xffffff))
             .opacity(new_opacity)
             .on_hover(move |hovered, _, cx| {
                 let _ = shell_hover.update(cx, |shell, cx| {
@@ -64,23 +64,13 @@ impl RenderOnce for HomeView {
             .id("home")
             .size_full()
             .overflow_y_scroll()
-            .child(
-                div()
-                    .flex()
-                    .justify_end()
-                    .p(px(16.))
-                    .child(new_btn),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap(px(16.))
-                    .px(px(16.))
-                    .children(designs.into_iter().map(|meta| {
-                        DesignCard { meta, shell: self.shell.clone() }
-                    })),
-            )
+            .child(div().flex().justify_end().p(px(16.)).child(new_btn))
+            .child(div().flex().flex_wrap().gap(px(16.)).px(px(16.)).children(
+                designs.into_iter().map(|meta| DesignCard {
+                    meta,
+                    shell: self.shell.clone(),
+                }),
+            ))
     }
 }
 
@@ -111,31 +101,38 @@ impl RenderOnce for DesignCard {
                 });
                 let t = *crate::theme::active(cx);
                 match shell.read(cx).thumb_snapshot(meta_id) {
-                    Some((doc, camera)) => {
-                        paint::build_draw_list(&doc, &camera, bounds.size, t, None, None, None, &[])
-                    }
+                    Some((doc, camera)) => paint::build_draw_list(
+                        &doc,
+                        &camera,
+                        bounds.size,
+                        t,
+                        None,
+                        None,
+                        None,
+                        &[],
+                        None,
+                        None,
+                        None,
+                    ),
                     None => Vec::new(),
                 }
             };
 
-        let paint_thumbs =
-            move |_: Bounds<Pixels>, list: Vec<paint::Primitive>, window: &mut Window, _: &mut App| {
-                for prim in list {
-                    match prim {
-                        paint::Primitive::Rect { bounds, color } => {
-                            window.paint_quad(fill(bounds, color));
-                        }
-                        paint::Primitive::Ellipse { center, radii, color } => {
-                            if let Some(path) = paint::ellipse_path(center, radii) {
-                                window.paint_path(path, color);
-                            }
-                        }
-                        paint::Primitive::Outline { bounds: _ } => {}
-                        paint::Primitive::Circle { .. } => {}
-                        paint::Primitive::CornerHandle { .. } => {}
+        let paint_thumbs = move |_: Bounds<Pixels>,
+                                 list: Vec<paint::Primitive>,
+                                 window: &mut Window,
+                                 _: &mut App| {
+            for prim in list {
+                match prim {
+                    paint::Primitive::Rect { bounds, color } => {
+                        window.paint_quad(fill(bounds, color));
                     }
+                    paint::Primitive::Outline { bounds: _ } => {}
+                    paint::Primitive::Circle { .. } => {}
+                    paint::Primitive::CornerHandle { .. } => {}
                 }
-            };
+            }
+        };
 
         let is_renaming = self
             .shell
@@ -209,7 +206,7 @@ impl RenderOnce for DesignCard {
                             .text_color(rgb(t.text_primary))
                             .bg(rgb(t.bg_primary))
                             .border_2()
-                            .border_color(rgb(crate::theme::ACCENT))
+                            .border_color(rgb(t.accent))
                             .rounded(px(4.))
                             .px(px(3.))
                             .h(px(22.))
@@ -283,8 +280,8 @@ pub fn render_context_menu(
     t: Theme,
     cx: &App,
 ) -> impl IntoElement {
-    use gpui::{MouseDownEvent, rgba, SharedString};
     use crate::theme::{fade_in, lerp_rgb, lerp_rgba};
+    use gpui::{MouseDownEvent, SharedString, rgba};
 
     let menu_id = menu.id;
     let left = f32::from(menu.position.x);
@@ -327,7 +324,11 @@ pub fn render_context_menu(
                 let shell = shell.clone();
                 move |hovered, _, cx| {
                     let _ = shell.update(cx, |shell, cx| {
-                        shell.animate_fade(&format!("ctx-{index}"), if *hovered { 1.0 } else { 0.0 }, cx);
+                        shell.animate_fade(
+                            &format!("ctx-{index}"),
+                            if *hovered { 1.0 } else { 0.0 },
+                            cx,
+                        );
                     });
                 }
             })
@@ -367,6 +368,3 @@ pub fn render_context_menu(
         .child(entry("Open", 0))
         .child(entry("Rename", 1))
 }
-
-
-

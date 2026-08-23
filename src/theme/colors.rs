@@ -24,6 +24,8 @@ pub const DARK_BUTTON_BACKGROUND: u32 = 0xF2F2F2;
 pub const DARK_BUTTON_TEXT: u32 = 0x1F1E1C;
 pub const DARK_BUTTON_BORDER_COLOR: u32 = 0xCBCBCB;
 
+pub const DARK_ACCENT: u32 = 0x5B96E8;
+
 // ========================================
 // LIGHT THEME
 // ========================================
@@ -49,3 +51,5 @@ pub const LIGHT_ITEM_SHADOW_COLOR: u32 = 0x00000008;
 pub const LIGHT_BUTTON_BACKGROUND: u32 = 0x232220;
 pub const LIGHT_BUTTON_TEXT: u32 = 0xF2F2F2;
 pub const LIGHT_BUTTON_BORDER_COLOR: u32 = 0x55534E;
+
+pub const LIGHT_ACCENT: u32 = 0x5586CC;

@@ -1,8 +1,8 @@
-use gpui::{Bounds, Path, PathBuilder, Pixels, Point, Size, px, rgb, rgba};
+use gpui::{Bounds, Pixels, Point, Size, px, rgb, rgba};
 
 use crate::core::document::{Document, ShapeKind};
 use crate::core::geometry::{Point2, Rect};
-use crate::editor::Camera;
+use crate::editor::{Camera, Handle};
 use crate::theme::Theme;
 
 // Screen-space draw list built during prepaint (culled to the viewport),
@@ -11,11 +11,6 @@ use crate::theme::Theme;
 pub enum Primitive {
     Rect {
         bounds: Bounds<Pixels>,
-        color: gpui::Background,
-    },
-    Ellipse {
-        center: Point<Pixels>,
-        radii: Size<Pixels>,
         color: gpui::Background,
     },
     // 1px outline used for the selection indicator.
@@ -44,6 +39,9 @@ pub fn build_draw_list(
     selection: Option<crate::core::ids::ShapeId>,
     dim_geom: Option<crate::editor::DimGeom>,
     snap_guides: &[crate::editor::SnapGuide],
+    hover: Option<(crate::core::ids::ShapeId, Option<crate::editor::Handle>)>,
+    selected_handle: Option<(crate::core::ids::ShapeId, crate::editor::Handle)>,
+    edge_dim: Option<(crate::editor::DimGeom, bool)>,
 ) -> Vec<Primitive> {
     let min = camera.screen_to_unit(Point2::new(0., 0.));
     let max = camera.screen_to_unit(Point2::new(
@@ -52,9 +50,9 @@ pub fn build_draw_list(
     ));
     let visible = Rect::from_points(min, max);
 
-    // Shape fill: translucent ink derived from the secondary text color so
-    // it reads against any background; selection styling comes later.
-    let color: gpui::Background = rgba((t.text_secondary << 8) | 0x5A).into();
+    // Default shape fill: neutral gray, fully opaque. Custom colors come
+    // later; until then every new design starts here.
+    let color: gpui::Background = rgb(0x808080).into();
     let mut list = Vec::new();
 
     for layer in &doc.layers {
@@ -87,16 +85,116 @@ pub fn build_draw_list(
             );
         }
     }
+    // Hover affordances: outline on interior hover, side bar, corner dot.
+    // The independently selected edge/corner stays highlighted permanently.
+    let mut handle_highlight = |list: &mut Vec<Primitive>,
+                                doc: &Document,
+                                camera: &Camera,
+                                sid: crate::core::ids::ShapeId,
+                                handle: crate::editor::Handle| {
+        if let Some(unit) = doc.shape_bounds(sid) {
+            let accent: gpui::Background = rgb(t.accent).into();
+            let (x, y, w, h) = screen_rect(unit, camera);
+            const BAR: f32 = 3.;
+            match handle {
+                Handle::N => list.push(Primitive::Rect {
+                    bounds: Bounds {
+                        origin: Point { x: px(x), y: px(y - BAR / 2.) },
+                        size: Size { width: px(w), height: px(BAR) },
+                    },
+                    color: accent,
+                }),
+                Handle::S => list.push(Primitive::Rect {
+                    bounds: Bounds {
+                        origin: Point { x: px(x), y: px(y + h - BAR / 2.) },
+                        size: Size { width: px(w), height: px(BAR) },
+                    },
+                    color: accent,
+                }),
+                Handle::W => list.push(Primitive::Rect {
+                    bounds: Bounds {
+                        origin: Point { x: px(x - BAR / 2.), y: px(y) },
+                        size: Size { width: px(BAR), height: px(h) },
+                    },
+                    color: accent,
+                }),
+                Handle::E => list.push(Primitive::Rect {
+                    bounds: Bounds {
+                        origin: Point { x: px(x + w - BAR / 2.), y: px(y) },
+                        size: Size { width: px(BAR), height: px(h) },
+                    },
+                    color: accent,
+                }),
+                corner => {
+                    let (hx, hy) = match corner {
+                        Handle::Nw => (x, y),
+                        Handle::Ne => (x + w, y),
+                        Handle::Se => (x + w, y + h),
+                        _ => (x, y + h),
+                    };
+                    circle(list, Point { x: px(hx), y: px(hy) }, 4.);
+                }
+            }
+        }
+    };
+
+    if let Some((sid, handle)) = hover
+        && Some(sid) != selection
+    {
+        match handle {
+            Some(hd) => handle_highlight(&mut list, doc, camera, sid, hd),
+            None => {
+                if let Some(unit) = doc.shape_bounds(sid) {
+                    let (x, y, w, h) = screen_rect(unit, camera);
+                    list.push(Primitive::Outline {
+                        bounds: Bounds {
+                            origin: Point { x: px(x), y: px(y) },
+                            size: Size { width: px(w), height: px(h) },
+                        },
+                    });
+                }
+            }
+        }
+    }
+
+    // Persistent highlight for the selected edge/corner — only meaningful
+    // while its shape is NOT fully selected (a selected shape shows the
+    // full handle set instead).
+    if let Some((sid, handle)) = selected_handle
+        && Some(sid) != selection
+    {
+        handle_highlight(&mut list, doc, camera, sid, handle);
+    }
+
+    // Dimension lines render whenever there's an active dimension source
+    // (selection, pending shape, or hover-resize) — independent of whether
+    // the shape is selected.
+    if let Some(geom) = dim_geom {
+        let dim_color: gpui::Background = rgb(t.accent).into();
+        list.extend(dimension_prims(geom.x, geom.y, geom.w, geom.h, geom.ext, dim_color));
+    }
+    // Single-axis dimension while edge-resizing.
+    if let Some((geom, is_width)) = edge_dim {
+        let accent: gpui::Background = rgb(t.accent).into();
+        let dim_y = geom.y + geom.h + geom.ext;
+        let dim_x = geom.x + geom.w + geom.ext;
+        if is_width {
+            dashed_v(&mut list, geom.y + geom.h, dim_y, geom.x, accent);
+            dashed_v(&mut list, geom.y + geom.h, dim_y, geom.x + geom.w, accent);
+            dashed_h(&mut list, geom.x, geom.x + geom.w, dim_y, accent);
+        } else {
+            dashed_h(&mut list, geom.x + geom.w, dim_x, geom.y, accent);
+            dashed_h(&mut list, geom.x + geom.w, dim_x, geom.y + geom.h, accent);
+            dashed_v(&mut list, geom.y, geom.y + geom.h, dim_x, accent);
+        }
+    }
+
     // Selection overlay drawn AFTER every shape fill so nothing can cover
-    // the outline, dimension lines, or handles.
+    // the outline or handles.
     if let Some(sel) = selection
         && let Some(unit) = doc.shape_bounds(sel)
     {
         let (x, y, w, h) = screen_rect(unit, camera);
-        // Dimensions at the bottom of the overlay stack.
-        if let Some(geom) = dim_geom {
-            list.extend(dimension_prims(geom.x, geom.y, geom.w, geom.h, geom.ext));
-        }
         // 2px selection outline.
         list.push(Primitive::Outline {
             bounds: Bounds {
@@ -112,13 +210,31 @@ pub fn build_draw_list(
         }
     }
 
-    // In-progress shape being dragged out (on top of fills).
+    // In-progress shape being dragged out (on top of fills), plus an
+    // accent crosshair pinned to the anchor corner.
     if let Some((kind, unit)) = pending {
         if overlaps(unit, visible) {
             if let Some(prim) = to_primitive(kind, unit, camera, color) {
                 list.push(prim);
             }
         }
+        let s = camera.unit_to_screen(unit.origin);
+        let (sx, sy) = (s.x as f32, s.y as f32);
+        const ARM: f32 = 4.;
+        list.push(Primitive::Rect {
+            bounds: Bounds {
+                origin: Point { x: px(sx - ARM), y: px(sy) },
+                size: Size { width: px(ARM * 2.), height: px(1.) },
+            },
+            color: rgb(t.accent).into(),
+        });
+        list.push(Primitive::Rect {
+            bounds: Bounds {
+                origin: Point { x: px(sx), y: px(sy - ARM) },
+                size: Size { width: px(1.), height: px(ARM * 2.) },
+            },
+            color: rgb(t.accent).into(),
+        });
     }
     list
 }
@@ -169,11 +285,6 @@ fn to_primitive(
                 origin: Point { x: px(x), y: px(y) },
                 size: Size { width: px(w), height: px(h) },
             },
-            color,
-        },
-        ShapeKind::Ellipse => Primitive::Ellipse {
-            center: Point { x: px(x + w / 2.), y: px(y + h / 2.) },
-            radii: Size { width: px(w / 2.), height: px(h / 2.) },
             color,
         },
     })
@@ -228,8 +339,14 @@ fn dashed_v(list: &mut Vec<Primitive>, y0: f32, y1: f32, x: f32, color: gpui::Ba
 // Witness stubs (perpendicular, offset by `ext` SCREEN pixels from the edge)
 // plus the parallel dashed dimension line, for width (bottom) and height
 // (right). The label itself is a DOM overlay added by the canvas view.
-pub fn dimension_prims(x: f32, y: f32, w: f32, h: f32, ext: f32) -> Vec<Primitive> {
-    let color: gpui::Background = rgb(crate::theme::ACCENT).into();
+pub fn dimension_prims(
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    ext: f32,
+    color: gpui::Background,
+) -> Vec<Primitive> {
     let mut list = Vec::new();
     const OVERSHOOT: f32 = 3.;
 
@@ -256,47 +373,4 @@ pub fn dimension_label_centers(x: f32, y: f32, w: f32, h: f32, ext: f32) -> [(f3
         (x + w + ext, y + h / 2.), // height
     ]
 }
-
-// Four-cubic-bezier ellipse approximation (standard kappa constant).
-pub fn ellipse_path(center: Point<Pixels>, radii: Size<Pixels>) -> Option<Path<Pixels>> {
-    let kx = radii.width * ELLIPSE_KAPPA;
-    let ky = radii.height * ELLIPSE_KAPPA;
-    let c = center;
-    let rx = radii.width;
-    let ry = radii.height;
-
-    let mut b = PathBuilder::fill();
-    b.move_to(Point { x: c.x + rx, y: c.y });
-    // NOTE: cubic_bezier_to takes (to, control_a, control_b).
-    b.cubic_bezier_to(
-        Point { x: c.x, y: c.y + ry },
-        Point { x: c.x + rx, y: c.y + ky },
-        Point { x: c.x + kx, y: c.y + ry },
-    );
-    b.cubic_bezier_to(
-        Point { x: c.x - rx, y: c.y },
-        Point { x: c.x - kx, y: c.y + ry },
-        Point { x: c.x - rx, y: c.y + ky },
-    );
-    b.cubic_bezier_to(
-        Point { x: c.x, y: c.y - ry },
-        Point { x: c.x - rx, y: c.y - ky },
-        Point { x: c.x - kx, y: c.y - ry },
-    );
-    b.cubic_bezier_to(
-        Point { x: c.x + rx, y: c.y },
-        Point { x: c.x + kx, y: c.y - ry },
-        Point { x: c.x + rx, y: c.y - ky },
-    );
-    b.close();
-    b.build().ok()
-}
-
-
-
-
-
-
-
-
 

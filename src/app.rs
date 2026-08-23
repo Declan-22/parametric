@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use gpui::{App, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
+use gpui::{App, AppContext, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 
 use gpui_platform::application;
 
@@ -17,6 +17,7 @@ pub fn run() {
         init_registry(cx);
         theme::init(cx, saved_theme_mode(cx));
         register_action_handlers(cx);
+        bind_keys(cx);
 
         let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
 
@@ -47,6 +48,15 @@ fn load_fonts(cx: &mut App) {
     cx.text_system()
         .add_fonts(fonts)
         .expect("failed to load bundled fonts");
+}
+
+fn bind_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("ctrl-x", Cut, None),
+        KeyBinding::new("ctrl-c", Copy, None),
+        KeyBinding::new("ctrl-v", Paste, None),
+        KeyBinding::new("delete", DeleteSelection, None),
+    ]);
 }
 
 fn register_action_handlers(cx: &mut App) {

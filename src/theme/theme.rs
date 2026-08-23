@@ -6,7 +6,7 @@ pub const FONT_MONO: &str = "Departure Mono";
 // Accent color for interactive indicators (selection outlines, handles).
 pub const ACCENT: u32 = 0x4C8DFF;
 
-// Snap indicator color (guides + snap marker) — distinct from accent.
+// Snap indicator color (guides + snap marker) â€” distinct from accent.
 pub const SNAP: u32 = 0xFF9500;
 
 // Fades an RGBA color's alpha byte in from transparent (0xRRGGBBAA colors).
@@ -57,6 +57,8 @@ pub struct Theme {
     pub button_background: u32,
     pub button_text: u32,
     pub button_border_color: u32,
+
+    pub accent: u32,
 }
 
 impl Theme {
@@ -110,6 +112,8 @@ impl Theme {
             button_background: LIGHT_BUTTON_BACKGROUND,
             button_text: LIGHT_BUTTON_TEXT,
             button_border_color: LIGHT_BUTTON_BORDER_COLOR,
+
+            accent: LIGHT_ACCENT,
         }
     }
 
@@ -135,6 +139,8 @@ impl Theme {
             button_background: DARK_BUTTON_BACKGROUND,
             button_text: DARK_BUTTON_TEXT,
             button_border_color: DARK_BUTTON_BORDER_COLOR,
+
+            accent: DARK_ACCENT,
         }
     }
 }

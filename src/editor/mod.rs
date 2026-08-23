@@ -21,7 +21,6 @@ pub enum Tool {
     Move,
     Pan,
     Rectangle,
-    Ellipse,
 }
 
 // In-progress shape being dragged out.
@@ -65,6 +64,18 @@ pub struct ResizeState {
     pub id: ShapeId,
     pub handle: Handle,
     orig: Rect,
+    // Doc-space cursor at grab time Ã¢â‚¬â€ used to detect physical movement
+    // before showing dimension annotations.
+    pub start_cursor: Point2,
+    pub moved: bool,
+}
+
+// What the cursor is currently over in Move mode.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HoverInfo {
+    pub shape: ShapeId,
+    // None = interior.
+    pub handle: Option<Handle>,
 }
 
 // Screen-space selection rectangle plus extension offset for dimensions.
@@ -99,10 +110,19 @@ pub struct Editor {
     pub tool: Tool,
     pub pending_shape: Option<PendingShape>,
     pub selection: Option<ShapeId>,
-    pub hover_handle: Option<Handle>,
+    pub hover: Option<HoverInfo>,
+    // Independently selectable edge/corner: persists across mouse-up and
+    // is independent of shape selection.
+    pub selected_handle: Option<(ShapeId, Handle)>,
+    // Pending shape created by a single click (commit on next click, not
+    // on mouse-up).
+    pub pending_via_click: bool,
     // Selection dimension geometry, computed once per frame in screen space.
     // Single source of truth for both the painted lines and the label DOM.
     pub dim_geom: Option<DimGeom>,
+    // Single-axis dimension while edge-resizing (side drag): geom + which
+    // axis (true = width).
+    pub edge_dim: Option<(DimGeom, bool)>,
     // Active snap connections: from the dragged shape's key point to the
     // matched target, rendered as segment + markers.
     pub snap_guides: Vec<SnapGuide>,
@@ -111,8 +131,8 @@ pub struct Editor {
     pub last_cursor: Option<gpui::Point<gpui::Pixels>>,
     pub shift: bool,
     pub alt_down: bool,
-    dragging: Option<SelectionDrag>,
-    resizing: Option<ResizeState>,
+    pub(crate) dragging: Option<SelectionDrag>,
+    pub(crate) resizing: Option<ResizeState>,
     next_layer_id: u64,
     pan_start: Option<(gpui::Pixels, gpui::Pixels, Camera)>,
 }
@@ -155,7 +175,7 @@ pub struct SnapTarget {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct SelectionDrag {
+pub(crate) struct SelectionDrag {
     id: ShapeId,
     // Cursor offset from the shape's bounds origin at grab time.
     grab_offset: Point2,
@@ -180,8 +200,11 @@ impl Editor {
             tool: Tool::Move,
             pending_shape: None,
             selection: None,
-            hover_handle: None,
+            hover: None,
+            pending_via_click: false,
+            selected_handle: None,
             dim_geom: None,
+            edge_dim: None,
             snap_guides: Vec::new(),
             last_cursor: None,
             shift: false,
@@ -199,7 +222,9 @@ impl Editor {
         }
         self.tool = tool;
         self.pending_shape = None;
+        self.pending_via_click = false;
         self.selection = None;
+        self.selected_handle = None;
         self.dragging = None;
         true
     }
@@ -223,11 +248,30 @@ impl Editor {
                     self.begin_pan(cursor);
                     true
                 }
-                Tool::Rectangle | Tool::Ellipse => {
-                    let kind = match self.tool {
-                        Tool::Rectangle => ShapeKind::Rectangle,
-                        _ => ShapeKind::Ellipse,
-                    };
+                Tool::Rectangle => {
+                    let kind = ShapeKind::Rectangle;
+                    // Second click commits a click-created pending shape,
+                    // selects the new shape, and returns to Move mode.
+                    if let Some(pending) = self.pending_shape.take() {
+                        self.pending_via_click = false;
+                        self.snap_guides.clear();
+                        let bounds = pending.bounds();
+                        self.tool = Tool::Move;
+                        if bounds.size.w > 0. && bounds.size.h > 0. {
+                            let layer_id = self.doc.layers[0].id;
+                            let id = self.create_shape(
+                                layer_id,
+                                pending.kind,
+                                bounds.origin,
+                                Point2::new(
+                                    bounds.origin.x + bounds.size.w,
+                                    bounds.origin.y + bounds.size.h,
+                                ),
+                            );
+                            self.selection = Some(id);
+                        }
+                        return true;
+                    }
                     let (at, guides) = self.snap_point(self.cursor_doc(cursor), None);
                     self.snap_guides = guides;
                     self.pending_shape = Some(PendingShape {
@@ -236,18 +280,34 @@ impl Editor {
                         cursor: at,
                         proportional: false,
                     });
+                    // Committed on second click unless the user drags.
+                    self.pending_via_click = true;
                     true
                 }
                 Tool::Move => {
                     let p = self.cursor_doc(cursor);
                     let tol = self.handle_tolerance();
 
-                    // 1) Resize handles of the current selection win.
-                    if let Some(sel) = self.selection
-                        && let Some(b) = self.doc.shape_bounds(sel)
-                        && let Some(handle) = handle_at(b, p, tol)
+                    // 1) Hover-driven resize: corner/side of ANY shape,
+                    //    no pre-selection required. For UNSELECTED shapes,
+                    //    the edge/corner itself becomes selected and stays
+                    //    highlighted; a FULLY selected shape is just
+                    //    resized without touching edge/corner selection.
+                    if let Some(hi) = self.hover
+                        && let Some(handle) = hi.handle
+                        && let Some(b) = self.doc.shape_bounds(hi.shape)
                     {
-                        self.resizing = Some(ResizeState { id: sel, handle, orig: b });
+                        let was_selected = self.selection == Some(hi.shape);
+                        if !was_selected {
+                            self.selected_handle = Some((hi.shape, handle));
+                        }
+                        self.resizing = Some(ResizeState {
+                            id: hi.shape,
+                            handle,
+                            orig: b,
+                            start_cursor: p,
+                            moved: false,
+                        });
                         return true;
                     }
 
@@ -269,8 +329,8 @@ impl Editor {
                     match hit {
                         Some(id) => {
                             let b = self.doc.shape_bounds(id).unwrap();
-                            let changed = self.selection != Some(id);
                             self.selection = Some(id);
+                            self.selected_handle = None;
                             self.dragging = Some(SelectionDrag {
                                 id,
                                 grab_offset: Point2::new(
@@ -281,8 +341,9 @@ impl Editor {
                             true
                         }
                         None => {
-                            let had = self.selection.is_some();
+                            let had = self.selection.is_some() || self.selected_handle.is_some();
                             self.selection = None;
+                            self.selected_handle = None;
                             had
                         }
                     }
@@ -316,7 +377,7 @@ impl Editor {
             let Some(b) = self.doc.shape_bounds(drag.id) else {
                 return false;
             };
-            // Free movement in document units — sub-pixel precision allowed.
+            // Free movement in document units ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â sub-pixel precision allowed.
             let target_x = p.x - drag.grab_offset.x;
             let target_y = p.y - drag.grab_offset.y;
             let delta = Point2::new(target_x - b.origin.x, target_y - b.origin.y);
@@ -332,6 +393,14 @@ impl Editor {
         // Corner/side resize of the selection.
         if let Some(rs) = self.resizing {
             let p = self.cursor_doc(cursor);
+            // Track physical movement Ã¢â‚¬â€ dimensions only appear after the
+            // handle actually moves.
+            if let Some(rs_mut) = self.resizing.as_mut() {
+                rs_mut.moved = rs_mut.moved
+                    || ((p.x - rs_mut.start_cursor.x).abs()
+                        + (p.y - rs_mut.start_cursor.y).abs())
+                        > 1e-9;
+            }
             // Snap the moving corner/edge to nearby targets.
             let (sp, guides) = self.snap_point(p, Some(rs.id));
             self.snap_guides = guides;
@@ -342,33 +411,30 @@ impl Editor {
             const EPS: f64 = 1e-6;
             let px_ = sp.x;
             let py_ = sp.y;
+            // Crossing past the opposite edge flips the shape ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â allowed.
             match rs.handle {
-                // West edge moves, east edge fixed.
                 Handle::Nw | Handle::W | Handle::Sw => {
                     right = rs.orig.origin.x + rs.orig.size.w;
-                    left = px_.min(right - EPS);
+                    left = px_;
                 }
-                // East edge moves, west edge fixed.
                 Handle::Ne | Handle::E | Handle::Se => {
                     left = rs.orig.origin.x;
-                    right = px_.max(left + EPS);
+                    right = px_;
                 }
                 _ => {}
             }
             match rs.handle {
-                // North edge moves, south edge fixed.
                 Handle::Nw | Handle::N | Handle::Ne => {
                     bottom = rs.orig.origin.y + rs.orig.size.h;
-                    top = py_.min(bottom - EPS);
+                    top = py_;
                 }
-                // South edge moves, north edge fixed.
                 Handle::Sw | Handle::S | Handle::Se => {
                     top = rs.orig.origin.y;
-                    bottom = py_.max(top + EPS);
+                    bottom = py_;
                 }
                 _ => {}
             }
-            // Shift: keep proportions (corners only — sides move one axis).
+            // Shift: keep proportions (corners only ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â sides move one axis).
             if shift && matches!(rs.handle, Handle::Nw | Handle::Ne | Handle::Se | Handle::Sw) {
                 // The fixed opposite corner anchors the scale.
                 let ax = if rs.handle.moves_x() { right } else { left };
@@ -398,17 +464,14 @@ impl Editor {
         false
     }
 
-    // Screen-space tolerance (6px) converted to document units.
+    // Screen-space tolerance (px) converted to document units.
     fn handle_tolerance(&self) -> f64 {
-        6.0 / self.camera.zoom
+        8.0 / self.camera.zoom
     }
 
     // Document-space size of the current selection (for dimension text).
     pub fn selection_size(&self) -> Option<(f64, f64)> {
-        let b = self
-            .selection
-            .and_then(|sel| self.doc.shape_bounds(sel))?;
-        Some((b.size.w, b.size.h))
+        self.dim_size()
     }
 
     // -- snapping --
@@ -417,7 +480,7 @@ impl Editor {
         6.0 / self.camera.zoom
     }
 
-    // Snapping is suppressed while Alt is held — the standard escape hatch
+    // Snapping is suppressed while Alt is held ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â the standard escape hatch
     // when you want free placement.
     fn snapping_active(&self) -> bool {
         !self.alt_down
@@ -426,7 +489,7 @@ impl Editor {
     // All snap locations exposed by shapes other than `exclude`.
     // Point targets (corners, center) offer both axes. Edge targets snap
     // only their normal axis and require the point to lie within the
-    // edge's span on the other axis — that's what makes sides snappable.
+    // edge's span on the other axis ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â that's what makes sides snappable.
     fn snap_targets(&self, exclude: Option<ShapeId>) -> Vec<SnapTarget> {
         let mut out = Vec::new();
         for layer in &self.doc.layers {
@@ -654,40 +717,121 @@ impl Editor {
             None => (delta, Vec::new()),
         }
     }
-    // Recomputes the selection's dimension geometry (screen space). Called
-    // once per frame before painting; lines and labels both read this.
-    pub fn update_dim_geom(&mut self) {
-        self.dim_geom = self
+    // The rect dimensions should describe right now: the pending rubber
+    // band while creating, otherwise the selection. Zero-size = no dims.
+    fn dim_source_rect(&self) -> Option<Rect> {
+        // While corner-resizing, dimensions track the resized shape Ã¢â‚¬â€ but
+        // only once the handle has physically moved... unless the shape is
+        // fully selected, in which case they show immediately.
+        if let Some(rs) = &self.resizing {
+            let fully_selected = Some(rs.id) == self.selection;
+            if !rs.moved && !fully_selected {
+                return None;
+            }
+            if matches!(rs.handle, Handle::Nw | Handle::Ne | Handle::Se | Handle::Sw) {
+                let b = self.doc.shape_bounds(rs.id)?;
+                return (b.size.w > 0. && b.size.h > 0.).then_some(b);
+            }
+            return None; // side resize uses the single edge_dim instead
+        }
+        if let Some(p) = &self.pending_shape {
+            let b = p.bounds();
+            return if b.size.w > 0. && b.size.h > 0. { Some(b) } else { None };
+        }
+        let b = self
             .selection
-            .and_then(|sel| self.doc.shape_bounds(sel))
-            .filter(|_| self.pending_shape.is_none())
-            .map(|b| {
-                let tl = self.camera.unit_to_screen(b.origin);
-                let br = self
-                    .camera
-                    .unit_to_screen(Point2::new(b.origin.x + b.size.w, b.origin.y + b.size.h));
-                DimGeom {
-                    x: (tl.x as f32).min(br.x as f32),
-                    y: (tl.y as f32).min(br.y as f32),
-                    w: (tl.x - br.x).abs() as f32,
-                    h: (tl.y - br.y).abs() as f32,
-                    ext: crate::ui::canvas::paint::extension_offset(self.camera.zoom),
-                }
-            });
+            .and_then(|sel| self.doc.shape_bounds(sel))?;
+        (b.size.w > 0. && b.size.h > 0.).then_some(b)
     }
 
-    // Updates the hover handle for cursor styling. Returns true on change.
+    fn screen_dim_geom(&self, b: Rect) -> DimGeom {
+        let tl = self.camera.unit_to_screen(b.origin);
+        let br =
+            self.camera
+                .unit_to_screen(Point2::new(b.origin.x + b.size.w, b.origin.y + b.size.h));
+        DimGeom {
+            x: (tl.x as f32).min(br.x as f32),
+            y: (tl.y as f32).min(br.y as f32),
+            w: (tl.x - br.x).abs() as f32,
+            h: (tl.y - br.y).abs() as f32,
+            ext: crate::ui::canvas::paint::extension_offset(self.camera.zoom),
+        }
+    }
+    // Recomputes dimension geometry (screen space). Called once per frame
+    // before painting; lines and labels both read this.
+    pub fn update_dim_geom(&mut self) {
+        // While edge-resizing (side drag, no corner), show exactly ONE
+        // dimension Ã¢â‚¬â€ the changing axis. Shows immediately for a fully
+        // selected shape; otherwise only once the handle has moved.
+        if let Some(rs) = &self.resizing
+            && (rs.moved || Some(rs.id) == self.selection)
+            && matches!(
+                rs.handle,
+                Handle::N | Handle::S | Handle::E | Handle::W
+            )
+            && let Some(b) = self.doc.shape_bounds(rs.id)
+        {
+            self.dim_geom = None;
+            self.edge_dim = Some((self.screen_dim_geom(b), matches!(rs.handle, Handle::E | Handle::W)));
+            return;
+        }
+        self.edge_dim = None;
+        self.dim_geom = self.dim_source_rect().map(|b| {
+            let tl = self.camera.unit_to_screen(b.origin);
+            let br =
+                self.camera
+                    .unit_to_screen(Point2::new(b.origin.x + b.size.w, b.origin.y + b.size.h));
+            DimGeom {
+                x: (tl.x as f32).min(br.x as f32),
+                y: (tl.y as f32).min(br.y as f32),
+                w: (tl.x - br.x).abs() as f32,
+                h: (tl.y - br.y).abs() as f32,
+                ext: crate::ui::canvas::paint::extension_offset(self.camera.zoom),
+            }
+        });
+    }
+
+    // Document-space size of the dim source (pending or selection).
+    pub fn dim_size(&self) -> Option<(f64, f64)> {
+        let b = self.dim_source_rect()?;
+        Some((b.size.w, b.size.h))
+    }
+
+    // Updates hover state for cursor styling + direct manipulation
+    // affordances. Returns true on change.
     pub fn canvas_hover(&mut self, cursor: gpui::Point<gpui::Pixels>) -> bool {
         if self.tool != Tool::Move || self.dragging.is_some() || self.resizing.is_some() {
             return false;
         }
         let p = self.cursor_doc(cursor);
-        let handle = self
-            .selection
-            .and_then(|sel| self.doc.shape_bounds(sel))
-            .and_then(|b| handle_at(b, p, self.handle_tolerance()));
-        if self.hover_handle != handle {
-            self.hover_handle = handle;
+        let tol = self.handle_tolerance();
+
+        // Topmost shape whose handles OR body are under the cursor.
+        // Handles win over body, so they're grabbable even slightly
+        // outside the bounds.
+        let mut info = None;
+        for layer in self.doc.layers.iter().rev() {
+            for &sid in layer.shape_ids.iter().rev() {
+                let Some(b) = self.doc.shape_bounds(sid) else {
+                    continue;
+                };
+                if let Some(handle) = handle_at(b, p, tol) {
+                    info = Some(HoverInfo { shape: sid, handle: Some(handle) });
+                    break;
+                }
+                if b.contains(p) && info.is_none() {
+                    info = Some(HoverInfo { shape: sid, handle: None });
+                }
+            }
+            if info.as_ref().map(|i| i.handle.is_some()).unwrap_or(false) {
+                break;
+            }
+        }
+
+        if self.hover.map(|h| h.shape) != info.map(|i| i.shape)
+            || self.hover.and_then(|h| h.handle) != info.and_then(|i| i.handle)
+        {
+            self.hover = info;
             return true;
         }
         false
@@ -695,7 +839,29 @@ impl Editor {
 
     pub fn cursor_style(&self) -> gpui::CursorStyle {
         use gpui::CursorStyle;
-        match self.hover_handle {
+        // Grab/grabbing in Pan mode (gpui: open/closed hand).
+        if self.pan_start.is_some() {
+            return CursorStyle::ClosedHand;
+        }
+        if self.tool == Tool::Pan {
+            return CursorStyle::OpenHand;
+        }
+        // Crosshair while placing a rectangle.
+        if self.tool == Tool::Rectangle {
+            return CursorStyle::Crosshair;
+        }
+        // Resize cursors only when a shape is FULLY selected and the
+        // cursor is on one of its handlers. Everywhere else: default.
+        let on_selected_handler = self
+            .hover
+            .as_ref()
+            .filter(|h| Some(h.shape) == self.selection)
+            .and_then(|h| h.handle)
+            .is_some();
+        if !on_selected_handler {
+            return CursorStyle::Arrow;
+        }
+        match self.hover.as_ref().and_then(|h| h.handle) {
             Some(Handle::Nw) | Some(Handle::Se) => CursorStyle::ResizeUpLeftDownRight,
             Some(Handle::Ne) | Some(Handle::Sw) => CursorStyle::ResizeUpRightDownLeft,
             Some(Handle::N) | Some(Handle::S) => CursorStyle::ResizeUpDown,
@@ -714,6 +880,16 @@ impl Editor {
         self.dragging = None;
         self.resizing = None;
         self.snap_guides.clear();
+        // Ending a pan-mode drag must release the pan state, otherwise
+        // mouse movement keeps panning forever.
+        if button == gpui::MouseButton::Left && self.end_pan() {
+            return true;
+        }
+        // Click-created pending shapes survive mouse-up; they commit on the
+        // next click instead. Only drag-created ones commit here.
+        if self.pending_via_click {
+            return true;
+        }
         let Some(pending) = self.pending_shape.take() else {
             return false;
         };
@@ -724,10 +900,18 @@ impl Editor {
             return true;
         }
         let bounds = pending.bounds();
-        let layer_id = self.doc.layers[0].id;
-        self.create_shape(layer_id, pending.kind, bounds.origin, {
-            Point2::new(bounds.origin.x + bounds.size.w, bounds.origin.y + bounds.size.h)
-        });
+        // Drag-committed: select the new shape and return to Move mode.
+        self.tool = Tool::Move;
+        if bounds.size.w > 0. && bounds.size.h > 0. {
+            let layer_id = self.doc.layers[0].id;
+            let id = self.create_shape(
+                layer_id,
+                pending.kind,
+                bounds.origin,
+                Point2::new(bounds.origin.x + bounds.size.w, bounds.origin.y + bounds.size.h),
+            );
+            self.selection = Some(id);
+        }
         true
     }
 
@@ -802,7 +986,7 @@ impl Editor {
         self.doc.add_shape(layer_id, kind, [pa, pb])
     }
 
-    // Visible region in document units — used for culling before paint.
+    // Visible region in document units ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â used for culling before paint.
     pub fn visible_bounds(&self, size: Size) -> Rect {
         let min = self.camera.screen_to_unit(Point2::new(0., 0.));
         let max = self.camera.screen_to_unit(Point2::new(size.w, size.h));
@@ -813,12 +997,14 @@ impl Editor {
 // Which resize handle (if any) is under a document-space point, given a
 // tolerance in document units. Corners win over sides.
 pub fn handle_at(b: Rect, p: Point2, tol: f64) -> Option<Handle> {
+    // Corners get a bigger hitbox so they're easy to reach.
+    let corner_tol = tol * 1.6;
     let right = b.origin.x + b.size.w;
     let bottom = b.origin.y + b.size.h;
-    let near_left = (p.x - b.origin.x).abs() <= tol;
-    let near_right = (p.x - right).abs() <= tol;
-    let near_top = (p.y - b.origin.y).abs() <= tol;
-    let near_bottom = (p.y - bottom).abs() <= tol;
+    let near_left = (p.x - b.origin.x).abs() <= corner_tol;
+    let near_right = (p.x - right).abs() <= corner_tol;
+    let near_top = (p.y - b.origin.y).abs() <= corner_tol;
+    let near_bottom = (p.y - bottom).abs() <= corner_tol;
     let inside_x = p.x >= b.origin.x - tol && p.x <= right + tol;
     let inside_y = p.y >= b.origin.y - tol && p.y <= bottom + tol;
 
@@ -842,5 +1028,7 @@ pub fn handle_at(b: Rect, p: Point2, tol: f64) -> Option<Handle> {
         None
     }
 }
+
+
 
 

@@ -1,10 +1,12 @@
 mod camera;
+pub mod pick;
 
 pub use camera::Camera;
 
-use crate::core::document::{Document, Layer, ShapeKind};
+use crate::core::constraints::{ConstraintKind, ElementRef};
+use crate::core::document::{Document, Layer};
 use crate::core::geometry::{Point2, Rect};
-use crate::core::ids::ShapeId;
+use crate::core::ids::{FillId, PointId};
 
 // The session: the permanent design plus view/editing state.
 // Owns nothing about GPUI widgets; the UI layer drives it.
@@ -15,7 +17,8 @@ pub struct Size {
     pub h: f64,
 }
 
-// Active canvas tool. Move/Pan are modes; the shape tools create on drag.
+// Active canvas tool. Move/Pan are modes; shape tools emit element
+// composites (the document has no "rectangle" object).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
     Move,
@@ -23,69 +26,13 @@ pub enum Tool {
     Rectangle,
 }
 
-// In-progress shape being dragged out.
+// In-progress rectangle being dragged out (tool-side preview only).
 #[derive(Clone, Copy, Debug)]
 pub struct PendingShape {
-    pub kind: ShapeKind,
     pub start: Point2,
     pub cursor: Point2,
-    // Shift held: keep width == height (perfect square/circle).
+    // Shift held: keep width == height (perfect square).
     pub proportional: bool,
-}
-
-// The eight resize zones around a selected shape.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Handle {
-    Nw,
-    N,
-    Ne,
-    E,
-    Se,
-    S,
-    Sw,
-    W,
-}
-
-impl Handle {
-    pub const CORNERS: [Handle; 4] = [Handle::Nw, Handle::Ne, Handle::Se, Handle::Sw];
-
-    fn moves_x(self) -> bool {
-        matches!(self, Handle::Nw | Handle::W | Handle::Sw)
-    }
-
-    fn moves_y(self) -> bool {
-        matches!(self, Handle::Nw | Handle::N | Handle::Ne)
-    }
-}
-
-// Active corner/side resize of the selected shape.
-#[derive(Clone, Copy, Debug)]
-pub struct ResizeState {
-    pub id: ShapeId,
-    pub handle: Handle,
-    orig: Rect,
-    // Doc-space cursor at grab time Ã¢â‚¬â€ used to detect physical movement
-    // before showing dimension annotations.
-    pub start_cursor: Point2,
-    pub moved: bool,
-}
-
-// What the cursor is currently over in Move mode.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct HoverInfo {
-    pub shape: ShapeId,
-    // None = interior.
-    pub handle: Option<Handle>,
-}
-
-// Screen-space selection rectangle plus extension offset for dimensions.
-#[derive(Clone, Copy, Debug)]
-pub struct DimGeom {
-    pub x: f32,
-    pub y: f32,
-    pub w: f32,
-    pub h: f32,
-    pub ext: f32,
 }
 
 impl PendingShape {
@@ -104,52 +51,44 @@ impl PendingShape {
     }
 }
 
-pub struct Editor {
-    pub doc: Document,
-    pub camera: Camera,
-    pub tool: Tool,
-    pub pending_shape: Option<PendingShape>,
-    pub selection: Vec<ShapeId>,
-    // Edge/corner sub-selections: these shapes scale per their selected
-    // sides during group moves instead of translating.
-    pub selected_handles: Vec<(ShapeId, Handle)>,
-    // Rubber-band marquee: (start doc, current doc).
-    pub marquee: Option<(Point2, Point2)>,
-    pub hover: Option<HoverInfo>,
-    pub group_drag_last: Option<Point2>,
-    // Pending shape created by a single click (commit on next click, not
-    // on mouse-up).
-    pub pending_via_click: bool,
-    // Selection dimension geometry, computed once per frame in screen space.
-    // Single source of truth for both the painted lines and the label DOM.
-    pub dim_geom: Option<DimGeom>,
-    // Single-axis dimension while edge-resizing (side drag): geom + which
-    // axis (true = width).
-    pub edge_dim: Option<(DimGeom, bool)>,
-    // Active snap connections: from the dragged shape's key point to the
-    // matched target, rendered as segment + markers.
-    pub snap_guides: Vec<SnapGuide>,
-    // Last known cursor + shift state, so modifier changes can re-derive
-    // the pending drag/resize instantly.
-    pub last_cursor: Option<gpui::Point<gpui::Pixels>>,
-    pub shift: bool,
-    pub alt_down: bool,
-    pub(crate) dragging: Option<SelectionDrag>,
-    pub(crate) resizing: Option<ResizeState>,
-    next_layer_id: u64,
-    pan_start: Option<(gpui::Pixels, gpui::Pixels, Camera)>,
+// An active endpoint/body drag: the points being moved and where they
+// started, so the delta is recomputed from scratch every frame (keeps
+// clamping and snapping stable).
+pub(crate) struct DragState {
+    pub points: Vec<(PointId, Point2)>,
+    pub start_cursor: Point2,
+}
+
+// Screen-space render data for one dimension: measured endpoints, the
+// parallel dim line, extension stubs, and the label anchor. Computed once
+// per frame; paint draws the lines, the DOM layer draws labels.
+#[derive(Clone, Debug)]
+pub struct DimRender {
+    pub ax: f32,
+    pub ay: f32,
+    pub bx: f32,
+    pub by: f32,
+    pub lax: f32,
+    pub lay: f32,
+    pub lbx: f32,
+    pub lby: f32,
+    pub label_cx: f32,
+    pub label_cy: f32,
+    pub text: String,
+    // Additional extension lines (screen x1,y1,x2,y2) reaching from other
+    // objects' extremes to this dim line.
+    pub extra_ext: Vec<[f32; 4]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnapKind {
-    Corner,
+    Endpoint,
     Midpoint,
-    Center,
     Edge,
 }
 
 // A visual snap connection: what locked onto what. Edge snaps carry the
-// target's full span so rendering can trace the entire side.
+// target's full span so rendering can trace it.
 #[derive(Clone, Copy, Debug)]
 pub struct SnapGuide {
     pub vertical: bool,
@@ -161,27 +100,47 @@ pub struct SnapGuide {
     pub span_hi: f64,
 }
 
-// One candidate location other shapes expose for snapping. Corners are
-// points; edges carry a span along their axis so any position along the
-// edge can snap (point-on-edge).
+// One candidate location other geometry exposes for snapping. Points offer
+// both axes; edges snap only their normal axis within their span.
 #[derive(Clone, Copy, Debug)]
-pub struct SnapTarget {
-    pub x: f64,
-    pub y: f64,
-    pub kind: SnapKind,
-    pub snap_x: bool,
-    pub snap_y: bool,
-    pub has_span: bool,
-    pub span_lo: f64,
-    pub span_hi: f64,
-    pub span_is_x: bool,
+struct SnapTarget {
+    x: f64,
+    y: f64,
+    kind: SnapKind,
+    snap_x: bool,
+    snap_y: bool,
+    span_lo: f64,
+    span_hi: f64,
+    span_is_x: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct SelectionDrag {
-    id: ShapeId,
-    // Cursor offset from the shape's bounds origin at grab time.
-    grab_offset: Point2,
+pub struct Editor {
+    pub doc: Document,
+    pub camera: Camera,
+    pub tool: Tool,
+    pub pending_shape: Option<PendingShape>,
+    // Pending rectangle created by a single click (commit on next click).
+    pub pending_via_click: bool,
+    pub selection: Vec<ElementRef>,
+    pub hover: Option<ElementRef>,
+    // Rubber-band marquee: (start doc, current doc).
+    pub marquee: Option<(Point2, Point2)>,
+    // Shift held at marquee start: extend the selection instead of replacing.
+    pub marquee_add: bool,
+    // Tolerant-only hit awaiting mouse-up: becomes a click-select when the
+    // band never grew, else the marquee result takes over.
+    pub(crate) deferred_pick: Option<ElementRef>,
+    pub group_drag_last: Option<Point2>,
+    pub snap_guides: Vec<SnapGuide>,
+    // Per-frame dimension render data (preview + stored dims).
+    pub dim_renders: Vec<DimRender>,
+    // Last known cursor + modifier state so changes can re-derive drags.
+    pub last_cursor: Option<gpui::Point<gpui::Pixels>>,
+    pub shift: bool,
+    pub alt_down: bool,
+    pub(crate) dragging: Option<DragState>,
+    next_layer_id: u64,
+    pan_start: Option<(gpui::Pixels, gpui::Pixels, Camera)>,
 }
 
 impl Editor {
@@ -190,7 +149,7 @@ impl Editor {
         doc.layers.push(Layer {
             id: 1,
             name: "Layer 1".into(),
-            shape_ids: Vec::new(),
+            elements: Vec::new(),
         });
         Self::from_document(doc)
     }
@@ -202,20 +161,19 @@ impl Editor {
             camera: Camera::new(),
             tool: Tool::Move,
             pending_shape: None,
+            pending_via_click: false,
             selection: Vec::new(),
             hover: None,
-            pending_via_click: false,
-            selected_handles: Vec::new(),
             marquee: None,
+            marquee_add: false,
+            deferred_pick: None,
             group_drag_last: None,
-            dim_geom: None,
-            edge_dim: None,
             snap_guides: Vec::new(),
+            dim_renders: Vec::new(),
             last_cursor: None,
             shift: false,
             alt_down: false,
             dragging: None,
-            resizing: None,
             next_layer_id: next_layer_id.max(2),
             pan_start: None,
         }
@@ -229,11 +187,15 @@ impl Editor {
         self.pending_shape = None;
         self.pending_via_click = false;
         self.selection.clear();
-        self.selected_handles.clear();
         self.marquee = None;
         self.group_drag_last = None;
         self.dragging = None;
         true
+    }
+
+    // True while no drag or pan is in progress (gates hover tracking).
+    pub fn is_idle(&self) -> bool {
+        self.pan_start.is_none() && self.dragging.is_none()
     }
 
     // -- canvas input (called from the canvas view) --
@@ -244,7 +206,13 @@ impl Editor {
     }
 
     // Mouse down on the canvas. Returns true if a repaint is needed.
-    pub fn canvas_down(&mut self, button: gpui::MouseButton, cursor: gpui::Point<gpui::Pixels>) -> bool {
+    pub fn canvas_down(
+        &mut self,
+        button: gpui::MouseButton,
+        cursor: gpui::Point<gpui::Pixels>,
+        shift: bool,
+        click_count: usize,
+    ) -> bool {
         match button {
             gpui::MouseButton::Middle => {
                 self.begin_pan(cursor);
@@ -256,112 +224,87 @@ impl Editor {
                     true
                 }
                 Tool::Rectangle => {
-                    let kind = ShapeKind::Rectangle;
-                    // Second click commits a click-created pending shape,
-                    // selects the new shape, and returns to Move mode.
+                    // Second click commits a click-created pending rectangle.
                     if let Some(pending) = self.pending_shape.take() {
                         self.pending_via_click = false;
                         self.snap_guides.clear();
-                        let bounds = pending.bounds();
                         self.tool = Tool::Move;
-                        if bounds.size.w > 0. && bounds.size.h > 0. {
+                        let b = pending.bounds();
+                        if b.size.w > 0. && b.size.h > 0. {
                             let layer_id = self.doc.layers[0].id;
-                            let id = self.create_shape(
-                                layer_id,
-                                pending.kind,
-                                bounds.origin,
-                                Point2::new(
-                                    bounds.origin.x + bounds.size.w,
-                                    bounds.origin.y + bounds.size.h,
-                                ),
-                            );
-                            self.selection = vec![id];
+                            let fill = self.create_rectangle(layer_id, b.origin, Point2::new(
+                                b.origin.x + b.size.w,
+                                b.origin.y + b.size.h,
+                            ));
+                            self.selection = vec![ElementRef::Fill(fill)];
                         }
                         return true;
                     }
-                    let (at, guides) = self.snap_point(self.cursor_doc(cursor), None);
+                    let (at, guides) = self.snap_point(self.cursor_doc(cursor));
                     self.snap_guides = guides;
-                    self.pending_shape = Some(PendingShape {
-                        kind,
-                        start: at,
-                        cursor: at,
-                        proportional: false,
-                    });
-                    // Committed on second click unless the user drags.
+                    self.pending_shape =
+                        Some(PendingShape { start: at, cursor: at, proportional: false });
                     self.pending_via_click = true;
                     true
                 }
                 Tool::Move => {
                     let p = self.cursor_doc(cursor);
-                    let tol = self.handle_tolerance();
-                    let in_group = |id: ShapeId| {
-                        self.selection.contains(&id)
-                            || self.selected_handles.iter().any(|(s, _)| *s == id)
-                    };
+                    let picker = pick::Picker::new(&self.doc, &self.camera, HANDLE_TOL_PX);
+                    // Shift extends the selection instead of replacing it.
+                    self.marquee_add = shift;
 
-                    // 1) Hover-driven resize: corner/side of ANY shape.
-                    //    Shapes already in the selection (fully or via
-                    //    handles) become group moves instead — grabbing an
-                    //    already-selected edge must never deselect the
-                    //    other selected edges.
-                    if let Some(hi) = self.hover
-                        && let Some(handle) = hi.handle
-                        && let Some(b) = self.doc.shape_bounds(hi.shape)
-                    {
-                        let was_selected = in_group(hi.shape);
-                        if !was_selected {
-                            self.selected_handles = vec![(hi.shape, handle)];
-                            self.resizing = Some(ResizeState {
-                                id: hi.shape,
-                                handle,
-                                orig: b,
-                                start_cursor: p,
-                                moved: false,
-                            });
-                            return true;
-                        }
-                        // Group member: start a group move.
-                        self.group_drag_last = Some(p);
-                        return true;
-                    }
-
-                    // 2) Body hit-test, topmost shape wins.
-                    let mut hit = None;
-                    for layer in self.doc.layers.iter().rev() {
-                        for &sid in layer.shape_ids.iter().rev() {
-                            if let Some(b) = self.doc.shape_bounds(sid)
-                                && b.contains(p)
-                            {
-                                hit = Some(sid);
-                                break;
+                    // Exact hit (tight tolerance) grabs immediately. A
+                    // TOLERANT-only hit near geometry stays a marquee — the
+                    // grab zone around points/edges must not create dead
+                    // zones for band selection. The deferred pick resolves
+                    // on mouse-up as a click if the band never grew.
+                    let exact = pick::Picker::new(&self.doc, &self.camera, EXACT_TOL_PX).element(p);
+                    match picker.element(p) {
+                        Some(mut el) => {
+                            if exact.is_none() {
+                                // Tolerant-only hit: marquee wins; the pick
+                                // resolves as a click on mouse-up if the
+                                // band never grows.
+                                self.deferred_pick = Some(el);
+                                self.marquee = Some((p, p));
+                                return true;
                             }
-                        }
-                        if hit.is_some() {
-                            break;
-                        }
-                    }
-                    match hit {
-                        // Clicking a member keeps the group: group move.
-                        Some(id) if in_group(id) => {
-                            self.group_drag_last = Some(p);
-                            true
-                        }
-                        Some(id) => {
-                            let b = self.doc.shape_bounds(id).unwrap();
-                            self.selection = vec![id];
-                            self.selected_handles.clear();
-                            self.dragging = Some(SelectionDrag {
-                                id,
-                                grab_offset: Point2::new(
-                                    p.x - b.origin.x,
-                                    p.y - b.origin.y,
-                                ),
-                            });
+                            // Double-click on an edge escalates to its
+                            // containing object.
+                            if click_count >= 2
+                                && let Some(sid) = el.as_segment()
+                                && let Some(fid) = self.fill_containing(sid)
+                            {
+                                el = ElementRef::Fill(fid);
+                            }
+                            // Pressing part of an ALREADY-SELECTED object
+                            // keeps the whole selection; pressing something
+                            // unselected replaces it — unless shift adds.
+                            if !self.element_selected(el) {
+                                if self.marquee_add {
+                                    self.selection.push(el);
+                                } else {
+                                    self.selection = vec![el];
+                                }
+                            }
+
+                            // Grab-and-go: whatever is in the selection
+                            // AFTER the press resolves moves as one group.
+                            // Pressing selected geometry keeps the group;
+                            // pressing unselected geometry replaced it above,
+                            // so the drag is just that element.
+                            let pts = self.doc.selection_points(&self.selection);
+                            let start_pos = pts
+                                .iter()
+                                .filter_map(|&pid| self.doc.point(pid).map(|pos| (pid, pos)))
+                                .collect();
+                            self.dragging = Some(DragState { points: start_pos, start_cursor: p });
                             true
                         }
                         None => {
-                            self.selection.clear();
-                            self.selected_handles.clear();
+                            if !shift {
+                                self.selection.clear();
+                            }
                             self.marquee = Some((p, p));
                             true
                         }
@@ -379,218 +322,237 @@ impl Editor {
             self.snap_guides.clear();
             return true;
         }
-        if self.pending_shape.is_none() && self.dragging.is_none() && self.resizing.is_none() {
-            // Group move?
-            if let Some(last) = self.group_drag_last {
-                let cur = self.cursor_doc(cursor);
-                let dx = cur.x - last.x;
-                let dy = cur.y - last.y;
-                if dx != 0. || dy != 0. {
-                    self.apply_group_move(dx, dy);
-                    self.group_drag_last = Some(cur);
-                    return true;
-                }
-                return false;
-            }
-            // Marquee band update.
-            let p = self.cursor_doc(cursor);
-            if let Some((start, cur)) = self.marquee.as_mut() {
-                *cur = p;
-                return true;
-            }
-            self.snap_guides.clear();
-            return false;
-        }
+
+        // Rectangle rubber band.
         if self.pending_shape.is_some() {
-            let (cursor_doc, guides) = self.snap_point(self.cursor_doc(cursor), None);
+            let at = self.cursor_doc(cursor);
+            let (at, guides) = self.snap_point(at);
             self.snap_guides = guides;
-            let pending = self.pending_shape.as_mut().unwrap();
-            pending.cursor = cursor_doc;
-            pending.proportional = shift;
+            if let Some(pending) = self.pending_shape.as_mut() {
+                pending.cursor = at;
+                pending.proportional = shift;
+            }
             return true;
         }
-        if let Some(drag) = self.dragging {
+
+        // Group move (drag started on an already-selected element without
+        // reselecting): plain translate, no per-point clamping.
+        if self.dragging.is_none() && self.group_drag_last.is_some() {
+            return false;
+        }
+
+        // Endpoint/body drag with constraint clamps + snapping.
+        if self.dragging.is_some() {
+            let drag = self.dragging.as_ref().unwrap();
             let p = self.cursor_doc(cursor);
-            let Some(b) = self.doc.shape_bounds(drag.id) else {
-                return false;
-            };
-            // Free movement in document units — sub-pixel precision allowed.
-            let target_x = p.x - drag.grab_offset.x;
-            let target_y = p.y - drag.grab_offset.y;
-            let delta = Point2::new(target_x - b.origin.x, target_y - b.origin.y);
+            let delta = Point2::new(p.x - drag.start_cursor.x, p.y - drag.start_cursor.y);
             if delta.x == 0. && delta.y == 0. {
                 return false;
             }
-            // Snap: try aligning any key point of the moving shape with a
-            // target; apply the smallest correction.
-            let (delta, guides) = self.snap_move_delta(drag.id, b, delta);
-            self.snap_guides = guides;
-            return self.doc.translate_shape(drag.id, delta);
+            let ids: Vec<PointId> = drag.points.iter().map(|(id, _)| *id).collect();
+
+            // Snap: smallest correction over all dragged points' new spots.
+            let mut snapped_delta = delta;
+            if self.snapping_active() {
+                let mut best: Option<(f64, Point2)> = None;
+                for &(_pid, start) in &drag.points {
+                    let target = Point2::new(start.x + delta.x, start.y + delta.y);
+                    let (adj, _) = self.best_snap(target, &ids, true);
+                    let score = adj.x.abs() + adj.y.abs();
+                    if best.map_or(true, |(s, _)| score < s) {
+                        best = Some((score, adj));
+                    }
+                }
+                if let Some((_, adj)) = best {
+                    snapped_delta = Point2::new(delta.x + adj.x, delta.y + adj.y);
+                }
+            }
+
+            // Apply per point: snap-adjusted spot, then constraint clamps.
+            let apply_hv = ids.len() > 1;
+            let mut placements: Vec<(PointId, Point2)> = Vec::new();
+            for &(pid, start) in &drag.points {
+                let desired = Point2::new(start.x + snapped_delta.x, start.y + snapped_delta.y);
+                placements.push((pid, self.clamp_point(pid, desired, &ids, apply_hv)));
+            }
+
+            // Single-point drag: PROPAGATE along H/V constraints instead of
+            // clamping. Dragging a rectangle corner slides its two adjacent
+            // corners along their edges (opposite corner anchors), which is
+            // exactly how a constrained shape resizes.
+            if ids.len() == 1 {
+                let pid = ids[0];
+                let pos = placements[0].1;
+                for c in &self.doc.constraints {
+                    let other = if c.a == pid {
+                        Some(c.b)
+                    } else if c.b == pid {
+                        Some(c.a)
+                    } else {
+                        None
+                    };
+                    let Some(o) = other else { continue };
+                    if ids.contains(&o) || o == pid {
+                        continue;
+                    }
+                    match c.kind {
+                        ConstraintKind::Horizontal => {
+                            placements.push((o, Point2::new(self.doc.point(o).unwrap_or(pos).x, pos.y)));
+                        }
+                        ConstraintKind::Vertical => {
+                            placements.push((o, Point2::new(pos.x, self.doc.point(o).unwrap_or(pos).y)));
+                        }
+                        ConstraintKind::Coincident => {}
+                    }
+                }
+            }
+
+            for (id, pos) in placements {
+                self.doc.move_point(id, pos);
+            }
+            return true;
         }
-        // Corner/side resize of the selection.
-        if let Some(rs) = self.resizing {
-            let p = self.cursor_doc(cursor);
-            // Track physical movement Ã¢â‚¬â€ dimensions only appear after the
-            // handle actually moves.
-            if let Some(rs_mut) = self.resizing.as_mut() {
-                rs_mut.moved = rs_mut.moved
-                    || ((p.x - rs_mut.start_cursor.x).abs()
-                        + (p.y - rs_mut.start_cursor.y).abs())
-                        > 1e-9;
-            }
-            // Snap the moving corner/edge to nearby targets.
-            let (sp, guides) = self.snap_point(p, Some(rs.id));
-            self.snap_guides = guides;
-            let mut left = rs.orig.origin.x;
-            let mut top = rs.orig.origin.y;
-            let mut right = left + rs.orig.size.w;
-            let mut bottom = top + rs.orig.size.h;
-            const EPS: f64 = 1e-6;
-            let px_ = sp.x;
-            let py_ = sp.y;
-            // Crossing past the opposite edge flips the shape ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â allowed.
-            match rs.handle {
-                Handle::Nw | Handle::W | Handle::Sw => {
-                    right = rs.orig.origin.x + rs.orig.size.w;
-                    left = px_;
-                }
-                Handle::Ne | Handle::E | Handle::Se => {
-                    left = rs.orig.origin.x;
-                    right = px_;
-                }
-                _ => {}
-            }
-            match rs.handle {
-                Handle::Nw | Handle::N | Handle::Ne => {
-                    bottom = rs.orig.origin.y + rs.orig.size.h;
-                    top = py_;
-                }
-                Handle::Sw | Handle::S | Handle::Se => {
-                    top = rs.orig.origin.y;
-                    bottom = py_;
-                }
-                _ => {}
-            }
-            // Shift: keep proportions (corners only ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â sides move one axis).
-            if shift && matches!(rs.handle, Handle::Nw | Handle::Ne | Handle::Se | Handle::Sw) {
-                // The fixed opposite corner anchors the scale.
-                let ax = if rs.handle.moves_x() { right } else { left };
-                let ay = if rs.handle.moves_y() { bottom } else { top };
-                let ow = rs.orig.size.w.max(EPS);
-                let oh = rs.orig.size.h.max(EPS);
-                // Free corner = cursor mirrored around the anchor with a
-                // uniform scale from the dominant axis.
-                let dx = px_ - ax;
-                let dy = py_ - ay;
-                let scale = (dx.abs() / ow).max(dy.abs() / oh);
-                let fx = ax + dx.signum() * ow * scale;
-                let fy = ay + dy.signum() * oh * scale;
-                return self.doc.set_shape_corners(
-                    rs.id,
-                    Rect::from_points(Point2::new(ax, ay), Point2::new(fx, fy)),
-                );
-            }
-            return self.doc.set_shape_corners(
-                rs.id,
-                Rect::from_points(
-                    Point2::new(left.min(right), top.min(bottom)),
-                    Point2::new(left.max(right), top.max(bottom)),
-                ),
-            );
+
+        // Marquee band update.
+        if let Some((start, _)) = self.marquee {
+            let cur = self.cursor_doc(cursor);
+            self.marquee = Some((start, cur));
+            return true;
         }
+        self.snap_guides.clear();
         false
     }
 
-    // Screen-space tolerance (px) converted to document units.
-    fn handle_tolerance(&self) -> f64 {
-        8.0 / self.camera.zoom
-    }
-
-    // Document-space size of the current selection (for dimension text).
-    pub fn selection_size(&self) -> Option<(f64, f64)> {
-        self.dim_size()
+    // Applies H/V constraints and locked dimensions to a point being placed
+    // at `desired`. Constraints whose partner is also moving are skipped —
+    // rigid groups need the real solver, not per-point clamps.
+    fn clamp_point(&self, pid: PointId, mut desired: Point2, moving: &[PointId], apply_hv: bool) -> Point2 {
+        if apply_hv {
+            for c in &self.doc.constraints {
+            let other = if c.a == pid {
+                Some(c.b)
+            } else if c.b == pid {
+                Some(c.a)
+            } else {
+                None
+            };
+            let Some(o) = other else { continue };
+            if moving.contains(&o) || o == pid {
+                continue;
+            }
+            let Some(op) = self.doc.point(o) else { continue };
+            match c.kind {
+                ConstraintKind::Horizontal => desired.y = op.y,
+                ConstraintKind::Vertical => desired.x = op.x,
+                ConstraintKind::Coincident => {}
+            }
+            }
+        }
+        // Locked dimensions project onto the circle of allowed positions.
+        for d in &self.doc.dimensions {
+            let Some(v) = d.value else { continue };
+            let other = if d.a == pid {
+                Some(d.b)
+            } else if d.b == pid {
+                Some(d.a)
+            } else {
+                None
+            };
+            let Some(o) = other else { continue };
+            if moving.contains(&o) || o == pid {
+                continue;
+            }
+            let Some(op) = self.doc.point(o) else { continue };
+            let dx = desired.x - op.x;
+            let dy = desired.y - op.y;
+            let len = (dx * dx + dy * dy).sqrt();
+            if len < 1e-9 {
+                desired = Point2::new(op.x + v, op.y);
+            } else {
+                desired = Point2::new(op.x + dx / len * v, op.y + dy / len * v);
+            }
+        }
+        desired.clamped()
     }
 
     // -- snapping --
 
-    fn snap_tolerance(&self) -> f64 {
-        6.0 / self.camera.zoom
-    }
-
-    // Snapping is suppressed while Alt is held ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â the standard escape hatch
-    // when you want free placement.
     fn snapping_active(&self) -> bool {
         !self.alt_down
     }
 
-    // All snap locations exposed by shapes other than `exclude`.
-    // Point targets (corners, center) offer both axes. Edge targets snap
-    // only their normal axis and require the point to lie within the
-    // edge's span on the other axis ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â that's what makes sides snappable.
-    fn snap_targets(&self, exclude: Option<ShapeId>) -> Vec<SnapTarget> {
+    // All snap locations exposed by the geometry. `endpoints_only` keeps
+    // drags fluid — midpoints and edge spans apply only to precise
+    // placement (rectangle tool), never while dragging geometry.
+    fn snap_targets(&self, exclude: &[PointId], endpoints_only: bool) -> Vec<SnapTarget> {
         let mut out = Vec::new();
-        for layer in &self.doc.layers {
-            for &sid in &layer.shape_ids {
-                if Some(sid) == exclude {
-                    continue;
-                }
-                let Some(b) = self.doc.shape_bounds(sid) else {
-                    continue;
-                };
-                let (l, t) = (b.origin.x, b.origin.y);
-                let (r, bm) = (l + b.size.w, t + b.size.h);
-                // Representative marker positions on each edge.
-                let mx = l + b.size.w / 2.;
-                let my = t + b.size.h / 2.;
-
-                // Point targets: corners.
-                for (x, y, k) in [
-                    (l, t, SnapKind::Corner),
-                    (r, t, SnapKind::Corner),
-                    (r, bm, SnapKind::Corner),
-                    (l, bm, SnapKind::Corner),
-                ] {
-                    out.push(SnapTarget {
-                        x,
-                        y,
-                        kind: k,
-                        snap_x: true,
-                        snap_y: true,
-                        has_span: false,
-                        span_lo: 0.,
-                        span_hi: 0.,
-                        span_is_x: false,
-                    });
-                }
-
-                // Edge targets: top/bottom edges snap Y within an X span;
-                // left/right edges snap X within a Y span.
-                for (x, y, sx, sy, lo, hi, is_x) in [
-                    (mx, t, false, true, l, r, true),
-                    (mx, bm, false, true, l, r, true),
-                    (l, my, true, false, t, bm, false),
-                    (r, my, true, false, t, bm, false),
-                ] {
-                    out.push(SnapTarget {
-                        x,
-                        y,
-                        kind: SnapKind::Edge,
-                        snap_x: sx,
-                        snap_y: sy,
-                        has_span: true,
-                        span_lo: lo,
-                        span_hi: hi,
-                        span_is_x: is_x,
-                    });
-                }
+        for (pid, p) in self.doc.all_points() {
+            if exclude.contains(&pid) {
+                continue;
+            }
+            out.push(SnapTarget {
+                x: p.x,
+                y: p.y,
+                kind: SnapKind::Endpoint,
+                snap_x: true,
+                snap_y: true,
+                span_lo: 0.,
+                span_hi: 0.,
+                span_is_x: false,
+            });
+        }
+        if endpoints_only {
+            return out;
+        }
+        for (sid, seg) in self.doc.all_segments() {
+            let Some((a, b)) = self.doc.segment_geom(sid) else { continue };
+            let m = pick::mid(a, b);
+            out.push(SnapTarget {
+                x: m.x,
+                y: m.y,
+                kind: SnapKind::Midpoint,
+                snap_x: true,
+                snap_y: true,
+                span_lo: 0.,
+                span_hi: 0.,
+                span_is_x: false,
+            });
+            let _ = seg;
+            // Edge spans: horizontal edge snaps Y within X range, vertical
+            // edge snaps X within Y range.
+            let horizontal = (a.y - b.y).abs() < 1e-9;
+            let vertical = (a.x - b.x).abs() < 1e-9;
+            if horizontal {
+                let (lo, hi) = (a.x.min(b.x), a.x.max(b.x));
+                out.push(SnapTarget {
+                    x: m.x,
+                    y: a.y,
+                    kind: SnapKind::Edge,
+                    snap_x: false,
+                    snap_y: true,
+                    span_lo: lo,
+                    span_hi: hi,
+                    span_is_x: true,
+                });
+            } else if vertical {
+                let (lo, hi) = (a.y.min(b.y), a.y.max(b.y));
+                out.push(SnapTarget {
+                    x: a.x,
+                    y: m.y,
+                    kind: SnapKind::Edge,
+                    snap_x: true,
+                    snap_y: false,
+                    span_lo: lo,
+                    span_hi: hi,
+                    span_is_x: false,
+                });
             }
         }
         out
     }
 
-    // Span constraint: the point must lie along the edge's axis range.
     fn span_ok(t: &SnapTarget, p: Point2) -> bool {
-        if !t.has_span {
+        if t.kind != SnapKind::Edge {
             return true;
         }
         let (lo, hi) = (t.span_lo.min(t.span_hi), t.span_lo.max(t.span_hi));
@@ -601,378 +563,321 @@ impl Editor {
         }
     }
 
-    // Snaps a point to the SINGLE best target. Edge targets match only on
-    // their normal axis while the point lies within their span; only axes
-    // that are genuinely close adjust, so one alignment = one guide and
-    // the other axis stays free.
-    fn snap_point(&self, p: Point2, exclude: Option<ShapeId>) -> (Point2, Vec<SnapGuide>) {
+    // Best single correction for a point against all targets. Returns
+    // (adjustment delta, guides).
+    fn best_snap(&self, p: Point2, exclude: &[PointId], endpoints_only: bool) -> (Point2, Vec<SnapGuide>) {
         if !self.snapping_active() {
-            return (p, Vec::new());
+            return (Point2::new(0., 0.), Vec::new());
         }
-        let tol = self.snap_tolerance();
-        let targets = self.snap_targets(exclude);
-
-        let mut best: Option<(f64, f64, f64, bool, bool)> = None; // (score, x, y, hit_x, hit_y)
-        let mut best_kind = SnapKind::Corner;
-        let mut best_span = (false, 0., 0.);
-        for tgt in &targets {
+        let tol = SNAP_TOL_PX / self.camera.zoom;
+        let mut best: Option<(f64, f64, f64, bool, bool, SnapTarget)> = None;
+        for tgt in self.snap_targets(exclude, endpoints_only) {
             let dx = tgt.x - p.x;
             let dy = tgt.y - p.y;
-            let hit_x = tgt.snap_x && dx.abs() <= tol && Self::span_ok(tgt, p);
-            let hit_y = tgt.snap_y && dy.abs() <= tol && Self::span_ok(tgt, p);
+            let hit_x = tgt.snap_x && dx.abs() <= tol && Self::span_ok(&tgt, p);
+            let hit_y = tgt.snap_y && dy.abs() <= tol && Self::span_ok(&tgt, p);
             if !hit_x && !hit_y {
                 continue;
             }
             let score = dx.abs() + dy.abs();
-            if best.map_or(true, |(s, _, _, _, _)| score < s) {
-                best = Some((score, tgt.x, tgt.y, hit_x, hit_y));
-                best_kind = tgt.kind;
-                best_span = (tgt.span_is_x, tgt.span_lo, tgt.span_hi);
+            if best.as_ref().map_or(true, |(s, _, _, _, _, _)| score < *s) {
+                best = Some((score, dx, dy, hit_x, hit_y, tgt));
             }
         }
-
-        let Some((_, tx, ty, hit_x, hit_y)) = best else {
-            return (p, Vec::new());
+        let Some((_, dx, dy, hit_x, hit_y, tgt)) = best else {
+            return (Point2::new(0., 0.), Vec::new());
         };
-        // Project the marker onto the actual snap location along edges.
-        let mut tx = tx;
-        let mut ty = ty;
-        if best_kind == SnapKind::Edge {
-            if !hit_x {
-                tx = p.x;
-            }
-            if !hit_y {
-                ty = p.y;
-            }
-        }
-        let is_edge = best_kind == SnapKind::Edge;
-        let mut out = p;
+        let mut adj = Point2::new(0., 0.);
         let mut guides = Vec::new();
         if hit_x {
-            out.x = tx;
+            adj.x = dx;
             guides.push(SnapGuide {
                 vertical: true,
                 from: p,
-                to: Point2::new(tx, p.y),
-                kind: best_kind,
-                span_is_x: best_span.0,
-                span_lo: best_span.1,
-                span_hi: best_span.2,
+                to: Point2::new(tgt.x, p.y),
+                kind: tgt.kind,
+                span_is_x: tgt.span_is_x,
+                span_lo: tgt.span_lo,
+                span_hi: tgt.span_hi,
             });
         }
         if hit_y {
-            out.y = ty;
+            adj.y = dy;
             guides.push(SnapGuide {
                 vertical: false,
                 from: p,
-                to: Point2::new(p.x, ty),
-                kind: if is_edge { SnapKind::Edge } else { best_kind },
-                span_is_x: best_span.0,
-                span_lo: best_span.1,
-                span_hi: best_span.2,
+                to: Point2::new(p.x, tgt.y),
+                kind: tgt.kind,
+                span_is_x: tgt.span_is_x,
+                span_lo: tgt.span_lo,
+                span_hi: tgt.span_hi,
             });
         }
-        (out, guides)
+        (adj, guides)
     }
 
-    // Snaps a moving shape: tries each of its key points (corners + center)
-    // against the target set and applies the smallest correction to the
-    // motion delta. Guides run from the key point to the matched target.
-    fn snap_move_delta(&self, id: ShapeId, b: Rect, delta: Point2) -> (Point2, Vec<SnapGuide>) {
-        if !self.snapping_active() {
-            return (delta, Vec::new());
-        }
-        let tol = self.snap_tolerance();
-        let targets = self.snap_targets(Some(id));
-        let (l, t) = (b.origin.x, b.origin.y);
-        let keys = [
-            (l, t),
-            (l + b.size.w, t),
-            (l + b.size.w, t + b.size.h),
-            (l, t + b.size.h),
-        ];
-
-        let mut best: Option<(f64, usize, f64, f64)> = None; // (score, key_idx, dx, dy)
-        let mut best_kind = SnapKind::Corner;
-        let mut best_span = (false, 0., 0.);
-        for (ki, (kx, ky)) in keys.iter().enumerate() {
-            let px_ = kx + delta.x;
-            let py_ = ky + delta.y;
-            for tgt in &targets {
-                let dx = tgt.x - px_;
-                let dy = tgt.y - py_;
-                let hit_x = tgt.snap_x && dx.abs() <= tol;
-                let hit_y = tgt.snap_y && dy.abs() <= tol;
-                if !hit_x && !hit_y {
-                    continue;
-                }
-                if !Self::span_ok(tgt, Point2::new(px_, py_)) {
-                    continue;
-                }
-                let score = dx.abs() + dy.abs();
-                if best.map_or(true, |(s, _, _, _)| score < s) {
-                    best = Some((score, ki, dx, dy));
-                    best_kind = tgt.kind;
-                    best_span = (tgt.span_is_x, tgt.span_lo, tgt.span_hi);
-                }
-            }
-        }
-
-        match best {
-            Some((_, ki, dx, dy)) => {
-                let (kx, ky) = keys[ki];
-                let from = Point2::new(kx + delta.x, ky + delta.y);
-                let mut guides = Vec::new();
-                let mut adj_x = 0.;
-                let mut adj_y = 0.;
-                if dx.abs() <= tol {
-                    adj_x = dx;
-                    guides.push(SnapGuide {
-                        vertical: true,
-                        from,
-                        to: Point2::new(from.x + dx, from.y),
-                        kind: best_kind,
-                        span_is_x: best_span.0,
-                        span_lo: best_span.1,
-                        span_hi: best_span.2,
-                    });
-                }
-                if dy.abs() <= tol {
-                    adj_y = dy;
-                    guides.push(SnapGuide {
-                        vertical: false,
-                        from,
-                        to: Point2::new(from.x, from.y + dy),
-                        kind: best_kind,
-                        span_is_x: best_span.0,
-                        span_lo: best_span.1,
-                        span_hi: best_span.2,
-                    });
-                }
-                (Point2::new(delta.x + adj_x, delta.y + adj_y), guides)
-            }
-            None => (delta, Vec::new()),
-        }
-    }
-    // The rect dimensions should describe right now: the pending rubber
-    // band while creating, otherwise the selection. Zero-size = no dims.
-    fn dim_source_rect(&self) -> Option<Rect> {
-        // While corner-resizing, dimensions track the resized shape Ã¢â‚¬â€ but
-        // only once the handle has physically moved... unless the shape is
-        // fully selected, in which case they show immediately.
-        if let Some(rs) = &self.resizing {
-            let fully_selected = self.selection.contains(&rs.id);
-            if !rs.moved && !fully_selected {
-                return None;
-            }
-            if matches!(rs.handle, Handle::Nw | Handle::Ne | Handle::Se | Handle::Sw) {
-                let b = self.doc.shape_bounds(rs.id)?;
-                return (b.size.w > 0. && b.size.h > 0.).then_some(b);
-            }
-            return None; // side resize uses the single edge_dim instead
-        }
-        if let Some(p) = &self.pending_shape {
-            let b = p.bounds();
-            return if b.size.w > 0. && b.size.h > 0. { Some(b) } else { None };
-        }
-        // Dims for multiple selection: bounding box of the whole group.
-        if self.selection.len() > 1 {
-            let mut acc: Option<Rect> = None;
-            for &sid in &self.selection {
-                if let Some(b) = self.doc.shape_bounds(sid) {
-                    acc = Some(match acc {
-                        Some(a) => a.union(&b),
-                        None => b,
-                    });
-                }
-            }
-            return acc.filter(|b| b.size.w > 0. && b.size.h > 0.);
-        }
-        let sel = *self.selection.first()?;
-        let b = self.doc.shape_bounds(sel)?;
-        (b.size.w > 0. && b.size.h > 0.).then_some(b)
+    // Snaps a free point (rectangle tool placement) to the best target.
+    fn snap_point(&self, p: Point2) -> (Point2, Vec<SnapGuide>) {
+        let (adj, guides) = self.best_snap(p, &[], false);
+        (Point2::new(p.x + adj.x, p.y + adj.y), guides)
     }
 
-    // Group move: fully-selected shapes translate; handle-partial shapes
-    // scale along the axes where they don't have both opposing sides.
-    fn apply_group_move(&mut self, dx: f64, dy: f64) {
-        use std::collections::HashMap;
-        // Per-shape selected side flags for partial selections.
-        let mut sides: HashMap<ShapeId, (bool, bool, bool, bool)> = HashMap::new(); // (e,w,n,s)
-        for (sid, h) in &self.selected_handles {
-            let e = sides.entry(*sid).or_insert((false, false, false, false));
-            match h {
-                Handle::E => e.0 = true,
-                Handle::W => e.1 = true,
-                Handle::N => e.2 = true,
-                _ => e.3 = true,
-            }
-        }
+    // -- dimensions (per-frame render data) --
 
-        let ids: Vec<ShapeId> = self.selection.clone();
-        for id in &ids {
-            if !self.doc.translate_shape(*id, Point2::new(dx, dy)) {
-                continue;
+    // Recomputes dimension geometry. Called once per frame before painting;
+    // lines and labels both read this.
+    pub fn update_dim_geom(&mut self) {
+        self.dim_renders.clear();
+
+        // Multi-object selection: every object shows its OWN W+H dims, plus
+        // a TOTAL pair for the whole selection whose extension lines run
+        // all the way to each object's nearest extreme.
+        let sel_fills: Vec<FillId> = self
+            .selection
+            .iter()
+            .filter_map(|el| el.as_fill())
+            .filter(|fid| self.doc.fill(*fid).is_some())
+            .collect();
+        if !sel_fills.is_empty() {
+            for fid in &sel_fills {
+                if let Some(b) = self.doc.fill_bounds(*fid) {
+                    self.push_wh_dims(b);
+                }
             }
-            // Fully-selected members also carry their handle-sub-selections.
-            let (mut he, mut hw, mut hn, mut hs) = (false, false, false, false);
-            for (sid, h) in &self.selected_handles {
-                if sid == id {
-                    match h {
-                        Handle::E => he = true,
-                        Handle::W => hw = true,
-                        Handle::N => hn = true,
-                        _ => hs = true,
+            if sel_fills.len() > 1 {
+                let mut total: Option<Rect> = None;
+                for fid in &sel_fills {
+                    if let Some(b) = self.doc.fill_bounds(*fid) {
+                        total = Some(match total {
+                            Some(t) => t.union(&b),
+                            None => b,
+                        });
                     }
                 }
+                if let Some(u) = total {
+                    let mut extras: Vec<(Point2, Point2)> = Vec::new();
+                    let off = PREVIEW_DIM_OFFSET_DOC;
+                    // W dim (bottom): verticals from each object's bottom
+                    // corners down to the dim line's y.
+                    let dim_y = u.origin.y + u.size.h + off;
+                    for fid in &sel_fills {
+                        if let Some(b) = self.doc.fill_bounds(*fid) {
+                            let by = b.origin.y + b.size.h;
+                            extras.push((
+                                Point2::new(b.origin.x, by),
+                                Point2::new(b.origin.x, dim_y),
+                            ));
+                            extras.push((
+                                Point2::new(b.origin.x + b.size.w, by),
+                                Point2::new(b.origin.x + b.size.w, dim_y),
+                            ));
+                        }
+                    }
+                    let bl = Point2::new(u.origin.x, u.origin.y + u.size.h);
+                    let br = Point2::new(u.origin.x + u.size.w, u.origin.y + u.size.h);
+                    self.dim_renders.push(self.linear_dim_extras(bl, br, off, u.size.w, &extras));
+                    // H dim (right): horizontals from each object's right
+                    // edge across to the dim line's x.
+                    let mut extras: Vec<(Point2, Point2)> = Vec::new();
+                    let dim_x = u.origin.x + u.size.w + off;
+                    for fid in &sel_fills {
+                        if let Some(b) = self.doc.fill_bounds(*fid) {
+                            let rx = b.origin.x + b.size.w;
+                            extras.push((
+                                Point2::new(rx, b.origin.y),
+                                Point2::new(dim_x, b.origin.y),
+                            ));
+                            extras.push((
+                                Point2::new(rx, b.origin.y + b.size.h),
+                                Point2::new(dim_x, b.origin.y + b.size.h),
+                            ));
+                        }
+                    }
+                    let br = Point2::new(u.origin.x + u.size.w, u.origin.y + u.size.h);
+                    let tr = Point2::new(u.origin.x + u.size.w, u.origin.y);
+                    self.dim_renders.push(self.linear_dim_extras(br, tr, off, u.size.h, &extras));
+                }
             }
-            if he || hw || hn || hs {
-                self.scale_member(*id, dx, dy, he, hw, hn, hs);
-            }
-        }
-
-        // Partial shapes: scale along axes missing an opposing side.
-        for (sid, (e, w, n, s)) in &sides {
-            if self.selection.contains(sid) {
-                continue;
-            }
-            self.scale_member(*sid, dx, dy, *e, *w, *n, *s);
-        }
-    }
-
-    // Moves the selected edges of a shape by (dx,dy), anchoring opposite
-    // edges; a side with no opposing counterpart scales the shape.
-    fn scale_member(
-        &mut self,
-        id: ShapeId,
-        dx: f64,
-        dy: f64,
-        e: bool,
-        w: bool,
-        n: bool,
-        s: bool,
-    ) {
-        let Some(b) = self.doc.shape_bounds(id) else {
             return;
-        };
-        let mut l = b.origin.x;
-        let mut t = b.origin.y;
-        let mut r = l + b.size.w;
-        let mut bt = t + b.size.h;
-        match (e, w) {
-            (true, true) => {
-                r += dx;
-                l += dx;
-            }
-            (true, false) => r += dx,
-            (false, true) => l += dx,
-            _ => {}
         }
-        match (n, s) {
-            (true, true) => {
-                t += dy;
-                bt += dy;
-            }
-            (true, false) => t += dy,
-            (false, true) => bt += dy,
-            _ => {}
-        }
-        self.doc.set_shape_corners(
-            id,
-            Rect::from_points(
-                Point2::new(l.min(r), t.min(bt)),
-                Point2::new(l.max(r), t.max(bt)),
-            ),
-        );
-    }
 
-    fn screen_dim_geom(&self, b: Rect) -> DimGeom {
-        let tl = self.camera.unit_to_screen(b.origin);
-        let br =
-            self.camera
-                .unit_to_screen(Point2::new(b.origin.x + b.size.w, b.origin.y + b.size.h));
-        DimGeom {
-            x: (tl.x as f32).min(br.x as f32),
-            y: (tl.y as f32).min(br.y as f32),
-            w: (tl.x - br.x).abs() as f32,
-            h: (tl.y - br.y).abs() as f32,
-            ext: crate::ui::canvas::paint::extension_offset(self.camera.zoom),
-        }
-    }
-    // Recomputes dimension geometry (screen space). Called once per frame
-    // before painting; lines and labels both read this.
-    pub fn update_dim_geom(&mut self) {
-        // While edge-resizing (side drag, no corner), show exactly ONE
-        // dimension Ã¢â‚¬â€ the changing axis. Shows immediately for a fully
-        // selected shape; otherwise only once the handle has moved.
-        if let Some(rs) = &self.resizing
-            && (rs.moved || self.selection.contains(&rs.id))
-            && matches!(
-                rs.handle,
-                Handle::N | Handle::S | Handle::E | Handle::W
-            )
-            && let Some(b) = self.doc.shape_bounds(rs.id)
+        // A lone selected edge shows the dim of the axis being resized:
+        // left/right edges -> WIDTH dim under the shape; top/bottom edges
+        // -> HEIGHT dim right of the shape. Applies WHILE dragging too.
+        if self.pending_shape.is_none()
+            && self.selection.len() == 1
+            && let Some(sid) = self.selection[0].as_segment()
+            && let Some((a, b)) = self.doc.segment_geom(sid)
         {
-            self.dim_geom = None;
-            self.edge_dim = Some((self.screen_dim_geom(b), matches!(rs.handle, Handle::E | Handle::W)));
+            for (fid, f) in self.doc.all_fills() {
+                if !f.segments.contains(&sid) {
+                    continue;
+                }
+                let Some(bounds) = self.doc.fill_bounds(fid) else { break };
+                let vertical_edge = (b.x - a.x).abs() <= 1e-9;
+                if vertical_edge {
+                    // Width: along the bottom, offset downward.
+                    let bl = Point2::new(bounds.origin.x, bounds.origin.y + bounds.size.h);
+                    let br = Point2::new(bounds.origin.x + bounds.size.w, bounds.origin.y + bounds.size.h);
+                    self.dim_renders.push(self.linear_dim(bl, br, PREVIEW_DIM_OFFSET_DOC, bounds.size.w));
+                } else {
+                    // Height: along the right, offset rightward.
+                    let tr = Point2::new(bounds.origin.x + bounds.size.w, bounds.origin.y);
+                    let br = Point2::new(bounds.origin.x + bounds.size.w, bounds.origin.y + bounds.size.h);
+                    self.dim_renders.push(self.linear_dim(br, tr, PREVIEW_DIM_OFFSET_DOC, bounds.size.h));
+                }
+                return;
+            }
+        }
+
+        // Dragging a single point that belongs to a closed loop: show the
+        // loop's W+H dims (bottom + right) while it resizes.
+        if self.pending_shape.is_none()
+            && self.selection.len() == 1
+            && let Some(pid) = self.selection[0].as_point()
+            && let Some(fid) = self.fill_containing_point(pid)
+            && let Some(b) = self.doc.fill_bounds(fid)
+        {
+            if b.size.w > 0. {
+                let bl = Point2::new(b.origin.x, b.origin.y + b.size.h);
+                let br = Point2::new(b.origin.x + b.size.w, b.origin.y + b.size.h);
+                self.dim_renders.push(self.linear_dim(bl, br, PREVIEW_DIM_OFFSET_DOC, b.size.w));
+            }
+            if b.size.h > 0. {
+                let br = Point2::new(b.origin.x + b.size.w, b.origin.y + b.size.h);
+                let tr = Point2::new(b.origin.x + b.size.w, b.origin.y);
+                self.dim_renders.push(self.linear_dim(br, tr, PREVIEW_DIM_OFFSET_DOC, b.size.h));
+            }
             return;
         }
-        self.edge_dim = None;
-        self.dim_geom = self.dim_source_rect().map(|b| {
-            let tl = self.camera.unit_to_screen(b.origin);
-            let br =
-                self.camera
-                    .unit_to_screen(Point2::new(b.origin.x + b.size.w, b.origin.y + b.size.h));
-            DimGeom {
-                x: (tl.x as f32).min(br.x as f32),
-                y: (tl.y as f32).min(br.y as f32),
-                w: (tl.x - br.x).abs() as f32,
-                h: (tl.y - br.y).abs() as f32,
-                ext: crate::ui::canvas::paint::extension_offset(self.camera.zoom),
+
+        // Live preview: bounding box W/H while creating or interacting.
+        let preview_box = self.preview_bounds();
+        if let Some(b) = preview_box {
+            if b.size.w > 0. {
+                self.dim_renders.push(self.linear_dim(
+                    Point2::new(b.origin.x, b.origin.y + b.size.h),
+                    Point2::new(b.origin.x + b.size.w, b.origin.y + b.size.h),
+                    PREVIEW_DIM_OFFSET_DOC,
+                    b.size.w,
+                ));
             }
-        });
+            if b.size.h > 0. {
+                // Bottom-right -> top-right so the LEFT normal points right
+                // (outside the shape).
+                self.dim_renders.push(self.linear_dim(
+                    Point2::new(b.origin.x + b.size.w, b.origin.y + b.size.h),
+                    Point2::new(b.origin.x + b.size.w, b.origin.y),
+                    PREVIEW_DIM_OFFSET_DOC,
+                    b.size.h,
+                ));
+            }
+        }
+
+        // Stored dimensions: rendered at their own angle and offset.
+        for d in &self.doc.dimensions {
+            let (Some(a), Some(b)) = (self.doc.point(d.a), self.doc.point(d.b)) else {
+                continue;
+            };
+            let len = d.value.unwrap_or_else(|| pick::distance(a, b));
+            self.dim_renders.push(self.linear_dim(a, b, d.offset, len));
+        }
     }
 
-    // Document-space size of the dim source (pending or selection).
-    pub fn dim_size(&self) -> Option<(f64, f64)> {
-        let b = self.dim_source_rect()?;
-        Some((b.size.w, b.size.h))
+    // Bounds shown by preview dims: pending rubber band, else active drag
+    // points, else the selection.
+    fn preview_bounds(&self) -> Option<Rect> {
+        if let Some(p) = &self.pending_shape {
+            let b = p.bounds();
+            return (b.size.w > 0. && b.size.h > 0.).then_some(b);
+        }
+        let ids: Vec<PointId> = if let Some(drag) = &self.dragging {
+            drag.points.iter().map(|(id, _)| *id).collect()
+        } else if !self.selection.is_empty() {
+            self.doc.selection_points(&self.selection)
+        } else {
+            return None;
+        };
+        self.doc.bounds_of_points(&ids)
     }
 
-    // Updates hover state for cursor styling + direct manipulation
-    // affordances. Returns true on change.
+    // W+H dims for one object's bounds (bottom + right).
+    fn push_wh_dims(&mut self, b: Rect) {
+        if b.size.w > 0. {
+            let bl = Point2::new(b.origin.x, b.origin.y + b.size.h);
+            let br = Point2::new(b.origin.x + b.size.w, b.origin.y + b.size.h);
+            self.dim_renders.push(self.linear_dim(bl, br, PREVIEW_DIM_OFFSET_DOC, b.size.w));
+        }
+        if b.size.h > 0. {
+            let br = Point2::new(b.origin.x + b.size.w, b.origin.y + b.size.h);
+            let tr = Point2::new(b.origin.x + b.size.w, b.origin.y);
+            self.dim_renders.push(self.linear_dim(br, tr, PREVIEW_DIM_OFFSET_DOC, b.size.h));
+        }
+    }
+
+    /// linear_dim plus extra extension segments (doc coords), used by total
+    /// selection dims so witness lines reach every object's nearest point.
+    fn linear_dim_extras(
+        &self,
+        a: Point2,
+        b: Point2,
+        offset_doc: f64,
+        value: f64,
+        extras: &[(Point2, Point2)],
+    ) -> DimRender {
+        let mut d = self.linear_dim(a, b, offset_doc, value);
+        for &(p, q) in extras {
+            let sp = self.camera.unit_to_screen(p);
+            let sq = self.camera.unit_to_screen(q);
+            d.extra_ext.push([sp.x as f32, sp.y as f32, sq.x as f32, sq.y as f32]);
+        }
+        d
+    }
+
+    /// Builds screen-space render data for a dimension between two doc
+    /// points. `offset_doc` shifts the dim line along the LEFT normal of
+    /// b-a; `value` is the displayed measurement.
+    fn linear_dim(&self, a: Point2, b: Point2, offset_doc: f64, value: f64) -> DimRender {
+        let scr = |p: Point2| self.camera.unit_to_screen(p);
+        let sa = scr(a);
+        let sb = scr(b);
+        let dx = sb.x - sa.x;
+        let dy = sb.y - sa.y;
+        let len = (dx * dx + dy * dy).sqrt().max(1e-9);
+        // Left normal in screen space (y down).
+        let nx = -dy / len;
+        let ny = dx / len;
+        let off = offset_doc * self.camera.zoom;
+        let lax = sa.x + nx * off;
+        let lay = sa.y + ny * off;
+        let lbx = sb.x + nx * off;
+        let lby = sb.y + ny * off;
+        DimRender {
+            ax: sa.x as f32,
+            ay: sa.y as f32,
+            bx: sb.x as f32,
+            by: sb.y as f32,
+            lax: lax as f32,
+            lay: lay as f32,
+            lbx: lbx as f32,
+            lby: lby as f32,
+            label_cx: ((lax + lbx) / 2.) as f32,
+            label_cy: ((lay + lby) / 2.) as f32,
+            text: crate::ui::canvas::fmt_dim(value),
+            extra_ext: Vec::new(),
+        }
+    }
+
+    // -- hover --
+
     pub fn canvas_hover(&mut self, cursor: gpui::Point<gpui::Pixels>) -> bool {
-        if self.tool != Tool::Move || self.dragging.is_some() || self.resizing.is_some() {
+        if self.tool != Tool::Move || self.dragging.is_some() || self.pan_start.is_some() {
             return false;
         }
         let p = self.cursor_doc(cursor);
-        let tol = self.handle_tolerance();
-
-        // Topmost shape whose handles OR body are under the cursor.
-        // Handles win over body, so they're grabbable even slightly
-        // outside the bounds.
-        let mut info = None;
-        for layer in self.doc.layers.iter().rev() {
-            for &sid in layer.shape_ids.iter().rev() {
-                let Some(b) = self.doc.shape_bounds(sid) else {
-                    continue;
-                };
-                if let Some(handle) = handle_at(b, p, tol) {
-                    info = Some(HoverInfo { shape: sid, handle: Some(handle) });
-                    break;
-                }
-                if b.contains(p) && info.is_none() {
-                    info = Some(HoverInfo { shape: sid, handle: None });
-                }
-            }
-            if info.as_ref().map(|i| i.handle.is_some()).unwrap_or(false) {
-                break;
-            }
-        }
-
-        if self.hover.map(|h| h.shape) != info.map(|i| i.shape)
-            || self.hover.and_then(|h| h.handle) != info.and_then(|i| i.handle)
-        {
+        let picker = pick::Picker::new(&self.doc, &self.camera, HANDLE_TOL_PX);
+        let info = picker.element(p);
+        if self.hover != info {
             self.hover = info;
             return true;
         }
@@ -981,35 +886,16 @@ impl Editor {
 
     pub fn cursor_style(&self) -> gpui::CursorStyle {
         use gpui::CursorStyle;
-        // Grab/grabbing in Pan mode (gpui: open/closed hand).
         if self.pan_start.is_some() {
             return CursorStyle::ClosedHand;
         }
         if self.tool == Tool::Pan {
             return CursorStyle::OpenHand;
         }
-        // Crosshair while placing a rectangle.
         if self.tool == Tool::Rectangle {
             return CursorStyle::Crosshair;
         }
-        // Resize cursors only when a shape is FULLY selected and the
-        // cursor is on one of its handlers. Everywhere else: default.
-        let on_selected_handler = self
-            .hover
-            .as_ref()
-            .filter(|h| self.selection.contains(&h.shape))
-            .and_then(|h| h.handle)
-            .is_some();
-        if !on_selected_handler {
-            return CursorStyle::Arrow;
-        }
-        match self.hover.as_ref().and_then(|h| h.handle) {
-            Some(Handle::Nw) | Some(Handle::Se) => CursorStyle::ResizeUpLeftDownRight,
-            Some(Handle::Ne) | Some(Handle::Sw) => CursorStyle::ResizeUpRightDownLeft,
-            Some(Handle::N) | Some(Handle::S) => CursorStyle::ResizeUpDown,
-            Some(Handle::E) | Some(Handle::W) => CursorStyle::ResizeLeftRight,
-            None => CursorStyle::Arrow,
-        }
+        CursorStyle::Arrow
     }
 
     pub fn canvas_up(&mut self, button: gpui::MouseButton) -> bool {
@@ -1020,56 +906,45 @@ impl Editor {
             return false;
         }
         self.dragging = None;
-        self.resizing = None;
         self.snap_guides.clear();
         self.group_drag_last = None;
-        // Marquee finalize: shapes fully inside become fully selected;
-        // crossed shapes get their intersected SIDES selected.
+
+        // Marquee finalize.
         if let Some((a, b)) = self.marquee.take() {
             let band = Rect::from_points(a, b);
-            let (bx0, by0) = (band.origin.x, band.origin.y);
-            let (bx1, by1) = (bx0 + band.size.w, by0 + band.size.h);
-            for layer in &self.doc.layers {
-                for &sid in &layer.shape_ids {
-                    let Some(b) = self.doc.shape_bounds(sid) else {
-                        continue;
-                    };
-                    let (l, t) = (b.origin.x, b.origin.y);
-                    let (r, bm) = (l + b.size.w, t + b.size.h);
-                    let x_over = l <= bx1 && bx0 <= r;
-                    let y_over = t <= by1 && by0 <= bm;
-                    if !x_over || !y_over {
-                        continue;
-                    }
-                    if l >= bx0 && r <= bx1 && t >= by0 && bm <= by1 {
-                        if !self.selection.contains(&sid) {
-                            self.selection.push(sid);
+            if band.size.w > 1e-9 || band.size.h > 1e-9 {
+                let picker = pick::Picker::new(&self.doc, &self.camera, HANDLE_TOL_PX);
+                let picked = picker.marquee(band);
+                if self.marquee_add {
+                    for el in picked {
+                        if !self.selection.contains(&el) {
+                            self.selection.push(el);
                         }
-                        continue;
                     }
-                    // Partial: pick up the sides the band crosses.
-                    if l >= bx0 && l <= bx1 && y_over {
-                        self.selected_handles.push((sid, Handle::W));
-                    }
-                    if r >= bx0 && r <= bx1 && y_over {
-                        self.selected_handles.push((sid, Handle::E));
-                    }
-                    if t >= by0 && t <= by1 && x_over {
-                        self.selected_handles.push((sid, Handle::N));
-                    }
-                    if bm >= by0 && bm <= by1 && x_over {
-                        self.selected_handles.push((sid, Handle::S));
-                    }
+                } else {
+                    self.selection = picked;
                 }
+                self.marquee_add = false;
+                self.deferred_pick = None;
+                return true;
             }
+            // Band never grew: a click on tolerant-only geometry.
+            if let Some(el) = self.deferred_pick.take() {
+                if self.marquee_add {
+                    if !self.selection.contains(&el) {
+                        self.selection.push(el);
+                    }
+                } else {
+                    self.selection = vec![el];
+                }
+                self.marquee_add = false;
+                return true;
+            }
+            self.marquee_add = false;
         }
-        // Ending a pan-mode drag must release the pan state, otherwise
-        // mouse movement keeps panning forever.
-        if button == gpui::MouseButton::Left && self.end_pan() {
-            return true;
-        }
-        // Click-created pending shapes survive mouse-up; they commit on the
-        // next click instead. Only drag-created ones commit here.
+
+        // Click-created pending rectangles survive mouse-up; they commit on
+        // the next click instead. Only drag-created ones commit here.
         if self.pending_via_click {
             return true;
         }
@@ -1082,20 +957,111 @@ impl Editor {
         {
             return true;
         }
-        let bounds = pending.bounds();
-        // Drag-committed: select the new shape and return to Move mode.
+        let b = pending.bounds();
         self.tool = Tool::Move;
-        if bounds.size.w > 0. && bounds.size.h > 0. {
+        if b.size.w > 0. && b.size.h > 0. {
             let layer_id = self.doc.layers[0].id;
-            let id = self.create_shape(
+            let fill = self.create_rectangle(
                 layer_id,
-                pending.kind,
-                bounds.origin,
-                Point2::new(bounds.origin.x + bounds.size.w, bounds.origin.y + bounds.size.h),
+                b.origin,
+                Point2::new(b.origin.x + b.size.w, b.origin.y + b.size.h),
             );
-            self.selection = vec![id];
+            self.selection = vec![ElementRef::Fill(fill)];
         }
         true
+    }
+
+    // -- object creation --
+
+    /// Emits a rectangle composite: 4 points, 4 chained segments, H/V
+    /// constraints, and a closed-loop fill. Returns the fill id. This is
+    /// the ONLY way a rectangle exists — there is no rectangle object.
+    pub fn create_rectangle(&mut self, layer_id: u64, a: Point2, c: Point2) -> FillId {
+        let tl = self.doc.add_point(a);
+        let tr = self.doc.add_point(Point2::new(c.x, a.y));
+        let br = self.doc.add_point(c);
+        let bl = self.doc.add_point(Point2::new(a.x, c.y));
+
+        let top = self.doc.add_segment(tl, tr);
+        let right = self.doc.add_segment(tr, br);
+        let bottom = self.doc.add_segment(br, bl);
+        let left = self.doc.add_segment(bl, tl);
+
+        self.doc.add_constraint(ConstraintKind::Horizontal, tl, tr);
+        self.doc.add_constraint(ConstraintKind::Horizontal, bl, br);
+        self.doc.add_constraint(ConstraintKind::Vertical, tl, bl);
+        self.doc.add_constraint(ConstraintKind::Vertical, tr, br);
+
+        let fill = self.doc.add_fill(vec![top, right, bottom, left]);
+
+        for el in [
+            ElementRef::Point(tl),
+            ElementRef::Point(tr),
+            ElementRef::Point(br),
+            ElementRef::Point(bl),
+            ElementRef::Segment(top),
+            ElementRef::Segment(right),
+            ElementRef::Segment(bottom),
+            ElementRef::Segment(left),
+            ElementRef::Fill(fill),
+        ] {
+            self.doc.push_to_layer(layer_id, el);
+        }
+        fill
+    }
+
+    // True when the element itself, or anything SELECTED that contains it,
+    // covers it — a corner shared by selected edges counts as selected.
+    fn element_selected(&self, el: ElementRef) -> bool {
+        if self.selection.contains(&el) {
+            return true;
+        }
+        match el {
+            ElementRef::Segment(sid) => self
+                .fill_containing(sid)
+                .is_some_and(|f| self.selection.contains(&ElementRef::Fill(f))),
+            ElementRef::Point(pid) => self.selection.iter().any(|sel| match *sel {
+                // A corner owned by a selected edge belongs to the selection.
+                ElementRef::Segment(s) => self
+                    .doc
+                    .segment(s)
+                    .is_some_and(|seg| seg.start == pid || seg.end == pid),
+                ElementRef::Fill(f) => self.doc.element_points(ElementRef::Fill(f)).contains(&pid),
+                _ => false,
+            }),
+            _ => false,
+        }
+    }
+
+    // The fill whose loop passes through this segment, if any.
+    fn fill_containing(&self, sid: crate::core::ids::SegmentId) -> Option<FillId> {
+        self.doc
+            .all_fills()
+            .find(|(_, f)| f.segments.contains(&sid))
+            .map(|(id, _)| id)
+    }
+
+    // The fill whose loop references this point, if any.
+    fn fill_containing_point(&self, pid: crate::core::ids::PointId) -> Option<FillId> {
+        self.doc.all_fills().find(|(_, f)| f.segments.iter().any(|&s| {
+            self.doc.segment(s).is_some_and(|seg| seg.start == pid || seg.end == pid)
+        })).map(|(id, _)| id)
+    }
+
+    /// Deletes an element from the document and clears it from selection.
+    pub fn delete_element(&mut self, el: ElementRef) {
+        match el {
+            ElementRef::Point(p) => {
+                self.doc.remove_point(p);
+            }
+            ElementRef::Segment(s) => {
+                self.doc.remove_segment(s);
+            }
+            ElementRef::Fill(f) => {
+                self.doc.remove_fill(f);
+            }
+        }
+        self.selection.retain(|&e| e != el);
     }
 
     // -- viewport interaction (called from the canvas view) --
@@ -1116,13 +1082,6 @@ impl Editor {
             start.pan.y - dy / start.zoom,
         );
         true
-    }
-
-    // True while no pan drag is in progress (used to gate hover tracking).
-    pub fn pan_start_none(&self) -> bool {
-        self.pan_start.is_none()
-            && self.dragging.is_none()
-            && self.resizing.is_none()
     }
 
     pub fn end_pan(&mut self) -> bool {
@@ -1150,26 +1109,12 @@ impl Editor {
         self.doc.layers.push(Layer {
             id,
             name: name.into(),
-            shape_ids: Vec::new(),
+            elements: Vec::new(),
         });
         id
     }
 
-    // Creates a shape from two opposite corners in document units,
-    // generating its point entities. Returns the shape handle.
-    pub fn create_shape(
-        &mut self,
-        layer_id: u64,
-        kind: ShapeKind,
-        a: Point2,
-        b: Point2,
-    ) -> ShapeId {
-        let pa = self.doc.add_point(a);
-        let pb = self.doc.add_point(b);
-        self.doc.add_shape(layer_id, kind, [pa, pb])
-    }
-
-    // Visible region in document units ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â used for culling before paint.
+    // Visible region in document units — used for culling before paint.
     pub fn visible_bounds(&self, size: Size) -> Rect {
         let min = self.camera.screen_to_unit(Point2::new(0., 0.));
         let max = self.camera.screen_to_unit(Point2::new(size.w, size.h));
@@ -1177,41 +1122,10 @@ impl Editor {
     }
 }
 
-// Which resize handle (if any) is under a document-space point, given a
-// tolerance in document units. Corners win over sides.
-pub fn handle_at(b: Rect, p: Point2, tol: f64) -> Option<Handle> {
-    // Corners get a bigger hitbox so they're easy to reach.
-    let corner_tol = tol * 1.6;
-    let right = b.origin.x + b.size.w;
-    let bottom = b.origin.y + b.size.h;
-    let near_left = (p.x - b.origin.x).abs() <= corner_tol;
-    let near_right = (p.x - right).abs() <= corner_tol;
-    let near_top = (p.y - b.origin.y).abs() <= corner_tol;
-    let near_bottom = (p.y - bottom).abs() <= corner_tol;
-    let inside_x = p.x >= b.origin.x - tol && p.x <= right + tol;
-    let inside_y = p.y >= b.origin.y - tol && p.y <= bottom + tol;
 
-    if near_left && near_top {
-        Some(Handle::Nw)
-    } else if near_right && near_top {
-        Some(Handle::Ne)
-    } else if near_right && near_bottom {
-        Some(Handle::Se)
-    } else if near_left && near_bottom {
-        Some(Handle::Sw)
-    } else if near_top && inside_x {
-        Some(Handle::N)
-    } else if near_right && inside_y {
-        Some(Handle::E)
-    } else if near_bottom && inside_x {
-        Some(Handle::S)
-    } else if near_left && inside_y {
-        Some(Handle::W)
-    } else {
-        None
-    }
-}
-
-
-
-
+const HANDLE_TOL_PX: f64 = 11.0;
+// Tight tolerance for press-to-grab: inside this, a drag moves geometry;
+// outside it (but within HANDLE_TOL_PX), a drag is a marquee.
+const EXACT_TOL_PX: f64 = 4.5;
+const SNAP_TOL_PX: f64 = 6.0;
+const PREVIEW_DIM_OFFSET_DOC: f64 = 18.0;

@@ -5,7 +5,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use gpui::{App, Context, Entity, MouseButton, Point, Window, div, prelude::*, px, rgb};
 
 use crate::core::geometry::Point2;
-use crate::core::document::{Document, Layer, ShapeKind};
+use crate::core::constraints::ElementRef;
+use crate::core::document::{Document, Layer};
 use crate::editor::{Camera, Editor};
 use crate::persistence::database::Database;
 use crate::persistence::paths;
@@ -124,7 +125,13 @@ impl Shell {
         let Ok(db) = Database::open(path.to_string_lossy().as_ref()) else {
             return;
         };
-        let _ = db.insert_layer("Layer 1");
+        let mut doc = Document::new();
+        doc.layers.push(Layer {
+            id: 1,
+            name: "Layer 1".into(),
+            elements: Vec::new(),
+        });
+        let _ = db.save_document(&doc);
         drop(db);
 
         let Ok(id) = reg.create_design(&name, &path, now_secs()) else {
@@ -148,7 +155,7 @@ impl Shell {
             doc.layers.push(Layer {
                 id: 1,
                 name: "Layer 1".into(),
-                shape_ids: Vec::new(),
+                elements: Vec::new(),
             });
         }
         self.design_name = meta.name.clone();
@@ -434,10 +441,10 @@ impl Shell {
             return None;
         }
         let sel = e.selection[0];
-        let b = e.doc.shape_bounds(sel)?;
-        let kind = e.doc.shape_kind(sel)?.as_str();
+        let pts = e.doc.element_points(sel);
+        let b = e.doc.bounds_of_points(&pts)?;
         Some(format!(
-            "parametric/{kind}:{},{},{},{}",
+            "parametric/bounds:{},{},{},{}",
             b.origin.x,
             b.origin.y,
             b.size.w,
@@ -460,7 +467,7 @@ impl Shell {
         let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) else {
             return;
         };
-        let Some(rest) = text.strip_prefix("parametric/rectangle:") else {
+        let Some(rest) = text.strip_prefix("parametric/bounds:") else {
             return;
         };
         let nums: Vec<f64> = rest.split(',').filter_map(|s| s.parse().ok()).collect();
@@ -476,9 +483,8 @@ impl Shell {
             let a = Point2::new(nums[0] + OFFSET, nums[1] + OFFSET);
             let b = Point2::new(nums[0] + OFFSET + nums[2], nums[1] + OFFSET + nums[3]);
             let layer_id = ed.doc.layers[0].id;
-            let id = ed.create_shape(layer_id, ShapeKind::Rectangle, a, b);
-            ed.selection = vec![id];
-            ed.selected_handles.clear();
+            let fill = ed.create_rectangle(layer_id, a, b);
+            ed.selection = vec![ElementRef::Fill(fill)];
             ed.update_dim_geom();
             cx.notify();
         });
@@ -493,9 +499,8 @@ impl Shell {
                 return false;
             }
             let sels = std::mem::take(&mut ed.selection);
-            ed.selected_handles.clear();
-            for sid in &sels {
-                ed.doc.remove_shape(*sid);
+            for el in &sels {
+                ed.delete_element(*el);
             }
             true
         });
@@ -551,8 +556,9 @@ impl Shell {
 fn fit_camera(doc: &Document, viewport: (f32, f32)) -> Camera {
     let mut bounds: Option<crate::core::geometry::Rect> = None;
     for layer in &doc.layers {
-        for &sid in &layer.shape_ids {
-            if let Some(b) = doc.shape_bounds(sid) {
+        for &el in &layer.elements {
+            let pts = doc.element_points(el);
+            if let Some(b) = doc.bounds_of_points(&pts) {
                 bounds = Some(match bounds {
                     Some(acc) => acc.union(&b),
                     None => b,

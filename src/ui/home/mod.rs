@@ -1,7 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    App, Bounds, IntoElement, MouseButton, Pixels, RenderOnce, WeakEntity, Window, canvas, div,
+    App, Bounds, IntoElement, MouseButton, Pixels, Point, RenderOnce, Size, WeakEntity, Window, canvas, div,
     fill, prelude::*, px, rgb, rgba,
 };
 
@@ -110,9 +110,7 @@ impl RenderOnce for DesignCard {
                         &[],
                         None,
                         &[],
-                        None,
                         &[],
-                        None,
                         None,
                     ),
                     None => Vec::new(),
@@ -125,12 +123,19 @@ impl RenderOnce for DesignCard {
                                  _: &mut App| {
             for prim in list {
                 match prim {
-                    paint::Primitive::Rect { bounds, color } => {
-                        window.paint_quad(fill(bounds, color));
+                    paint::Primitive::Rect { x, y, w, h, color } => {
+                        window.paint_quad(fill(
+                            Bounds {
+                                origin: Point { x: px(x), y: px(y) },
+                                size: Size { width: px(w), height: px(h) },
+                            },
+                            color,
+                        ));
                     }
-                    paint::Primitive::Outline { bounds: _ } => {}
+                    paint::Primitive::Polygon { .. } => {}
+                    paint::Primitive::Line { .. } => {}
+                    paint::Primitive::Outline { .. } => {}
                     paint::Primitive::Circle { .. } => {}
-                    paint::Primitive::CornerHandle { .. } => {}
                 }
             }
         };

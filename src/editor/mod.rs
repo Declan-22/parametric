@@ -51,11 +51,16 @@ impl PendingShape {
     }
 }
 
-// An active endpoint/body drag: the points being moved and where they
-// started, so the delta is recomputed from scratch every frame (keeps
-// clamping and snapping stable).
+// An active drag: `points` are the dragged slots (gesture-start positions;
+// they chase cursor targets), `aux` are follower points freed ONLY in
+// point-resize mode — they carry strong anchors so they slide along their
+// constrained axes without letting the whole object translate. Everything
+// else involved stays hard-fixed, which lets the solver PROJECT OUT illegal
+// motion components (an edge drag can never slide its unselected opposite
+// side).
 pub(crate) struct DragState {
     pub points: Vec<(PointId, Point2)>,
+    pub aux: Vec<(PointId, Point2)>,
     pub start_cursor: Point2,
 }
 
@@ -288,17 +293,48 @@ impl Editor {
                                 }
                             }
 
-                            // Grab-and-go: whatever is in the selection
-                            // AFTER the press resolves moves as one group.
-                            // Pressing selected geometry keeps the group;
-                            // pressing unselected geometry replaced it above,
-                            // so the drag is just that element.
-                            let pts = self.doc.selection_points(&self.selection);
-                            let start_pos = pts
-                                .iter()
-                                .filter_map(|&pid| self.doc.point(pid).map(|pos| (pid, pos)))
-                                .collect();
-                            self.dragging = Some(DragState { points: start_pos, start_cursor: p });
+                            // Grab semantics by what was pressed:
+                            //  - POINT -> resize mode: the corner chases the
+                            //    cursor; constraint-neighbors join as soft
+                            //    followers so they slide along their edges.
+                            //  - SEGMENT/FILL -> selection-wide drag; every
+                            //    unselected involved point is hard-fixed, so
+                            //    the solver stretches the selected sub-shape
+                            //    instead of translating the whole object.
+                            let (drag_pts, aux_pts) = if let ElementRef::Point(pid) = el {
+                                let mut ring: Vec<PointId> = Vec::new();
+                                for c in &self.doc.constraints {
+                                    let other = if c.a == pid {
+                                        Some(c.b)
+                                    } else if c.b == pid {
+                                        Some(c.a)
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(o) = other
+                                        && o != pid
+                                        && !ring.contains(&o)
+                                        && self.doc.point(o).is_some()
+                                    {
+                                        ring.push(o);
+                                    }
+                                }
+                                let start = self.doc.point(pid).unwrap();
+                                let aux = ring
+                                    .iter()
+                                    .map(|&o| (o, self.doc.point(o).unwrap()))
+                                    .collect();
+                                (vec![(pid, start)], aux)
+                            } else {
+                                let pts = self.doc.selection_points(&self.selection);
+                                let drag = pts
+                                    .iter()
+                                    .filter_map(|&pid| self.doc.point(pid).map(|pos| (pid, pos)))
+                                    .collect();
+                                (drag, Vec::new())
+                            };
+                            self.dragging =
+                                Some(DragState { points: drag_pts, aux: aux_pts, start_cursor: p });
                             true
                         }
                         None => {
@@ -341,7 +377,9 @@ impl Editor {
             return false;
         }
 
-        // Endpoint/body drag with constraint clamps + snapping.
+        // Live constraint-solve drag: cursor targets go in, solved
+        // positions come out — geometry satisfies H/V/dimension
+        // constraints continuously while dragging.
         if self.dragging.is_some() {
             let drag = self.dragging.as_ref().unwrap();
             let p = self.cursor_doc(cursor);
@@ -349,15 +387,30 @@ impl Editor {
             if delta.x == 0. && delta.y == 0. {
                 return false;
             }
-            let ids: Vec<PointId> = drag.points.iter().map(|(id, _)| *id).collect();
+            // Snap exclusion: everything belonging to the dragged system —
+            // dragged points, aux followers, and any point of the selected
+            // objects. Snapping is for OTHER objects only; snapping to the
+            // shape you're resizing is what made corner drags feel jumpy.
+            let mut exclude: Vec<PointId> = drag.points.iter().map(|(id, _)| *id).collect();
+            for &(pid, _) in &drag.aux {
+                if !exclude.contains(&pid) {
+                    exclude.push(pid);
+                }
+            }
+            for pid in self.doc.selection_points(&self.selection) {
+                if !exclude.contains(&pid) {
+                    exclude.push(pid);
+                }
+            }
 
-            // Snap: smallest correction over all dragged points' new spots.
+            // Endpoint-only snapping keeps drags fluid; the smallest
+            // correction across dragged points wins.
             let mut snapped_delta = delta;
             if self.snapping_active() {
                 let mut best: Option<(f64, Point2)> = None;
                 for &(_pid, start) in &drag.points {
                     let target = Point2::new(start.x + delta.x, start.y + delta.y);
-                    let (adj, _) = self.best_snap(target, &ids, true);
+                    let (adj, _) = self.best_snap(target, &exclude, true);
                     let score = adj.x.abs() + adj.y.abs();
                     if best.map_or(true, |(s, _)| score < s) {
                         best = Some((score, adj));
@@ -368,46 +421,21 @@ impl Editor {
                 }
             }
 
-            // Apply per point: snap-adjusted spot, then constraint clamps.
-            let apply_hv = ids.len() > 1;
-            let mut placements: Vec<(PointId, Point2)> = Vec::new();
-            for &(pid, start) in &drag.points {
-                let desired = Point2::new(start.x + snapped_delta.x, start.y + snapped_delta.y);
-                placements.push((pid, self.clamp_point(pid, desired, &ids, apply_hv)));
-            }
+            let targets: Vec<(PointId, Point2)> = drag
+                .points
+                .iter()
+                .map(|&(pid, start)| {
+                    (
+                        pid,
+                        Point2::new(start.x + snapped_delta.x, start.y + snapped_delta.y),
+                    )
+                })
+                .collect();
 
-            // Single-point drag: PROPAGATE along H/V constraints instead of
-            // clamping. Dragging a rectangle corner slides its two adjacent
-            // corners along their edges (opposite corner anchors), which is
-            // exactly how a constrained shape resizes.
-            if ids.len() == 1 {
-                let pid = ids[0];
-                let pos = placements[0].1;
-                for c in &self.doc.constraints {
-                    let other = if c.a == pid {
-                        Some(c.b)
-                    } else if c.b == pid {
-                        Some(c.a)
-                    } else {
-                        None
-                    };
-                    let Some(o) = other else { continue };
-                    if ids.contains(&o) || o == pid {
-                        continue;
-                    }
-                    match c.kind {
-                        ConstraintKind::Horizontal => {
-                            placements.push((o, Point2::new(self.doc.point(o).unwrap_or(pos).x, pos.y)));
-                        }
-                        ConstraintKind::Vertical => {
-                            placements.push((o, Point2::new(pos.x, self.doc.point(o).unwrap_or(pos).y)));
-                        }
-                        ConstraintKind::Coincident => {}
-                    }
-                }
-            }
-
-            for (id, pos) in placements {
+            let solver =
+                crate::core::solver::Solver::build(&self.doc, &targets, &drag.aux);
+            let solution = solver.solve();
+            for (id, pos) in solution.positions {
                 self.doc.move_point(id, pos);
             }
             return true;
@@ -421,58 +449,6 @@ impl Editor {
         }
         self.snap_guides.clear();
         false
-    }
-
-    // Applies H/V constraints and locked dimensions to a point being placed
-    // at `desired`. Constraints whose partner is also moving are skipped —
-    // rigid groups need the real solver, not per-point clamps.
-    fn clamp_point(&self, pid: PointId, mut desired: Point2, moving: &[PointId], apply_hv: bool) -> Point2 {
-        if apply_hv {
-            for c in &self.doc.constraints {
-            let other = if c.a == pid {
-                Some(c.b)
-            } else if c.b == pid {
-                Some(c.a)
-            } else {
-                None
-            };
-            let Some(o) = other else { continue };
-            if moving.contains(&o) || o == pid {
-                continue;
-            }
-            let Some(op) = self.doc.point(o) else { continue };
-            match c.kind {
-                ConstraintKind::Horizontal => desired.y = op.y,
-                ConstraintKind::Vertical => desired.x = op.x,
-                ConstraintKind::Coincident => {}
-            }
-            }
-        }
-        // Locked dimensions project onto the circle of allowed positions.
-        for d in &self.doc.dimensions {
-            let Some(v) = d.value else { continue };
-            let other = if d.a == pid {
-                Some(d.b)
-            } else if d.b == pid {
-                Some(d.a)
-            } else {
-                None
-            };
-            let Some(o) = other else { continue };
-            if moving.contains(&o) || o == pid {
-                continue;
-            }
-            let Some(op) = self.doc.point(o) else { continue };
-            let dx = desired.x - op.x;
-            let dy = desired.y - op.y;
-            let len = (dx * dx + dy * dy).sqrt();
-            if len < 1e-9 {
-                desired = Point2::new(op.x + v, op.y);
-            } else {
-                desired = Point2::new(op.x + dx / len * v, op.y + dy / len * v);
-            }
-        }
-        desired.clamped()
     }
 
     // -- snapping --

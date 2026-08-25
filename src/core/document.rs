@@ -41,11 +41,18 @@ pub struct Segment {
     pub start: PointId,
     pub end: PointId,
     pub kind: SegmentKind,
+    // Screen-px stroke rendered for standalone lines; 0 = invisible
+    // geometry (rectangle edges, etc.).
+    pub stroke_width: f64,
 }
 
 impl Segment {
     fn line(start: PointId, end: PointId) -> Self {
-        Self { start, end, kind: SegmentKind::Line }
+        Self { start, end, kind: SegmentKind::Line, stroke_width: 0. }
+    }
+
+    fn with_kind(start: PointId, end: PointId, kind: SegmentKind) -> Self {
+        Self { start, end, kind, stroke_width: 0. }
     }
 }
 
@@ -221,7 +228,18 @@ impl Document {
 
     /// Adds a segment with an explicit kind (ruler, future arcs).
     pub fn add_segment_kind(&mut self, start: PointId, end: PointId, kind: SegmentKind) -> SegmentId {
-        let (idx, generation) = self.segments.insert(Segment { start, end, kind });
+        let (idx, generation) = self.segments.insert(Segment::with_kind(start, end, kind));
+        SegmentId { idx, generation }
+    }
+
+    /// Adds a standalone stroked line (the line tool's output).
+    pub fn add_stroked_segment(&mut self, start: PointId, end: PointId, stroke_width: f64) -> SegmentId {
+        let (idx, generation) = self.segments.insert(Segment {
+            start,
+            end,
+            kind: SegmentKind::Line,
+            stroke_width,
+        });
         SegmentId { idx, generation }
     }
 
@@ -378,9 +396,16 @@ impl Document {
         self.points.set_at(id.idx, pos.clamped());
     }
 
-    pub fn insert_segment_with_id(&mut self, id: SegmentId, start: PointId, end: PointId, kind: SegmentKind) {
+    pub fn insert_segment_with_id(
+        &mut self,
+        id: SegmentId,
+        start: PointId,
+        end: PointId,
+        kind: SegmentKind,
+        stroke_width: f64,
+    ) {
         Self::reserve(&mut self.segments, id.idx, id.generation);
-        self.segments.set_at(id.idx, Segment { start, end, kind });
+        self.segments.set_at(id.idx, Segment { start, end, kind, stroke_width });
     }
 
     pub fn insert_fill_with_id(&mut self, id: FillId, segments: Vec<SegmentId>) {

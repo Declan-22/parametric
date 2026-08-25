@@ -8,7 +8,7 @@ mod tools;
 pub use camera::Camera;
 
 pub use snapping::SnapGuide;
-pub use tools::{PendingRuler, PendingShape, Tool};
+pub use tools::{PendingLine, PendingRuler, PendingShape, Tool};
 
 use crate::core::constraints::{ConstraintKind, ElementRef};
 use crate::core::document::{Document, Layer};
@@ -50,6 +50,7 @@ pub struct Editor {
     pub tool: Tool,
     pub pending_shape: Option<PendingShape>,
     pub pending_ruler: Option<PendingRuler>,
+    pub pending_line: Option<PendingLine>,
     // Pending shape created by a single click (commit on next click).
     pub pending_via_click: bool,
     pub selection: Vec<ElementRef>,
@@ -74,10 +75,10 @@ pub struct Editor {
     pan_start: Option<(gpui::Pixels, gpui::Pixels, Camera)>,
 }
 
-const HANDLE_TOL_PX: f64 = 11.0;
+const HANDLE_TOL_PX: f64 = 14.0;
 // Tight tolerance for press-to-grab: inside this, a drag moves geometry;
 // outside it (but within HANDLE_TOL_PX), a drag is a marquee.
-const EXACT_TOL_PX: f64 = 4.5;
+const EXACT_TOL_PX: f64 = 7.0;
 const SNAP_TOL_PX: f64 = 6.0;
 
 impl Editor {
@@ -99,6 +100,7 @@ impl Editor {
             tool: Tool::Move,
             pending_shape: None,
             pending_ruler: None,
+            pending_line: None,
             pending_via_click: false,
             selection: Vec::new(),
             hover: None,
@@ -124,6 +126,7 @@ impl Editor {
         self.tool = tool;
         self.pending_shape = None;
         self.pending_ruler = None;
+        self.pending_line = None;
         self.pending_via_click = false;
         self.selection.clear();
         self.marquee = None;
@@ -151,7 +154,7 @@ impl Editor {
     /// Snaps a free point (shape-tool placement) to the best target.
     fn snap_point(&self, p: Point2) -> (Point2, Vec<SnapGuide>) {
         let (adj, guides) =
-            snapping::best(&self.doc, self.snap_tol_doc(), p, &[], false);
+            snapping::best(&self.doc, self.snap_tol_doc(), p, &[], false, false);
         (Point2::new(p.x + adj.x, p.y + adj.y), guides)
     }
 
@@ -214,6 +217,26 @@ impl Editor {
                     let (at, guides) = self.snap_point(self.cursor_doc(cursor));
                     self.snap_guides = guides;
                     self.pending_ruler = Some(PendingRuler { start: at, cursor: at });
+                    self.pending_via_click = true;
+                    true
+                }
+                Tool::Line => {
+                    // Second click commits a click-created pending line.
+                    if let Some(pending) = self.pending_line.take() {
+                        self.pending_via_click = false;
+                        self.snap_guides.clear();
+                        self.tool = Tool::Move;
+                        let (_, b) = pending.snapped(shift);
+                        if pick::distance(b, pending.start) > 1e-6 {
+                            let layer_id = self.doc.layers[0].id;
+                            let seg = self.create_line(layer_id, pending.start, b);
+                            self.selection = vec![ElementRef::Segment(seg)];
+                        }
+                        return true;
+                    }
+                    let (at, guides) = self.snap_point(self.cursor_doc(cursor));
+                    self.snap_guides = guides;
+                    self.pending_line = Some(PendingLine { start: at, cursor: at });
                     self.pending_via_click = true;
                     true
                 }
@@ -346,6 +369,17 @@ impl Editor {
             return true;
         }
 
+        // Line rubber band.
+        if self.pending_line.is_some() {
+            let at = self.cursor_doc(cursor);
+            let (at, guides) = self.snap_point(at);
+            self.snap_guides = guides;
+            if let Some(pending) = self.pending_line.as_mut() {
+                pending.cursor = at;
+            }
+            return true;
+        }
+
         if self.dragging.is_none() {
             // Marquee band update.
             if let Some((start, _)) = self.marquee {
@@ -389,14 +423,25 @@ impl Editor {
             }
         }
 
-        // Endpoint-only snapping keeps drags fluid; the smallest correction
-        // across dragged points wins.
+        // Single-endpoint drags of STANDALONE lines only snap when the
+        // endpoint truly lands on another point — a passing axis alignment
+        // must not yank one axis (the slight 90-degree snap).
+        let coincident_only = drag.points.len() == 1
+            && self.pid_on_bare_line(drag.points[0].0);
+
         let mut snapped_delta = delta;
         if !self.alt_down {
             let mut best: Option<(f64, Point2)> = None;
             for &(_pid, start) in &drag.points {
                 let target = Point2::new(start.x + delta.x, start.y + delta.y);
-                let (adj, _) = snapping::best(&self.doc, self.snap_tol_doc(), target, &exclude, true);
+                let (adj, _) = snapping::best(
+                    &self.doc,
+                    self.snap_tol_doc(),
+                    target,
+                    &exclude,
+                    true,
+                    coincident_only,
+                );
                 let score = adj.x.abs() + adj.y.abs();
                 if best.map_or(true, |(s, _)| score < s) {
                     best = Some((score, adj));
@@ -429,6 +474,17 @@ impl Editor {
         true
     }
 
+    /// True when pid is an endpoint of a standalone stroked line (line
+    /// tool output, not part of any fill).
+    fn pid_on_bare_line(&self, pid: PointId) -> bool {
+        self.doc.all_segments().any(|(sid, s)| {
+            (s.start == pid || s.end == pid)
+                && s.kind == crate::core::document::SegmentKind::Line
+                && s.stroke_width > 0.
+                && !self.doc.all_fills().any(|(_, f)| f.segments.contains(&sid))
+        })
+    }
+
     // -- dimensions (delegates to the dims subsystem) --
 
     pub fn update_dim_geom(&mut self) {
@@ -459,14 +515,18 @@ impl Editor {
         if self.tool == Tool::Pan {
             return CursorStyle::OpenHand;
         }
-        if self.tool == Tool::Rectangle || self.tool == Tool::Ruler {
+        if self.tool == Tool::Rectangle || self.tool == Tool::Ruler || self.tool == Tool::Line {
             return CursorStyle::Crosshair;
         }
         CursorStyle::Arrow
     }
 
     pub fn canvas_up(&mut self, button: gpui::MouseButton, shift: bool) -> bool {
-        if button == gpui::MouseButton::Middle && self.end_pan() {
+        // Panning ends on release of EITHER panning button — a stuck
+        // pan_start made the camera chase the cursor forever.
+        if (button == gpui::MouseButton::Left || button == gpui::MouseButton::Middle)
+            && self.end_pan()
+        {
             return true;
         }
         if button != gpui::MouseButton::Left {
@@ -510,15 +570,32 @@ impl Editor {
             self.marquee_add = false;
         }
 
-        // Click-created pending shapes survive mouse-up; they commit on the
-        // next click instead. Only drag-created ones commit here.
-        if self.pending_via_click {
+        // Click-created pending shapes survive mouse-up ONLY when the
+        // cursor never moved (a true click); any real drag commits on
+        // release. Only the no-motion case waits for the next click.
+        if let Some(pending) = self.pending_line.take() {
+            let (_, b) = pending.snapped(shift);
+            if self.pending_via_click && pick::distance(b, pending.start) <= 1e-6 {
+                self.pending_line = Some(pending);
+                return true;
+            }
+            self.pending_via_click = false;
+            self.tool = Tool::Move;
+            if pick::distance(b, pending.start) > 1e-6 {
+                let layer_id = self.doc.layers[0].id;
+                let seg = self.create_line(layer_id, pending.start, b);
+                self.selection = vec![ElementRef::Segment(seg)];
+            }
             return true;
         }
-        // Drag-created ruler commits on release.
         if let Some(pending) = self.pending_ruler.take() {
-            self.tool = Tool::Move;
             let (_, b) = pending.snapped(shift);
+            if self.pending_via_click && pick::distance(b, pending.start) <= 1e-6 {
+                self.pending_ruler = Some(pending);
+                return true;
+            }
+            self.pending_via_click = false;
+            self.tool = Tool::Move;
             if pick::distance(b, pending.start) > 1e-6 {
                 let layer_id = self.doc.layers[0].id;
                 let seg = self.create_ruler(layer_id, pending.start, b);
@@ -529,12 +606,15 @@ impl Editor {
         let Some(pending) = self.pending_shape.take() else {
             return false;
         };
-        // Ignore click-without-drag.
-        if (pending.cursor.x - pending.start.x).abs() < 1e-9
+        // Click without motion: keep pending, commit on next click.
+        if self.pending_via_click
+            && (pending.cursor.x - pending.start.x).abs() < 1e-9
             && (pending.cursor.y - pending.start.y).abs() < 1e-9
         {
+            self.pending_shape = Some(pending);
             return true;
         }
+        self.pending_via_click = false;
         let b = pending.bounds();
         self.tool = Tool::Move;
         if b.size.w > 0. && b.size.h > 0. {
@@ -605,6 +685,26 @@ impl Editor {
         seg
     }
 
+    /// Emits a standalone line: 2 points + 1 stroked segment. No
+    /// constraints, no fill — the line tool's output.
+    pub fn create_line(
+        &mut self,
+        layer_id: u64,
+        a: Point2,
+        b: Point2,
+    ) -> crate::core::ids::SegmentId {
+        const LINE_STROKE_PX: f64 = 1.0;
+        let p1 = self.doc.add_point(a);
+        let p2 = self.doc.add_point(b);
+        let seg =
+            self.doc
+                .add_stroked_segment(p1, p2, LINE_STROKE_PX);
+        self.doc.push_to_layer(layer_id, ElementRef::Point(p1));
+        self.doc.push_to_layer(layer_id, ElementRef::Point(p2));
+        self.doc.push_to_layer(layer_id, ElementRef::Segment(seg));
+        seg
+    }
+
     /// Deletes an element from the document and clears it from selection.
     pub fn delete_element(&mut self, el: ElementRef) {
         match el {
@@ -612,7 +712,28 @@ impl Editor {
                 self.doc.remove_point(p);
             }
             ElementRef::Segment(s) => {
+                // Standalone endpoints die with their segment: once nothing
+                // else references an endpoint, remove it too.
+                let ends: Vec<PointId> = self
+                    .doc
+                    .segment(s)
+                    .map(|seg| vec![seg.start, seg.end])
+                    .unwrap_or_default();
                 self.doc.remove_segment(s);
+                for pid in ends {
+                    let still_used = self.doc.all_segments().any(|(_, seg)| seg.start == pid || seg.end == pid)
+                        || self.doc.constraints.iter().any(|c| c.a == pid || c.b == pid)
+                        || self.doc.dimensions.iter().any(|d| d.a == pid || d.b == pid)
+                        || self
+                            .doc
+                            .all_fills()
+                            .any(|(_, f)| f.segments.iter().any(|&fs| {
+                                self.doc.segment(fs).is_some_and(|seg| seg.start == pid || seg.end == pid)
+                            }));
+                    if !still_used {
+                        self.doc.remove_point(pid);
+                    }
+                }
             }
             ElementRef::Fill(f) => {
                 self.doc.remove_fill(f);
@@ -711,11 +832,13 @@ impl Editor {
 }
 
 /// Snap a single drag target's direction to 45-degree steps around the
-/// other endpoint of its owning segment (shift-resize of rulers etc.).
+/// other endpoint of its owning segment (shift-resize). Standalone lines
+/// get angle-only snapping — no inch-mark length quantization.
 fn snap_target_direction(doc: &Document, targets: &mut [(PointId, Point2)]) {
     let (pid, target) = targets[0];
     let mut anchor: Option<Point2> = None;
-    for (_, s) in doc.all_segments() {
+    let mut bare_line = false;
+    for (sid, s) in doc.all_segments() {
         let other = if s.start == pid {
             Some(s.end)
         } else if s.end == pid {
@@ -727,6 +850,9 @@ fn snap_target_direction(doc: &Document, targets: &mut [(PointId, Point2)]) {
             && let Some(pos) = doc.point(o)
         {
             anchor = Some(pos);
+            bare_line = s.kind == crate::core::document::SegmentKind::Line
+                && s.stroke_width > 0.
+                && !doc.all_fills().any(|(_, f)| f.segments.contains(&sid));
             break;
         }
     }
@@ -736,6 +862,10 @@ fn snap_target_direction(doc: &Document, targets: &mut [(PointId, Point2)]) {
     if dx == 0. && dy == 0. {
         return;
     }
-    let snapped = tools::snap_direction(anchor, target);
-    targets[0].1 = snapped.1;
+    let (_, snapped_b) = tools::snap_direction(anchor, target);
+    targets[0].1 = if bare_line {
+        tools::snap_angle(anchor, target)
+    } else {
+        snapped_b
+    };
 }

@@ -9,6 +9,7 @@ use crate::core::geometry::{Point2, Rect};
 pub enum Tool {
     Move,
     Pan,
+    Line,
     Rectangle,
     Ruler,
 }
@@ -36,6 +37,39 @@ impl PendingShape {
         );
         Rect::from_points(self.start, constrained)
     }
+}
+
+// In-progress line being drawn out (click-click or press-drag-release).
+// Shift snaps the direction to 45-degree increments, same as rulers.
+#[derive(Clone, Copy, Debug)]
+pub struct PendingLine {
+    pub start: Point2,
+    pub cursor: Point2,
+}
+
+impl PendingLine {
+    pub fn snapped(&self, shift: bool) -> (Point2, Point2) {
+        let (a, b) = (self.start, self.cursor);
+        if !shift {
+            return (a, b);
+        }
+        (a, snap_angle(a, b))
+    }
+}
+
+/// Snaps b's DIRECTION around anchor a to the nearest 45 degrees,
+/// preserving its length. Unlike `snap_direction` there is no length
+/// quantization — free-form lines must not lock to inch marks.
+pub fn snap_angle(a: Point2, b: Point2) -> Point2 {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    if dx == 0. && dy == 0. {
+        return b;
+    }
+    let step = std::f64::consts::FRAC_PI_4;
+    let angle = (dy.atan2(dx) / step).round() * step;
+    let len = (dx * dx + dy * dy).sqrt();
+    Point2::new(a.x + len * angle.cos(), a.y + len * angle.sin())
 }
 
 // In-progress ruler segment being dragged out. Shift snaps the direction

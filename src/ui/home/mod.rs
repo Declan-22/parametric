@@ -113,6 +113,7 @@ impl RenderOnce for DesignCard {
                         &[],    // snap guides
                         None,   // marquee
                         None,   // pending ruler
+                        None,   // pending line
                     ),
                     None => Vec::new(),
                 }

@@ -71,6 +71,7 @@ pub fn build_draw_list(
     snap_guides: &[SnapGuide],
     marquee: Option<(Point2, Point2)>,
     pending_ruler: Option<(Point2, Point2)>,
+    pending_line: Option<(Point2, Point2)>,
 ) -> Vec<Primitive> {
     let min = camera.screen_to_unit(Point2::new(0., 0.));
     let max = camera.screen_to_unit(Point2::new(
@@ -114,6 +115,23 @@ pub fn build_draw_list(
                         && (visible.contains(a) || visible.contains(b))
                     {
                         push_ruler(&mut list, a, b, camera, t);
+                    }
+                    // Standalone stroked lines (line tool output).
+                    if seg.kind == SegmentKind::Line
+                        && seg.stroke_width > 0.
+                        && let Some((a, b)) = doc.segment_geom(sid)
+                        && (visible.contains(a) || visible.contains(b))
+                    {
+                        let (ax, ay) = scr(a);
+                        let (bx, by) = scr(b);
+                        list.push(Primitive::Line {
+                            ax,
+                            ay,
+                            bx,
+                            by,
+                            width: seg.stroke_width as f32,
+                            color,
+                        });
                     }
                 }
                 _ => {}
@@ -206,6 +224,13 @@ pub fn build_draw_list(
     // In-progress ruler preview with full tick rendering.
     if let Some((a, b)) = pending_ruler {
         push_ruler(&mut list, a, b, camera, t);
+    }
+
+    // In-progress line preview: accent stroke at the final width.
+    if let Some((a, b)) = pending_line {
+        let (ax, ay) = scr(a);
+        let (bx, by) = scr(b);
+        list.push(Primitive::Line { ax, ay, bx, by, width: 1., color: accent });
     }
     list
 }

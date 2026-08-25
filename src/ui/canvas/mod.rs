@@ -265,6 +265,8 @@ impl CanvasView {
             let pending_ruler = ed
                 .pending_ruler
                 .map(|p| p.snapped(ed.shift));
+            let pending_line =
+                ed.pending_line.map(|p| p.snapped(ed.shift));
             let list = paint::build_draw_list(
                 &ed.doc,
                 &ed.camera,
@@ -277,6 +279,7 @@ impl CanvasView {
                 &ed.snap_guides,
                 ed.marquee,
                 pending_ruler,
+                pending_line,
             );
             (list, hitbox)
         };

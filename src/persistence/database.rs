@@ -5,7 +5,7 @@ use crate::core::document::{Document, Layer, SegmentKind};
 use crate::core::geometry::Point2;
 use crate::core::ids::{FillId, PointId, SegmentId};
 
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 pub struct Database {
     conn: Connection,
@@ -37,10 +37,9 @@ impl Database {
                 value TEXT NOT NULL
             );",
         )?;
-        // v3 is a full break from the shape-based model: points, segments,
-        // fills and constraints are first-class. Old databases don't
-        // migrate — the schema is dropped and rebuilt.
-        if self.schema_version()? < 3 {
+        // v3 was a full break from the shape-based model; v4 added segment
+        // stroke widths. Old databases don't migrate — dropped and rebuilt.
+        if self.schema_version()? < 4 {
             self.conn.execute_batch(
                 "DROP TABLE IF EXISTS shapes;
                  DROP TABLE IF EXISTS constraints;
@@ -74,7 +73,8 @@ impl Database {
                 start_idx INTEGER NOT NULL,
                 start_gen INTEGER NOT NULL,
                 end_idx INTEGER NOT NULL,
-                end_gen INTEGER NOT NULL
+                end_gen INTEGER NOT NULL,
+                stroke_width REAL NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS fills (
                 idx INTEGER PRIMARY KEY,
@@ -165,8 +165,8 @@ impl Database {
                     SegmentKind::Ruler => "ruler",
                 };
                 self.conn.execute(
-                    "INSERT INTO segments(idx, generation, kind, start_idx, start_gen, end_idx, end_gen)
-                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    "INSERT INTO segments(idx, generation, kind, start_idx, start_gen, end_idx, end_gen, stroke_width)
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     rusqlite::params![
                         sid.idx as i64,
                         sid.generation as i64,
@@ -174,7 +174,8 @@ impl Database {
                         s.start.idx as i64,
                         s.start.generation as i64,
                         s.end.idx as i64,
-                        s.end.generation as i64
+                        s.end.generation as i64,
+                        s.stroke_width
                     ],
                 )?;
             }
@@ -275,7 +276,7 @@ impl Database {
         drop(stmt);
 
         let mut stmt = self.conn.prepare(
-            "SELECT idx, generation, kind, start_idx, start_gen, end_idx, end_gen
+            "SELECT idx, generation, kind, start_idx, start_gen, end_idx, end_gen, stroke_width
              FROM segments ORDER BY idx",
         )?;
         let mut rows = stmt.query([])?;
@@ -301,6 +302,7 @@ impl Database {
                     generation: row.get::<_, i64>(6)? as u32,
                 },
                 kind,
+                row.get::<_, f64>(7).unwrap_or(0.),
             );
         }
         drop(rows);
@@ -427,8 +429,15 @@ fn insert_point_raw(doc: &mut Document, id: PointId, pos: Point2) {
     doc.insert_point_with_id(id, pos.clamped());
 }
 
-fn insert_segment_raw(doc: &mut Document, id: SegmentId, start: PointId, end: PointId, kind: SegmentKind) {
-    doc.insert_segment_with_id(id, start, end, kind);
+fn insert_segment_raw(
+    doc: &mut Document,
+    id: SegmentId,
+    start: PointId,
+    end: PointId,
+    kind: SegmentKind,
+    stroke_width: f64,
+) {
+    doc.insert_segment_with_id(id, start, end, kind, stroke_width);
 }
 
 fn insert_fills_raw(doc: &mut Document, fills: Vec<(u32, u32, Vec<SegmentId>)>) {

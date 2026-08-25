@@ -28,6 +28,15 @@ const ICON_PAN: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" 
 
 "#;
 
+const ICON_LINE: &[u8] =
+    br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 256 256">
+	<path d="M0 0h256v256H0z" fill="none" />
+	<path fill="currentColor" d="M213.23 42.77A30 30 0 0 0 167 80.54L80.54 167a30.07 30.07 0 0 0-37.77 3.81A30 30 0 1 0 89 175.46L175.46 89a30 30 0 0 0 37.77-46.25Zm-136.51 162a18 18 0 1 1 0-25.46a18 18 0 0 1 0 25.43Zm128-128a18 18 0 0 1-25.46 0a18 18 0 1 1 25.46 0" />
+</svg>
+
+
+"#;
+
 const ICON_RECTANGLE: &[u8] =
     br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
 	<path d="M0 0h24v24H0z" fill="none" />
@@ -87,6 +96,7 @@ impl RenderOnce for Toolbar {
             .child(divider(t))
             .child(self.tool_button(Tool::Ruler, ICON_RULER, active_tool, t, cx))
             .child(divider(t))
+            .child(self.tool_button(Tool::Line, ICON_LINE, active_tool, t, cx))
             .child(self.tool_button(Tool::Rectangle, ICON_RECTANGLE, active_tool, t, cx))
     }
 }
@@ -185,6 +195,7 @@ fn tool_debug_name(tool: Tool) -> &'static str {
     match tool {
         Tool::Move => "tool-move",
         Tool::Pan => "tool-pan",
+        Tool::Line => "tool-line",
         Tool::Rectangle => "tool-rectangle",
         Tool::Ruler => "tool-ruler",
     }

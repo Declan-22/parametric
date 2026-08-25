@@ -1,4 +1,5 @@
 use super::ruler;
+use crate::editor::pick;
 use super::Editor;
 use crate::core::document::Document;
 use crate::core::geometry::{Point2, Rect};
@@ -62,6 +63,20 @@ pub fn update(ed: &mut Editor) {
         return;
     }
 
+    // A lone selected standalone LINE (line tool output): its length dim
+    // runs ALONG the line itself — same angle, offset to the lower side.
+    if ed.pending_shape.is_none()
+        && ed.selection.len() == 1
+        && let Some(sid) = ed.selection[0].as_segment()
+        && let Some(seg) = ed.doc.segment(sid)
+        && seg.kind == crate::core::document::SegmentKind::Line
+        && !ed.doc.all_fills().any(|(_, f)| f.segments.contains(&sid))
+        && let Some((a, b)) = ed.doc.segment_geom(sid)
+    {
+        push_line_dim(ed, a, b);
+        return;
+    }
+
     // A lone selected edge shows the dim of the axis being resized:
     // left/right edges -> WIDTH dim under the shape; top/bottom -> HEIGHT
     // dim right of the shape. Applies WHILE dragging too. Ruler segments
@@ -77,7 +92,7 @@ pub fn update(ed: &mut Editor) {
             if let (Some(bounds), Some((a, b))) =
                 (ed.doc.fill_bounds(fid), ed.doc.segment_geom(sid))
             {
-                if (b.x - a.x).abs() <= 1e-9 {
+                if (b.x - a.x).abs() <= (b.y - a.y).abs() {
                     let bl = Point2::new(bounds.origin.x, bounds.origin.y + bounds.size.h);
                     let br = Point2::new(
                         bounds.origin.x + bounds.size.w,
@@ -111,15 +126,29 @@ pub fn update(ed: &mut Editor) {
         }
     }
 
-    // Dragging a point of a closed loop: show that loop's W+H dims.
+    // Dragging/selected point: a standalone line's endpoint shows the
+    // line's slanted length dim; a loop point shows the loop's W+H dims.
     if ed.pending_shape.is_none()
+        && ed.pending_line.is_none()
         && ed.selection.len() == 1
         && let Some(pid) = ed.selection[0].as_point()
-        && let Some(fid) = fill_containing_point(&ed.doc, pid)
-        && let Some(b) = ed.doc.fill_bounds(fid)
     {
-        push_wh_dims(ed, b);
-        return;
+        if let Some((a, b)) = bare_line_of_point(ed, pid) {
+            push_line_dim(ed, a, b);
+            return;
+        }
+        if let Some(fid) = fill_containing_point(&ed.doc, pid)
+            && let Some(b) = ed.doc.fill_bounds(fid)
+        {
+            push_wh_dims(ed, b);
+            return;
+        }
+    }
+
+    // Live line preview: slanted length dim while drawing.
+    if let Some(p) = &ed.pending_line {
+        let (_, b) = p.snapped(ed.shift);
+        push_line_dim(ed, p.start, b);
     }
 
     // Live preview: bounding box W/H while creating or interacting.
@@ -167,8 +196,24 @@ fn selection_is_ruler(ed: &Editor) -> bool {
             .is_some_and(|sid| ruler::is_ruler(&ed.doc, sid))
 }
 
-fn push_wh_dims(ed: &mut Editor, b: Rect) {
-    if b.size.w > 0. {
+// Slanted length dim for a line: runs parallel to a->b at full length,
+// offset toward the LOWER side (left normal of the left-to-right order).
+fn push_line_dim(ed: &mut Editor, a: Point2, b: Point2) {
+    if pick::distance(a, b) <= 1e-6 {
+        return;
+    }
+    let (a, b) = if a.x <= b.x { (a, b) } else { (b, a) };
+    ed.dim_renders.push(linear_dim(
+        &ed.doc,
+        &ed.camera,
+        a,
+        b,
+        PREVIEW_DIM_OFFSET_DOC,
+        pick::distance(a, b),
+    ));
+}
+
+fn push_wh_dims(ed: &mut Editor, b: Rect) {    if b.size.w > 0. {
         let bl = Point2::new(b.origin.x, b.origin.y + b.size.h);
         let br = Point2::new(b.origin.x + b.size.w, b.origin.y + b.size.h);
         ed.dim_renders.push(linear_dim(&ed.doc, &ed.camera, bl, br, PREVIEW_DIM_OFFSET_DOC, b.size.w));
@@ -255,6 +300,19 @@ fn fill_containing_point(doc: &Document, pid: PointId) -> Option<FillId> {
             })
         })
         .map(|(id, _)| id)
+}
+
+/// Endpoints of the standalone line pid belongs to, if any.
+fn bare_line_of_point(ed: &Editor, pid: PointId) -> Option<(Point2, Point2)> {
+    ed.doc
+        .all_segments()
+        .find(|(sid, s)| {
+            (s.start == pid || s.end == pid)
+                && s.kind == crate::core::document::SegmentKind::Line
+                && s.stroke_width > 0.
+                && !ed.doc.all_fills().any(|(_, f)| f.segments.contains(sid))
+        })
+        .and_then(|(sid, _)| ed.doc.segment_geom(sid))
 }
 
 fn linear_dim_extras(

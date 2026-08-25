@@ -154,13 +154,16 @@ fn span_ok(t: &SnapTarget, p: Point2) -> bool {
 }
 
 /// Best single correction for a point against all targets. Returns
-/// (adjustment delta, guides).
+/// (adjustment delta, guides). `coincident_only` demands BOTH axes hit —
+/// used while dragging so a passing row/column alignment doesn't yank a
+/// single axis (the "slight 90-degree snap").
 pub fn best(
     doc: &Document,
     tol: f64,
     p: Point2,
     exclude: &[PointId],
     endpoints_only: bool,
+    coincident_only: bool,
 ) -> (Point2, Vec<SnapGuide>) {
     let mut best: Option<(f64, f64, f64, bool, bool, SnapTarget)> = None;
     for tgt in targets(doc, exclude, endpoints_only) {
@@ -169,6 +172,9 @@ pub fn best(
         let hit_x = tgt.snap_x && dx.abs() <= tol && span_ok(&tgt, p);
         let hit_y = tgt.snap_y && dy.abs() <= tol && span_ok(&tgt, p);
         if !hit_x && !hit_y {
+            continue;
+        }
+        if coincident_only && !(hit_x && hit_y) {
             continue;
         }
         let score = dx.abs() + dy.abs();

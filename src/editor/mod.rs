@@ -72,6 +72,8 @@ pub struct Editor {
     pub constraint_markers: Vec<dims::ConstraintMarker>,
     // Last known cursor + modifier state so changes can re-derive drags.
     pub last_cursor: Option<gpui::Point<gpui::Pixels>>,
+    // Last known canvas size in px, for viewport-culled snapping.
+    pub viewport_size: (f64, f64),
     pub shift: bool,
     pub alt_down: bool,
     pub(crate) dragging: Option<DragState>,
@@ -83,7 +85,7 @@ const HANDLE_TOL_PX: f64 = 14.0;
 // Tight tolerance for press-to-grab: inside this, a drag moves geometry;
 // outside it (but within HANDLE_TOL_PX), a drag is a marquee.
 const EXACT_TOL_PX: f64 = 7.0;
-const SNAP_TOL_PX: f64 = 6.0;
+const SNAP_TOL_PX: f64 = 10.0;
 
 impl Editor {
     pub fn new() -> Self {
@@ -117,6 +119,7 @@ impl Editor {
             dim_renders: Vec::new(),
             constraint_markers: Vec::new(),
             last_cursor: None,
+            viewport_size: (0., 0.),
             shift: false,
             alt_down: false,
             dragging: None,
@@ -158,10 +161,28 @@ impl Editor {
         SNAP_TOL_PX / self.camera.zoom
     }
 
+    /// Visible doc region expanded by a margin — the snap search space.
+    /// Snapping only considers nearby, on-screen geometry.
+    fn snap_visible(&self) -> Rect {
+        const MARGIN_PX: f64 = 80.;
+        let mut v = self.visible_bounds(Size {
+            w: self.viewport_size.0,
+            h: self.viewport_size.1,
+        });
+        let m = MARGIN_PX / self.camera.zoom;
+        let min = Point2::new(v.origin.x - m, v.origin.y - m);
+        let max = Point2::new(
+            v.origin.x + v.size.w + m,
+            v.origin.y + v.size.h + m,
+        );
+        v = Rect::from_points(min, max);
+        v
+    }
+
     /// Snaps a free point (shape-tool placement) to the best target.
     fn snap_point(&self, p: Point2) -> (Point2, Vec<SnapGuide>) {
         let (adj, guides) =
-            snapping::best(&self.doc, self.snap_tol_doc(), p, &[], false, false);
+            snapping::best(&self.doc, self.snap_tol_doc(), p, &[], false, false, self.snap_visible());
         (Point2::new(p.x + adj.x, p.y + adj.y), guides)
     }
 
@@ -274,7 +295,12 @@ impl Editor {
         let exact = pick::Picker::new(&self.doc, &self.camera, EXACT_TOL_PX).element(p);
         match picker.element(p) {
             Some(mut el) => {
-                if exact.is_none() {
+                // Multi-selections grab on the TOLERANT hit: points are far
+                // harder to hit exactly than lines, and a missed exact grab
+                // would silently become a marquee and drop the selection.
+                let part_of_multi_selection =
+                    self.selection.len() > 1 && self.element_selected(el);
+                if exact.is_none() && !part_of_multi_selection {
                     self.deferred_pick = Some(el);
                     self.marquee = Some((p, p));
                     return true;
@@ -298,33 +324,67 @@ impl Editor {
                 }
 
                 // Grab semantics by what was pressed:
-                //  - POINT -> resize mode: the corner chases the cursor;
-                //    constraint-neighbors join as soft followers so they
-                //    slide along their edges.
-                //  - SEGMENT/FILL -> selection-wide drag; every unselected
-                //    involved point is hard-fixed, so the solver stretches
-                //    the selected sub-shape instead of translating.
-                let (drag_pts, aux_pts) = if let ElementRef::Point(pid) = el {
-                    let mut ring: Vec<PointId> = Vec::new();
-                    for c in &self.doc.constraints {
-                        let other = if c.a == pid {
-                            Some(c.b)
-                        } else if c.b == pid {
-                            Some(c.a)
-                        } else {
-                            None
-                        };
-                        if let Some(o) = other
-                            && o != pid
-                            && !ring.contains(&o)
-                            && self.doc.point(o).is_some()
-                        {
-                            ring.push(o);
+                //  - POINT with a SOLO selection -> resize mode: the corner
+                //    chases the cursor; constraint-neighbors join as soft
+                //    followers so they slide along their edges.
+                //  - POINT within a MULTI-selection -> the whole selection
+                //    translates together.
+                //  - SEGMENT -> EDGE-STRETCH: the edge's two endpoints are
+                //    dragged, constraint-neighbors follow, so pulling an
+                //    edge of a selected rectangle reshapes it instead of
+                //    translating. (Translate via the fill's interior.)
+                //  - FILL -> selection-wide translation.
+                let solo_point = match el {
+                    ElementRef::Point(pid) if self.selection.len() == 1 => Some(pid),
+                    _ => None,
+                };
+                let ring_of = |pids: &[PointId]| -> Vec<(PointId, Point2)> {
+                    let mut aux: Vec<(PointId, Point2)> = Vec::new();
+                    for &pid in pids {
+                        for c in &self.doc.constraints {
+                            let other = if c.a == pid {
+                                Some(c.b)
+                            } else if c.b == pid {
+                                Some(c.a)
+                            } else {
+                                None
+                            };
+                            if let Some(o) = other
+                                && o != pid
+                                && !pids.contains(&o)
+                                && !aux.iter().any(|&(id, _)| id == o)
+                                && self.doc.point(o).is_some()
+                            {
+                                aux.push((o, self.doc.point(o).unwrap()));
+                            }
                         }
                     }
+                    aux
+                };
+                let (drag_pts, aux_pts) = if let Some(pid) = solo_point {
                     let start = self.doc.point(pid).unwrap();
-                    let aux = ring.iter().map(|&o| (o, self.doc.point(o).unwrap())).collect();
+                    let aux = ring_of(&[pid]);
                     (vec![(pid, start)], aux)
+                } else if let (ElementRef::Segment(sid), false) =
+                    (&el, self.selection.len() > 1 && self.element_selected(el))
+                {
+                    // SOLO segment -> edge-stretch. With a MULTI-selection,
+                    // dragging any selected member moves the whole group
+                    // instead (see the fallback arm below).
+                    // No aux followers here: the H/V constraints alone
+                    // collapse an edge drag to a PERPENDICULAR stretch
+                    // (tangential pulls are projected out), so grabbing an
+                    // edge never translates the shape.
+                    let ends: Vec<PointId> = self
+                        .doc
+                        .segment(*sid)
+                        .map(|s| vec![s.start, s.end])
+                        .unwrap_or_default();
+                    let drag = ends
+                        .iter()
+                        .filter_map(|&pid| self.doc.point(pid).map(|pos| (pid, pos)))
+                        .collect();
+                    (drag, Vec::new())
                 } else {
                     let pts = self.doc.selection_points(&self.selection);
                     let drag = pts
@@ -431,16 +491,48 @@ impl Editor {
                 exclude.push(pid);
             }
         }
+        // Transitive closure along segments: every point REACHABLE from the
+        // dragged system is part of the dragged object(s). A partially
+        // selected rectangle must never snap back onto its own unselected
+        // far corner — NOTHING ever snaps to its own geometry.
+        let mut i = 0;
+        while i < exclude.len() {
+            let pid = exclude[i];
+            for (_, s) in self.doc.all_segments() {
+                let other = if s.start == pid {
+                    Some(s.end)
+                } else if s.end == pid {
+                    Some(s.start)
+                } else {
+                    None
+                };
+                if let Some(o) = other
+                    && !exclude.contains(&o)
+                    && self.doc.point(o).is_some()
+                {
+                    exclude.push(o);
+                }
+            }
+            i += 1;
+        }
 
         // Single-endpoint drags of STANDALONE lines only snap when the
         // endpoint truly lands on another point — a passing axis alignment
         // must not yank one axis (the slight 90-degree snap).
-        let coincident_only = drag.points.len() == 1
-            && self.pid_on_bare_line(drag.points[0].0);
+        // Line endpoints get the FULL snap vocabulary — axis alignment to
+        // distant points/edges included. Other single-point resizes stay
+        // fluid (endpoints only); multi-point moves get everything too.
+        let bare_line_endpoint =
+            drag.points.len() == 1 && self.pid_on_bare_line(drag.points[0].0);
+        let endpoints_only = drag.points.len() == 1 && !bare_line_endpoint;
 
-        let mut snapped_delta = delta;
+        // Per-axis consensus voting: every dragged point proposes its own
+        // snap corrections; each axis adopts the most-agreed proposal and
+        // applies it RIGIDLY to all points. One lucky corner no longer
+        // drags the whole object somewhere the other three hate.
+        let mut proposals_x: Vec<f64> = Vec::new();
+        let mut proposals_y: Vec<f64> = Vec::new();
         if !self.alt_down {
-            let mut best: Option<(f64, Point2)> = None;
             for &(_pid, start) in &drag.points {
                 let target = Point2::new(start.x + delta.x, start.y + delta.y);
                 let (adj, _) = snapping::best(
@@ -448,18 +540,28 @@ impl Editor {
                     self.snap_tol_doc(),
                     target,
                     &exclude,
-                    true,
-                    coincident_only,
+                    endpoints_only,
+                    false,
+                    self.snap_visible(),
                 );
-                let score = adj.x.abs() + adj.y.abs();
-                if best.map_or(true, |(s, _)| score < s) {
-                    best = Some((score, adj));
+                if adj.x != 0. {
+                    proposals_x.push(adj.x);
+                }
+                if adj.y != 0. {
+                    proposals_y.push(adj.y);
                 }
             }
-            if let Some((_, adj)) = best {
-                snapped_delta = Point2::new(delta.x + adj.x, delta.y + adj.y);
-            }
         }
+        let consensus = |props: &[f64]| -> Option<f64> {
+            props.iter().copied().min_by(|a, b| {
+                let sa: f64 = props.iter().map(|p| (p - a).abs()).sum();
+                let sb: f64 = props.iter().map(|p| (p - b).abs()).sum();
+                sa.total_cmp(&sb)
+            })
+        };
+        let sx = consensus(&proposals_x).unwrap_or(0.);
+        let sy = consensus(&proposals_y).unwrap_or(0.);
+        let snapped_delta = Point2::new(delta.x + sx, delta.y + sy);
 
         let mut targets: Vec<(PointId, Point2)> = drag
             .points
@@ -531,6 +633,12 @@ impl Editor {
     }
 
     pub fn canvas_up(&mut self, button: gpui::MouseButton, shift: bool) -> bool {
+        // A drag that ended with points sitting on other points BONDS them:
+        // a Coincident constraint glues the pair (solver-enforced, shown as
+        // a deletable chip).
+        if self.dragging.is_some() {
+            self.bond_snapped_points();
+        }
         // Panning ends on release of EITHER panning button — a stuck
         // pan_start made the camera chase the cursor forever.
         if (button == gpui::MouseButton::Left || button == gpui::MouseButton::Middle)
@@ -749,6 +857,37 @@ impl Editor {
             }
         }
         self.selection.retain(|&e| e != el);
+    }
+
+    // True when the element itself, or anything SELECTED that contains it,
+    /// Bonds dragged points that ended on top of other points with
+    /// Coincident constraints (endpoint-to-endpoint only).
+    fn bond_snapped_points(&mut self) {
+        let tol = self.snap_tol_doc();
+        let Some(drag) = &self.dragging else { return };
+        let dragged: Vec<PointId> =
+            drag.points.iter().chain(drag.aux.iter()).map(|&(id, _)| id).collect();
+        let mut bonds: Vec<(PointId, PointId)> = Vec::new();
+        for &pid in &dragged {
+            let Some(p) = self.doc.point(pid) else { continue };
+            for (qid, q) in self.doc.all_points() {
+                if qid == pid || dragged.contains(&qid) {
+                    continue;
+                }
+                if pick::distance(p, q) <= tol {
+                    // Skip pairs already glued in either order.
+                    if !self.doc.constraints.iter().any(|c| {
+                        c.kind == ConstraintKind::Coincident
+                            && ((c.a == pid && c.b == qid) || (c.a == qid && c.b == pid))
+                    }) {
+                        bonds.push((pid, qid));
+                    }
+                }
+            }
+        }
+        for (a, b) in bonds {
+            self.doc.add_constraint(ConstraintKind::Coincident, a, b);
+        }
     }
 
     // True when the element itself, or anything SELECTED that contains it,

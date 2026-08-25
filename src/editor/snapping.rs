@@ -1,5 +1,5 @@
 use crate::core::document::{Document, SegmentKind};
-use crate::core::geometry::Point2;
+use crate::core::geometry::{Point2, Rect};
 use crate::core::ids::PointId;
 
 // Snapping: candidate locations exposed by geometry, best-match search,
@@ -40,8 +40,10 @@ pub struct SnapTarget {
 }
 
 /// All snap locations exposed by the geometry. `endpoints_only` keeps
-/// drags fluid — midpoints and edge spans apply only to precise placement
-/// (shape tools), never while dragging geometry.
+/// single-point resize drags fluid — midpoints and edge spans apply to
+/// placement and whole-object moves. `exclude` silences the dragged
+/// object's own geometry (its points AND its segments/midpoints) so
+/// nothing snaps to itself.
 pub fn targets(doc: &Document, exclude: &[PointId], endpoints_only: bool) -> Vec<SnapTarget> {
     let mut out = Vec::new();
     for (pid, p) in doc.all_points() {
@@ -99,6 +101,10 @@ pub fn targets(doc: &Document, exclude: &[PointId], endpoints_only: bool) -> Vec
             continue;
         }
         let Some((a, b)) = doc.segment_geom(sid) else { continue };
+        // The dragged object's own edges must not snap to themselves.
+        if exclude.contains(&seg.start) || exclude.contains(&seg.end) {
+            continue;
+        }
         let m = mid(a, b);
         out.push(SnapTarget {
             x: m.x,
@@ -156,7 +162,9 @@ fn span_ok(t: &SnapTarget, p: Point2) -> bool {
 /// Best single correction for a point against all targets. Returns
 /// (adjustment delta, guides). `coincident_only` demands BOTH axes hit —
 /// used while dragging so a passing row/column alignment doesn't yank a
-/// single axis (the "slight 90-degree snap").
+/// single axis (the "slight 90-degree snap"). `visible` culls targets to
+/// the viewport (plus margin already applied by the caller) — snapping is
+/// a proximity affair, not a document-wide search.
 pub fn best(
     doc: &Document,
     tol: f64,
@@ -164,9 +172,13 @@ pub fn best(
     exclude: &[PointId],
     endpoints_only: bool,
     coincident_only: bool,
+    visible: Rect,
 ) -> (Point2, Vec<SnapGuide>) {
     let mut best: Option<(f64, f64, f64, bool, bool, SnapTarget)> = None;
     for tgt in targets(doc, exclude, endpoints_only) {
+        if !visible.contains(Point2::new(tgt.x, tgt.y)) {
+            continue;
+        }
         let dx = tgt.x - p.x;
         let dy = tgt.y - p.y;
         let hit_x = tgt.snap_x && dx.abs() <= tol && span_ok(&tgt, p);

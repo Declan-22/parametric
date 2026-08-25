@@ -170,13 +170,19 @@ pub fn build_draw_list(
         }
     }
 
-    // 3) Snap feedback markers.
-    for g in snap_guides {
-        list.push(Primitive::Circle {
-            cx: g.to.x as f32,
-            cy: g.to.y as f32,
-            radius: 4.,
-        });
+    // 3) Snap feedback markers — suppressed while CREATING a shape: the
+    // guide dot can sit far from the rubber band (projected edge targets),
+    // which reads as a stray point floating near the new object. Nothing
+    // about the object is shown until it's fully placed.
+    let creating = pending.is_some() || pending_line.is_some();
+    if !creating {
+        for g in snap_guides {
+            list.push(Primitive::Circle {
+                cx: g.to.x as f32,
+                cy: g.to.y as f32,
+                radius: 4.,
+            });
+        }
     }
 
     // 4) Hover affordance: accent outline of the hovered element.

@@ -132,6 +132,13 @@ const ICON_CONSTRAINT_H: &[u8] =
 	<path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M5 9c-.607.59-3 2.16-3 3s2.393 2.41 3 3m14-6c.607.59 3 2.16 3 3s-2.393 2.41-3 3M2.423 11.98h19.445" />
 </svg>"#;
 
+const ICON_CONSTRAINT_C: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+  <circle cx="12" cy="4.5" r="1.25" fill="currentColor"/>
+  <path d="M12 7.25V12.25M9.9 10.2L12 12.3L14.1 10.2" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M6 17.5H18" stroke="currentColor" stroke-width="1" stroke-linecap="round"/>
+  <circle cx="6" cy="17.5" r="1.25" fill="currentColor"/>
+</svg>"#;
+
 const CHIP_SIZE: f32 = 18.;
 const CHIP_ICON: f32 = 10.;
 
@@ -188,7 +195,13 @@ impl CanvasView {
             let constraint = m.constraint;
             let key_for_hover = hover_key;
             let shell_hover = self.shell.clone();
-            let icon = if m.vertical { ICON_CONSTRAINT_V } else { ICON_CONSTRAINT_H };
+            let icon = if m.coincident {
+                ICON_CONSTRAINT_C
+            } else if m.vertical {
+                ICON_CONSTRAINT_V
+            } else {
+                ICON_CONSTRAINT_H
+            };
 
             layer = layer.child(
                 div()
@@ -386,6 +399,14 @@ impl CanvasView {
             let Some(editor) = editor.upgrade() else {
                 return (Vec::new(), hitbox);
             };
+            // Keep the editor's snap-search region in sync with the view.
+            let _ = editor.update(cx, |ed, _| {
+                let w = f64::from(bounds.size.width);
+                let h = f64::from(bounds.size.height);
+                if (ed.viewport_size.0 - w).abs() > 0.5 || (ed.viewport_size.1 - h).abs() > 0.5 {
+                    ed.viewport_size = (w, h);
+                }
+            });
             let ed = editor.read(cx);
             let t = *crate::theme::active(cx);
             let pending = ed.pending_shape.map(|p| p.bounds());

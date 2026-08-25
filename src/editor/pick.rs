@@ -42,7 +42,7 @@ impl<'a> Picker<'a> {
     pub fn segment(&self, at: Point2) -> Option<SegmentId> {
         let mut best: Option<(f64, SegmentId)> = None;
         for (id, seg) in self.doc.all_segments() {
-            if seg.kind != SegmentKind::Line {
+            if seg.kind != SegmentKind::Line && seg.kind != SegmentKind::Ruler {
                 continue;
             }
             let Some((a, b)) = self.doc.segment_geom(id) else {
@@ -287,7 +287,6 @@ pub fn midpoint(a: Point2, b: Point2) -> Point2 {
     Point2::new((a.x + b.x) / 2., (a.y + b.y) / 2.)
 }
 
-pub use midpoint as mid;
 
 // Even-odd ray cast.
 fn point_in_polygon(p: Point2, pts: &[Point2]) -> bool {

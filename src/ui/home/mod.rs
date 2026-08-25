@@ -106,12 +106,13 @@ impl RenderOnce for DesignCard {
                         &camera,
                         bounds.size,
                         t,
-                        None,
-                        &[],
-                        None,
-                        &[],
-                        &[],
-                        None,
+                        None,   // pending
+                        &[],    // selection
+                        None,   // hover
+                        &[],    // dims
+                        &[],    // snap guides
+                        None,   // marquee
+                        None,   // pending ruler
                     ),
                     None => Vec::new(),
                 }
@@ -136,6 +137,7 @@ impl RenderOnce for DesignCard {
                     paint::Primitive::Line { .. } => {}
                     paint::Primitive::Outline { .. } => {}
                     paint::Primitive::Circle { .. } => {}
+                    paint::Primitive::RulerLabel { .. } => {}
                 }
             }
         };

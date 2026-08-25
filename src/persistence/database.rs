@@ -162,6 +162,7 @@ impl Database {
             for (sid, s) in doc.all_segments() {
                 let kind = match s.kind {
                     SegmentKind::Line => "line",
+                    SegmentKind::Ruler => "ruler",
                 };
                 self.conn.execute(
                     "INSERT INTO segments(idx, generation, kind, start_idx, start_gen, end_idx, end_gen)
@@ -282,6 +283,7 @@ impl Database {
             let kind_raw: String = row.get(2)?;
             let kind = match kind_raw.as_str() {
                 "line" => SegmentKind::Line,
+                "ruler" => SegmentKind::Ruler,
                 _ => continue,
             };
             insert_segment_raw(

@@ -131,6 +131,15 @@ impl Solver {
             eqs.push(Eq::Distance { a, b, target });
         }
 
+        // Constraint-less geometry (rulers, free lines) must still enter
+        // the system when dragged, or their targets get dropped.
+        for &(pid, _) in drag {
+            let _ = slot_of(pid);
+        }
+        for &(pid, _) in aux {
+            let _ = slot_of(pid);
+        }
+
         let mut fixed = vec![true; slots.len()];
         let mut fixed_pos = vec![Point2::new(0., 0.); slots.len()];
         for (i, &pid) in slots.iter().enumerate() {

@@ -37,6 +37,19 @@ const ICON_RECTANGLE: &[u8] =
 
 "#;
 
+const ICON_RULER: &[u8] =
+    br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<g fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.5">
+		<path d="m17.5 10.5l2 2M14 14l2 2m-5.5 1.5l2 2" />
+		<path stroke-linejoin="round" d="M10.536 4.678c1.364-1.365 2.047-2.047 2.808-2.363a4.14 4.14 0 0 1 3.17 0c.761.316 1.444.998 2.808 2.363c1.365 1.364 2.047 2.047 2.363 2.808a4.14 4.14 0 0 1 0 3.17c-.316.761-.998 1.444-2.363 2.808l-5.857 5.858c-1.365 1.365-2.048 2.047-2.809 2.363a4.14 4.14 0 0 1-3.17 0c-.761-.316-1.444-.998-2.808-2.363c-1.365-1.364-2.047-2.047-2.363-2.808a4.14 4.14 0 0 1 0-3.17c.316-.761.998-1.444 2.363-2.808z" />
+	</g>
+    </svg>
+
+
+
+"#;
+
 #[derive(IntoElement)]
 pub struct Toolbar {
     pub editor: gpui::WeakEntity<crate::editor::Editor>,
@@ -71,6 +84,8 @@ impl RenderOnce for Toolbar {
             .border_color(rgb(t.component_border_color))
             .child(self.tool_button(Tool::Move, ICON_MOVE, active_tool, t, cx))
             .child(self.tool_button(Tool::Pan, ICON_PAN, active_tool, t, cx))
+            .child(divider(t))
+            .child(self.tool_button(Tool::Ruler, ICON_RULER, active_tool, t, cx))
             .child(divider(t))
             .child(self.tool_button(Tool::Rectangle, ICON_RECTANGLE, active_tool, t, cx))
     }
@@ -171,5 +186,6 @@ fn tool_debug_name(tool: Tool) -> &'static str {
         Tool::Move => "tool-move",
         Tool::Pan => "tool-pan",
         Tool::Rectangle => "tool-rectangle",
+        Tool::Ruler => "tool-ruler",
     }
 }

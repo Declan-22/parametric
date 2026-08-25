@@ -1,9 +1,11 @@
 use gpui::{Pixels, Size, rgb, rgba};
 
 use crate::core::constraints::ElementRef;
-use crate::core::document::Document;
+use crate::core::document::{Document, SegmentKind};
 use crate::core::geometry::{Point2, Rect};
-use crate::editor::{Camera, DimRender, SnapGuide};
+use crate::editor::dims::DimRender;
+use crate::editor::ruler;
+use crate::editor::{Camera, SnapGuide};
 use crate::theme::Theme;
 
 // Screen-space draw list built during prepaint (culled to the viewport),
@@ -46,6 +48,15 @@ pub enum Primitive {
         cy: f32,
         radius: f32,
     },
+    // Real vector text painted into the canvas (ruler markings etc.) —
+    // no DOM overlay containers. Two rows: pixels nearest the dash, inches
+    // below; value in ink, unit suffix in empty_text_primary.
+    RulerLabel {
+        center_x: f32,
+        anchor_y: f32,
+        px_value: String,
+        in_value: String,
+    },
 }
 
 pub fn build_draw_list(
@@ -59,6 +70,7 @@ pub fn build_draw_list(
     dim_renders: &[DimRender],
     snap_guides: &[SnapGuide],
     marquee: Option<(Point2, Point2)>,
+    pending_ruler: Option<(Point2, Point2)>,
 ) -> Vec<Primitive> {
     let min = camera.screen_to_unit(Point2::new(0., 0.));
     let max = camera.screen_to_unit(Point2::new(
@@ -77,21 +89,34 @@ pub fn build_draw_list(
         (s.x as f32, s.y as f32)
     };
 
-    // 1) Fills. Segments are NOT stroked — bare lines are invisible
-    // geometry; they only appear via hover/selection overlays below.
+    // 1) Fills, then rulers (always-visible procedural components). Bare
+    // line segments are invisible geometry; they only appear via
+    // hover/selection overlays below.
     for layer in &doc.layers {
         for &el in &layer.elements {
-            if let ElementRef::Fill(fid) = el {
-                let Some(pts) = crate::editor::pick::loop_points(doc, fid) else {
-                    continue;
-                };
-                if pts.len() < 3 || !pts.iter().any(|p| visible.contains(*p)) {
-                    continue;
+            match el {
+                ElementRef::Fill(fid) => {
+                    let Some(pts) = crate::editor::pick::loop_points(doc, fid) else {
+                        continue;
+                    };
+                    if pts.len() < 3 || !pts.iter().any(|p| visible.contains(*p)) {
+                        continue;
+                    }
+                    list.push(Primitive::Polygon {
+                        points: pts.iter().map(|&p| scr(p)).collect(),
+                        color,
+                    });
                 }
-                list.push(Primitive::Polygon {
-                    points: pts.iter().map(|&p| scr(p)).collect(),
-                    color,
-                });
+                ElementRef::Segment(sid) => {
+                    let Some(seg) = doc.segment(sid) else { continue };
+                    if seg.kind == SegmentKind::Ruler
+                        && let Some((a, b)) = doc.segment_geom(sid)
+                        && (visible.contains(a) || visible.contains(b))
+                    {
+                        push_ruler(&mut list, a, b, camera, t);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -177,6 +202,11 @@ pub fn build_draw_list(
             color: accent,
         });
     }
+
+    // In-progress ruler preview with full tick rendering.
+    if let Some((a, b)) = pending_ruler {
+        push_ruler(&mut list, a, b, camera, t);
+    }
     list
 }
 
@@ -236,9 +266,41 @@ fn screen_rect(unit: Rect, cam: &Camera) -> (f32, f32, f32, f32) {
     )
 }
 
-// Dashed straight line between two screen points, any angle.
-fn dashed_line(list: &mut Vec<Primitive>, ax: f32, ay: f32, bx: f32, by: f32, color: gpui::Background) {
-    const DASH: f32 = 6.;
+// Procedural ruler along segment a->b, driven entirely by the shared
+// editor::ruler module: baseline + perpendicular ticks + real vector text
+// labels at each inch mark. No DOM overlays involved.
+fn push_ruler(list: &mut Vec<Primitive>, a: Point2, b: Point2, cam: &Camera, t: Theme) {
+    let ink: gpui::Background = rgb(t.text_secondary).into();
+
+    // Baseline sits exactly on the stored segment.
+    let (ax, ay) = ruler::to_screen(cam, a);
+    let (bx, by) = ruler::to_screen(cam, b);
+    list.push(Primitive::Line { ax, ay, bx, by, width: 1., color: ink });
+
+    for tick in ruler::ticks(a, b) {
+        let (x0, y0) = ruler::to_screen(cam, tick.base);
+        let (x1, y1) = ruler::to_screen(cam, tick.tip);
+        list.push(Primitive::Line {
+            ax: x0,
+            ay: y0,
+            bx: x1,
+            by: y1,
+            width: if tick.inch_mark { 1.5 } else { 1. },
+            color: ink,
+        });
+    }
+
+    for (pos, px_n, in_n) in ruler::labels(a, b) {
+        let (x, y) = ruler::to_screen(cam, pos);
+        list.push(Primitive::RulerLabel {
+            center_x: x,
+            anchor_y: y,
+            px_value: format!("{px_n}"),
+            in_value: format!("{in_n}"),
+        });
+    }
+}// Dashed straight line between two screen points, any angle.
+fn dashed_line(list: &mut Vec<Primitive>, ax: f32, ay: f32, bx: f32, by: f32, color: gpui::Background) {    const DASH: f32 = 6.;
     const GAP: f32 = 4.;
     let dx = bx - ax;
     let dy = by - ay;

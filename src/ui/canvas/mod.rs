@@ -98,16 +98,16 @@ impl RenderOnce for CanvasView {
                     cx.notify();
                 });
             })
-            .on_mouse_up(MouseButton::Left, move |_: &MouseUpEvent, _, cx| {
+            .on_mouse_up(MouseButton::Left, move |e: &MouseUpEvent, _, cx| {
                 let _ = editor_up_l.update(cx, |ed, cx| {
-                    if ed.canvas_up(MouseButton::Left) {
+                    if ed.canvas_up(MouseButton::Left, e.modifiers.shift) {
                         cx.notify();
                     }
                 });
             })
             .on_mouse_up(MouseButton::Middle, move |_: &MouseUpEvent, _, cx| {
                 let _ = editor_up_m.update(cx, |ed, cx| {
-                    if ed.canvas_up(MouseButton::Middle) {
+                    if ed.canvas_up(MouseButton::Middle, false) {
                         cx.notify();
                     }
                 });
@@ -262,6 +262,9 @@ impl CanvasView {
             let ed = editor.read(cx);
             let t = *crate::theme::active(cx);
             let pending = ed.pending_shape.map(|p| p.bounds());
+            let pending_ruler = ed
+                .pending_ruler
+                .map(|p| p.snapped(ed.shift));
             let list = paint::build_draw_list(
                 &ed.doc,
                 &ed.camera,
@@ -273,6 +276,7 @@ impl CanvasView {
                 &ed.dim_renders,
                 &ed.snap_guides,
                 ed.marquee,
+                pending_ruler,
             );
             (list, hitbox)
         };
@@ -355,6 +359,65 @@ impl CanvasView {
                             rgb(crate::theme::active(cx).accent),
                             gpui::BorderStyle::Solid,
                         ));
+                    }
+                    paint::Primitive::RulerLabel { center_x, anchor_y, px_value, in_value } => {
+                        // Two-row vector label centered on the inch tick,
+                        // sitting entirely BEYOND the tick tips: pixels row
+                        // on top (nearest the dashes), inches below it.
+                        // Value in ink; unit suffix in empty_text_primary.
+                        const SIZE: f32 = 9.;
+                        const ROW_GAP: f32 = 2.;
+                        let t = crate::theme::active(cx);
+                        let value_color = rgb(t.text_secondary).into();
+                        let unit_color = rgb(t.empty_text_primary).into();
+                        let font = gpui::Font {
+                            family: crate::theme::FONT_UI.into(),
+                            weight: gpui::FontWeight::MEDIUM,
+                            ..Default::default()
+                        };
+
+                        // Rows top -> bottom: px first, inches under it.
+                        let rows = [
+                            (px_value.clone(), "px", anchor_y),
+                            (in_value.clone(), "in", anchor_y + SIZE + ROW_GAP),
+                        ];
+                        for (value, unit, top_y) in rows {
+                            let text = format!("{value}{unit}");
+                            let runs = [
+                                gpui::TextRun {
+                                    len: value.len(),
+                                    font: font.clone(),
+                                    color: value_color,
+                                    background_color: None,
+                                    underline: None,
+                                    strikethrough: None,
+                                },
+                                gpui::TextRun {
+                                    len: unit.len(),
+                                    font: font.clone(),
+                                    color: unit_color,
+                                    background_color: None,
+                                    underline: None,
+                                    strikethrough: None,
+                                },
+                            ];
+                            let line = window.text_system().shape_line(
+                                text.into(),
+                                px(SIZE),
+                                &runs,
+                                None,
+                            );
+                            // Center on the tick.
+                            let origin_x = center_x - line.width.as_f32() / 2.;
+                            let _ = line.paint(
+                                Point { x: px(origin_x), y: px(top_y) },
+                                px(SIZE),
+                                gpui::TextAlign::Left,
+                                None,
+                                window,
+                                cx,
+                            );
+                        }
                     }
                 }
             }

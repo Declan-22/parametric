@@ -29,6 +29,9 @@ pub struct Document {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SegmentKind {
     Line,
+    // A measuring ruler: renders with procedural inch ticks and labels,
+    // carries no constraints, no fill, no dims.
+    Ruler,
     // Arc support lands later; the enum is reserved now so stored data and
     // all match sites already expect it.
 }
@@ -213,7 +216,13 @@ impl Document {
 
     pub fn add_segment(&mut self, start: PointId, end: PointId) -> SegmentId {
         let (idx, generation) = self.segments.insert(Segment::line(start, end));
-        SegmentId { idx, generation: generation }
+        SegmentId { idx, generation }
+    }
+
+    /// Adds a segment with an explicit kind (ruler, future arcs).
+    pub fn add_segment_kind(&mut self, start: PointId, end: PointId, kind: SegmentKind) -> SegmentId {
+        let (idx, generation) = self.segments.insert(Segment { start, end, kind });
+        SegmentId { idx, generation }
     }
 
     pub fn segment(&self, id: SegmentId) -> Option<Segment> {

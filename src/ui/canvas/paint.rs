@@ -100,7 +100,26 @@ pub fn build_draw_list(
                     let Some(pts) = crate::editor::pick::loop_points(doc, fid) else {
                         continue;
                     };
-                    if pts.len() < 3 || !pts.iter().any(|p| visible.contains(*p)) {
+                    if pts.len() < 3 {
+                        continue;
+                    }
+                    // Cull on BOUNDS intersection, not corner containment:
+                    // zoomed in, every corner can sit outside the viewport
+                    // while the fill still covers the whole screen.
+                    let mut bb: Option<Rect> = None;
+                    for &p in &pts {
+                        let r = Rect::from_points(p, p);
+                        bb = Some(match bb {
+                            Some(a) => a.union(&r),
+                            None => r,
+                        });
+                    }
+                    let Some(bb) = bb else { continue };
+                    let intersects = visible.origin.x < bb.origin.x + bb.size.w
+                        && bb.origin.x < visible.origin.x + visible.size.w
+                        && visible.origin.y < bb.origin.y + bb.size.h
+                        && bb.origin.y < visible.origin.y + visible.size.h;
+                    if !intersects {
                         continue;
                     }
                     list.push(Primitive::Polygon {

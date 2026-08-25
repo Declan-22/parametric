@@ -495,8 +495,16 @@ impl Shell {
             return;
         };
         let removed = ed.update(cx, |ed, _| {
+            // Selected constraint chips die first: deleting one just drops
+            // the constraint, freeing its points.
+            let mut removed_any = false;
+            if !ed.selected_constraints.is_empty() {
+                let dead = std::mem::take(&mut ed.selected_constraints);
+                ed.doc.constraints.retain(|c| !dead.contains(c));
+                removed_any = true;
+            }
             if ed.selection.is_empty() {
-                return false;
+                return removed_any;
             }
             let sels = std::mem::take(&mut ed.selection);
             for el in &sels {
@@ -703,6 +711,7 @@ impl Render for Shell {
                         .overflow_hidden()
                         .child(CanvasView {
                             editor: editor.downgrade(),
+                            shell: cx.entity().downgrade(),
                             focus: self.canvas_focus.clone(),
                         })
                         .child(Toolbar {

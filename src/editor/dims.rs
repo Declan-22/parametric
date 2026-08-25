@@ -12,6 +12,23 @@ use crate::core::ids::{FillId, PointId};
 
 const PREVIEW_DIM_OFFSET_DOC: f64 = 18.0;
 
+/// Screen-space render data for one constraint chip. `out` is the
+/// preferred spot (just off the constrained edge's outer side); `in_` is
+/// the flipped spot used when `out` would collide with a dim container or
+/// another chip. The layer animates between them.
+#[derive(Clone, Debug)]
+pub struct ConstraintMarker {
+    pub key: String,
+    pub constraint: crate::core::constraints::Constraint,
+    pub vertical: bool,
+    pub cx_out: f32,
+    pub cy_out: f32,
+    pub cx_in: f32,
+    pub cy_in: f32,
+    pub flipped: bool,
+    pub selected: bool,
+}
+
 /// Screen-space render data for one dimension.
 #[derive(Clone, Debug)]
 pub struct DimRender {
@@ -185,6 +202,76 @@ pub fn update(ed: &mut Editor) {
         };
         let len = d.value.unwrap_or_else(|| dist(a, b));
         ed.dim_renders.push(linear_dim(&ed.doc, &ed.camera, a, b, d.offset, len));
+    }
+
+    update_constraint_markers(ed);
+}
+
+// Constraint chips: one per H/V constraint, always visible. Preferred spot
+// sits just off the edge (right of vertical edges, below horizontal ones,
+// matching the dim offset direction); if that would collide with a dim
+// label box or another chip, the chip flips to the opposite side and the
+// layer slides it over.
+fn update_constraint_markers(ed: &mut Editor) {
+    ed.constraint_markers.clear();
+    let off_px = (PREVIEW_DIM_OFFSET_DOC * ed.camera.zoom) as f32;
+    const CHIP_HW: f32 = 16.;
+    const CHIP_HH: f32 = 12.;
+    // Approximate dim label half-extents for collision tests.
+    const DIM_HW: f32 = 38.;
+    const DIM_HH: f32 = 13.;
+
+    let mut placed: Vec<(f32, f32, f32, f32)> = Vec::new();
+    for d in &ed.dim_renders {
+        placed.push((d.label_cx, d.label_cy, DIM_HW, DIM_HH));
+    }
+
+    let constraints = ed.doc.constraints.clone();
+    for c in constraints {
+        if c.kind == crate::core::constraints::ConstraintKind::Coincident {
+            continue;
+        }
+        let (Some(a), Some(b)) = (ed.doc.point(c.a), ed.doc.point(c.b)) else {
+            continue;
+        };
+        let ma = ed.camera.unit_to_screen(a);
+        let mb = ed.camera.unit_to_screen(b);
+        let mx = ((ma.x + mb.x) / 2.) as f32;
+        let my = ((ma.y + mb.y) / 2.) as f32;
+        let vertical_edge = (mb.x - ma.x).abs() <= (mb.y - ma.y).abs();
+        let (cx_out, cy_out, cx_in, cy_in) = if vertical_edge {
+            (mx + off_px, my, mx - off_px, my)
+        } else {
+            (mx, my + off_px, mx, my - off_px)
+        };
+
+        let hits = |x: f32, y: f32| {
+            placed.iter().any(|&(px, py, hw, hh)| {
+                (px - x).abs() < hw + CHIP_HW && (py - y).abs() < hh + CHIP_HH
+            })
+        };
+        let flipped = hits(cx_out, cy_out);
+        let (fx, fy) = if flipped { (cx_in, cy_in) } else { (cx_out, cy_out) };
+        placed.push((fx, fy, CHIP_HW, CHIP_HH));
+
+        ed.constraint_markers.push(ConstraintMarker {
+            key: format!(
+                "cmark-{}-{}-{}-{}-{}",
+                c.kind.as_str(),
+                c.a.idx,
+                c.a.generation,
+                c.b.idx,
+                c.b.generation
+            ),
+            constraint: c,
+            vertical: c.kind == crate::core::constraints::ConstraintKind::Vertical,
+            cx_out,
+            cy_out,
+            cx_in,
+            cy_in,
+            flipped,
+            selected: ed.selected_constraints.contains(&c),
+        });
     }
 }
 

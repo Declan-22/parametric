@@ -54,6 +54,8 @@ pub struct Editor {
     // Pending shape created by a single click (commit on next click).
     pub pending_via_click: bool,
     pub selection: Vec<ElementRef>,
+    // Selected constraint chips (identity = the Constraint value).
+    pub selected_constraints: Vec<crate::core::constraints::Constraint>,
     pub hover: Option<ElementRef>,
     // Rubber-band marquee: (start doc, current doc).
     pub marquee: Option<(Point2, Point2)>,
@@ -66,6 +68,8 @@ pub struct Editor {
     pub snap_guides: Vec<SnapGuide>,
     // Per-frame dimension render data.
     pub dim_renders: Vec<dims::DimRender>,
+    // Per-frame constraint chip render data.
+    pub constraint_markers: Vec<dims::ConstraintMarker>,
     // Last known cursor + modifier state so changes can re-derive drags.
     pub last_cursor: Option<gpui::Point<gpui::Pixels>>,
     pub shift: bool,
@@ -103,6 +107,7 @@ impl Editor {
             pending_line: None,
             pending_via_click: false,
             selection: Vec::new(),
+            selected_constraints: Vec::new(),
             hover: None,
             marquee: None,
             marquee_add: false,
@@ -110,6 +115,7 @@ impl Editor {
             group_drag_last: None,
             snap_guides: Vec::new(),
             dim_renders: Vec::new(),
+            constraint_markers: Vec::new(),
             last_cursor: None,
             shift: false,
             alt_down: false,
@@ -129,6 +135,7 @@ impl Editor {
         self.pending_line = None;
         self.pending_via_click = false;
         self.selection.clear();
+        self.selected_constraints.clear();
         self.marquee = None;
         self.group_drag_last = None;
         self.dragging = None;
@@ -253,6 +260,8 @@ impl Editor {
         click_count: usize,
     ) -> bool {
         let p = self.cursor_doc(cursor);
+        // Pressing the canvas dismisses constraint-chip selection.
+        self.selected_constraints.clear();
         let picker = pick::Picker::new(&self.doc, &self.camera, HANDLE_TOL_PX);
         // Shift extends the selection instead of replacing it.
         self.marquee_add = shift;

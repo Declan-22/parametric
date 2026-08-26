@@ -27,6 +27,7 @@ actions!(
         ZoomIn,
         ZoomOut,
         ZoomToFit,
+        ZoomToSelection,
         // Arrange
         BringToFront,
         BringForward,

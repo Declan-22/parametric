@@ -633,6 +633,32 @@ impl Render for Shell {
                     cx.notify();
                 }
             }))
+            .on_action(cx.listener(|shell, _: &crate::ui::actions::ZoomIn, _, cx| {
+                if let Some(ed) = shell.editor.as_ref() {
+                    ed.update(cx, |ed, _| ed.zoom_step(1.));
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|shell, _: &crate::ui::actions::ZoomOut, _, cx| {
+                if let Some(ed) = shell.editor.as_ref() {
+                    ed.update(cx, |ed, _| ed.zoom_step(-1.));
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|shell, _: &crate::ui::actions::ZoomToFit, _, cx| {
+                if let Some(ed) = shell.editor.as_ref() {
+                    ed.update(cx, |ed, _| ed.zoom_to_fit());
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(
+                |shell, _: &crate::ui::actions::ZoomToSelection, _, cx| {
+                    if let Some(ed) = shell.editor.as_ref() {
+                        ed.update(cx, |ed, _| ed.zoom_to_selection());
+                        cx.notify();
+                    }
+                },
+            ))
             .on_action(cx.listener(|shell, _: &crate::ui::actions::BondCoincident, _, cx| {
                 if let Some(ed) = shell.editor.as_ref() {
                     let _ = ed.update(cx, |ed, _| ed.trigger_context_shortcut(0));

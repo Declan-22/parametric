@@ -1221,6 +1221,75 @@ impl Editor {
         );
     }
 
+    /// One zoom step around the VIEWPORT center (menu/key triggered —
+    /// there is no cursor anchor).
+    pub fn zoom_step(&mut self, dir: f64) {
+        const STEP: f32 = 120.;
+        let c = gpui::Point {
+            x: gpui::px((self.viewport_size.0 / 2.) as f32),
+            y: gpui::px((self.viewport_size.1 / 2.) as f32),
+        };
+        self.zoom_at(c, (dir * STEP as f64) as f32);
+    }
+
+    /// Fits the camera to a document-space rect with padding.
+    pub fn zoom_to_bounds(&mut self, bounds: Rect) -> bool {
+        if bounds.size.w < 1e-6 || bounds.size.h < 1e-6 {
+            return false;
+        }
+        if self.viewport_size.0 <= 0. || self.viewport_size.1 <= 0. {
+            return false;
+        }
+        const PAD_PX: f64 = 16.;
+        let zw = (self.viewport_size.0 - PAD_PX * 2.) / bounds.size.w;
+        let zh = (self.viewport_size.1 - PAD_PX * 2.) / bounds.size.h;
+        self.camera.set_zoom(zw.min(zh));
+        let c = Point2::new(
+            bounds.origin.x + bounds.size.w / 2.,
+            bounds.origin.y + bounds.size.h / 2.,
+        );
+        self.camera.pan = Point2::new(
+            c.x - self.viewport_size.0 / (2. * self.camera.zoom),
+            c.y - self.viewport_size.1 / (2. * self.camera.zoom),
+        );
+        true
+    }
+
+    /// Bounding rect of the current selection, if any.
+    pub fn selection_bounds(&self) -> Option<Rect> {
+        if self.selection.is_empty() {
+            return None;
+        }
+        let pts = self.doc.selection_points(&self.selection);
+        self.doc.bounds_of_points(&pts)
+    }
+
+    pub fn zoom_to_fit(&mut self) -> bool {
+        let mut acc: Option<Rect> = None;
+        for layer in &self.doc.layers {
+            for &el in &layer.elements {
+                let pts = self.doc.element_points(el);
+                if let Some(b) = self.doc.bounds_of_points(&pts) {
+                    acc = Some(match acc {
+                        Some(a) => a.union(&b),
+                        None => b,
+                    });
+                }
+            }
+        }
+        match acc {
+            Some(b) => self.zoom_to_bounds(b),
+            None => false,
+        }
+    }
+
+    pub fn zoom_to_selection(&mut self) -> bool {
+        match self.selection_bounds() {
+            Some(b) => self.zoom_to_bounds(b),
+            None => false,
+        }
+    }
+
     pub fn add_layer(&mut self, name: &str) -> u64 {
         let id = self.next_layer_id;
         self.next_layer_id += 1;

@@ -58,6 +58,10 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("delete", DeleteSelection, None),
         KeyBinding::new("ctrl-z", Undo, None),
         KeyBinding::new("ctrl-shift-z", Redo, None),
+        KeyBinding::new("=", ZoomIn, None),
+        KeyBinding::new("-", ZoomOut, None),
+        KeyBinding::new("shift-1", ZoomToFit, None),
+        KeyBinding::new("shift-2", ZoomToSelection, None),
         // Snap-bond choice menu quick keys.
         KeyBinding::new("1", BondCoincident, None),
         KeyBinding::new("2", BondCombinePoints, None),

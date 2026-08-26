@@ -85,9 +85,10 @@ pub fn default_menus() -> Vec<Menu> {
         Menu {
             label: "View".into(),
             items: vec![
-                MenuItem::entry("Zoom In", ZoomIn).shortcut("Ctrl+="),
-                MenuItem::entry("Zoom Out", ZoomOut).shortcut("Ctrl+-"),
-                MenuItem::entry("Zoom to Fit", ZoomToFit).shortcut("Ctrl+0"),
+                MenuItem::entry("Zoom In", ZoomIn).shortcut("="),
+                MenuItem::entry("Zoom Out", ZoomOut).shortcut("-"),
+                MenuItem::entry("Zoom to Fit", ZoomToFit).shortcut("Shift+1"),
+                MenuItem::entry("Zoom to Selection", ZoomToSelection).shortcut("Shift+2"),
                 MenuItem::separator(),
                 MenuItem::entry("Toggle Theme", ToggleTheme),
             ],

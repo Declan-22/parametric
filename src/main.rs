@@ -1,4 +1,5 @@
 mod app;
+mod commands;
 mod core;
 mod editor;
 mod persistence;

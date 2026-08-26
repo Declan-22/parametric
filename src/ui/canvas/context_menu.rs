@@ -88,9 +88,17 @@ pub fn draw(
     let open = editor_up.read(cx).context_menu.is_some();
     const POP_KEY: &str = "ctx-menu-pop";
     if !open {
-        // Re-arm the tween so the next opening pops again.
-        if shell.upgrade().is_some_and(|s| s.read(cx).fade(POP_KEY) > 0.001) {
-            shell.update(cx, |s, cx| s.animate_fade(POP_KEY, 0.0, cx));
+        // Re-arm the pop tween and clear stale entry hover fades so the
+        // next opening doesn't render entries pre-hovered.
+        if let Some(s) = shell.upgrade() {
+            if s.read(cx).fade(POP_KEY) > 0.001 {
+                s.update(cx, |s, cx| s.animate_fade(POP_KEY, 0.0, cx));
+            }
+            s.update(cx, |s, _| {
+                s.fades.retain(|k, _| !k.starts_with("ctx-entry-"));
+                s.fade_pending.retain(|k, _| !k.starts_with("ctx-entry-"));
+                s.fade_tween_active.retain(|k| !k.starts_with("ctx-entry-"));
+            });
         }
         return None;
     }

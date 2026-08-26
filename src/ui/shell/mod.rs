@@ -531,6 +531,14 @@ impl Shell {
         self.menu_open = false;
         self.active_menu = None;
         self.menu_animation = 0.0;
+        // Stale hover fades made entries render pre-hovered on reopen.
+        self.fades.retain(|k, _| {
+            !k.starts_with("menu-entry-") && !k.starts_with("submenu-")
+        });
+        self.fade_pending
+            .retain(|k, _| !k.starts_with("menu-entry-") && !k.starts_with("submenu-"));
+        self.fade_tween_active
+            .retain(|k| !k.starts_with("menu-entry-") && !k.starts_with("submenu-"));
         self.animate_icon(false, cx);
         cx.notify();
     }
@@ -610,6 +618,20 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|shell, _: &crate::ui::actions::DeleteSelection, _, cx| {
                 shell.delete_selection(cx);
+            }))
+            .on_action(cx.listener(|shell, _: &crate::ui::actions::Undo, _, cx| {
+                if let Some(ed) = shell.editor.as_ref() {
+                    let _ = ed.update(cx, |ed, _| ed.undo());
+                    shell.invalidate_thumbs_all();
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|shell, _: &crate::ui::actions::Redo, _, cx| {
+                if let Some(ed) = shell.editor.as_ref() {
+                    let _ = ed.update(cx, |ed, _| ed.redo());
+                    shell.invalidate_thumbs_all();
+                    cx.notify();
+                }
             }))
             .on_action(cx.listener(|shell, _: &crate::ui::actions::BondCoincident, _, cx| {
                 if let Some(ed) = shell.editor.as_ref() {

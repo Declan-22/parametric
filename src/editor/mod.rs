@@ -76,6 +76,10 @@ pub struct Editor {
     pub context_menu: Option<crate::ui::canvas::context_menu::ContextMenu>,
     // Pairs awaiting the user's bond choice while the menu is open.
     pub pending_bonds: Vec<(PointId, PointId)>,
+    // Undo/redo history (full-document snapshots; commands/ module drives).
+    pub(crate) undo_stack: Vec<Document>,
+    pub(crate) redo_stack: Vec<Document>,
+    pub(crate) gesture_snapshot: Option<Document>,
     // Last known cursor + modifier state so changes can re-derive drags.
     pub last_cursor: Option<gpui::Point<gpui::Pixels>>,
     // Last known canvas size in px, for viewport-culled snapping.
@@ -127,6 +131,9 @@ impl Editor {
             hovered_constraint: None,
             context_menu: None,
             pending_bonds: Vec::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            gesture_snapshot: None,
             last_cursor: None,
             viewport_size: (0., 0.),
             shift: false,
@@ -225,6 +232,9 @@ impl Editor {
         shift: bool,
         click_count: usize,
     ) -> bool {
+        // Every gesture is one undo step; the snapshot commits lazily only
+        // if the document actually changed.
+        self.history_begin();
         // Any click dismisses the pending bond-choice menu first.
         if self.context_menu.take().is_some() {
             return true;
@@ -1085,10 +1095,16 @@ impl Editor {
         action: crate::ui::canvas::context_menu::ContextAction,
     ) -> bool {
         use crate::ui::canvas::context_menu::ContextAction;
-        match action {
+        self.history_begin();
+        let changed = match action {
             ContextAction::BondCoincident => self.apply_bond_choice(false),
             ContextAction::BondMerge => self.apply_bond_choice(true),
+        };
+        if !changed {
+            // Drop the useless snapshot.
+            self.gesture_snapshot = None;
         }
+        changed
     }
 
     /// Triggers the Nth context menu entry (keyboard shortcuts).
@@ -1109,6 +1125,30 @@ impl Editor {
             self.pending_bonds.clear();
         }
         had
+    }
+
+    /// Re-derives session state after the document was swapped by
+    /// undo/redo — drops anything referencing ids that may not exist.
+    pub(crate) fn after_history_restore(&mut self) {
+        self.selection.retain(|el| match *el {
+            ElementRef::Point(p) => self.doc.point(p).is_some(),
+            ElementRef::Segment(s) => self.doc.segment(s).is_some(),
+            ElementRef::Fill(f) => self.doc.fill(f).is_some(),
+        });
+        self.selected_constraints
+            .retain(|c| self.doc.constraints.contains(c));
+        self.pending_bonds.clear();
+        self.context_menu = None;
+        self.hovered_constraint = None;
+        self.snap_guides.clear();
+        self.pending_shape = None;
+        self.pending_ruler = None;
+        self.pending_line = None;
+        self.pending_via_click = false;
+        self.dragging = None;
+        self.marquee = None;
+        self.deferred_pick = None;
+        self.group_drag_last = None;
     }
 
     // True when the element itself, or anything SELECTED that contains it,

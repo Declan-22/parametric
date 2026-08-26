@@ -11,7 +11,7 @@ use super::ids::{FillId, PointId, SegmentId};
 // horizontal/vertical constraints, and one fill over the loop, emitted by
 // the rectangle tool. Deleting any piece leaves the rest valid.
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Document {
     pub layers: Vec<Layer>,
     points: Arena<Point2>,
@@ -63,7 +63,7 @@ pub struct Fill {
     pub segments: Vec<SegmentId>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Layer {
     pub id: u64,
     pub name: String,
@@ -80,7 +80,7 @@ impl Layer {
 
 /// Generational slot storage: stable ids survive deletes without dangling
 /// references. A stale id resolves to None instead of wrong data.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct Arena<T> {
     slots: Vec<Slot<T>>,
     free: Vec<u32>,
@@ -92,7 +92,7 @@ impl<T> Default for Arena<T> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct Slot<T> {
     generation: u32,
     value: Option<T>,

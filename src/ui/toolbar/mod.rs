@@ -10,8 +10,12 @@ use crate::theme::Theme;
 
 const ICON_MOVE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
 	<path d="M0 0h24v24H0z" fill="none" />
-	<path fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.5" d="m9.803 4.63l6.033 2.36c3.48 1.362 5.22 2.043 5.163 3.123c-.058 1.08-1.874 1.576-5.506 2.566c-1.081.295-1.622.442-1.997.817s-.522.916-.817 1.997c-.99 3.632-1.486 5.448-2.566 5.506s-1.76-1.683-3.122-5.163L4.63 9.803C3.204 6.159 2.49 4.338 3.414 3.414c.924-.923 2.745-.21 6.389 1.216Z" />
+	<g fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.5">
+		<path d="m12.669 8.358l5.028 1.968c2.9 1.134 4.35 1.702 4.302 2.602s-1.561 1.313-4.588 2.138c-.901.246-1.352.369-1.664.68c-.312.313-.435.764-.681 1.665c-.825 3.026-1.238 4.54-2.138 4.588s-1.468-1.402-2.602-4.302l-1.968-5.028C7.17 9.633 6.576 8.115 7.345 7.345s2.288-.175 5.324 1.013Z" />
+		<path stroke-linecap="round" d="M9 4V2M5 5L3.5 3.5M4 9H2m3 4l-1.5 1.5m11-11L13 5" />
+	</g>
 </svg>
+
 
 
 "#;
@@ -40,10 +44,26 @@ const ICON_LINE: &[u8] =
 const ICON_RECTANGLE: &[u8] =
     br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
 	<path d="M0 0h24v24H0z" fill="none" />
-	<path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M5.061 20.045C6.375 21 8.251 21 12 21s5.625 0 6.939-.955a5 5 0 0 0 1.106-1.106C21 17.625 21 15.749 21 12s0-5.625-.955-6.939a5 5 0 0 0-1.106-1.106C17.625 3 15.749 3 12 3s-5.625 0-6.939.955A5 5 0 0 0 3.955 5.06C3 6.375 3 8.251 3 12s0 5.625.955 6.939a5 5 0 0 0 1.106 1.106M17 18l1-1m-5 1l5-5m-9 5l9-9" />
+	<g fill="none" stroke="currentColor" stroke-width="1.5">
+		<path stroke-linecap="round" stroke-linejoin="round" d="M20 6v12M18 4H6m12 16H6m-2-2V6" />
+		<path d="M22 4a2 2 0 1 1-4 0a2 2 0 0 1 4 0ZM6 4a2 2 0 1 1-4 0a2 2 0 0 1 4 0Zm16 16a2 2 0 1 1-4 0a2 2 0 0 1 4 0ZM6 20a2 2 0 1 1-4 0a2 2 0 0 1 4 0Z" />
+	</g>
     </svg>
 
 
+
+"#;
+
+const ICON_CIRCLE: &[u8] =
+    br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2">
+		<path d="M20.34 17.52a10 10 0 1 0-2.82 2.82" />
+		<circle cx="19" cy="19" r="2" />
+		<path d="m13.41 13.41l4.18 4.18" />
+		<circle cx="12" cy="12" r="2" />
+	</g>
+    </svg>
 "#;
 
 const ICON_RULER: &[u8] =
@@ -98,6 +118,7 @@ impl RenderOnce for Toolbar {
             .child(divider(t))
             .child(self.tool_button(Tool::Line, ICON_LINE, active_tool, t, cx))
             .child(self.tool_button(Tool::Rectangle, ICON_RECTANGLE, active_tool, t, cx))
+            .child(self.tool_button(Tool::Circle, ICON_CIRCLE, active_tool, t, cx))
     }
 }
 
@@ -197,6 +218,7 @@ fn tool_debug_name(tool: Tool) -> &'static str {
         Tool::Pan => "tool-pan",
         Tool::Line => "tool-line",
         Tool::Rectangle => "tool-rectangle",
+        Tool::Circle => "tool-circle",
         Tool::Ruler => "tool-ruler",
     }
 }

@@ -11,6 +11,7 @@ pub enum Tool {
     Pan,
     Line,
     Rectangle,
+    Circle,
     Ruler,
 }
 
@@ -70,6 +71,25 @@ pub fn snap_angle(a: Point2, b: Point2) -> Point2 {
     let angle = (dy.atan2(dx) / step).round() * step;
     let len = (dx * dx + dy * dy).sqrt();
     Point2::new(a.x + len * angle.cos(), a.y + len * angle.sin())
+}
+
+// In-progress circle/arc: stage 1 has `a` set, stage 2 adds the chord end
+// `b`, then the cursor acts as the third (on-arc) point until commit.
+#[derive(Clone, Copy, Debug)]
+pub struct PendingCircle {
+    pub a: Option<Point2>,
+    pub b: Option<Point2>,
+    pub cursor: Point2,
+}
+
+impl PendingCircle {
+    pub fn stage(&self) -> u8 {
+        match (self.a.is_some(), self.b.is_some()) {
+            (false, _) => 1,
+            (true, false) => 2,
+            _ => 3,
+        }
+    }
 }
 
 // In-progress ruler segment being dragged out. Shift snaps the direction

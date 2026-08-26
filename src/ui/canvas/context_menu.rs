@@ -75,50 +75,27 @@ pub const ICON_MERGE_POINTS: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg"
 </svg>"#;
 
 /// Renders the open context menu, if any. Clicking an entry applies its
-/// action through the editor; hover fades ride the shell's tween system.
+/// action through the editor; hover/pop fades ride the *Editor*'s tween
+/// system (not Shell's) so reading them during Shell::render doesn't
+/// re-entrantly borrow Shell.
 pub fn draw(
     editor: WeakEntity<crate::editor::Editor>,
-    shell: WeakEntity<Shell>,
+    _shell: WeakEntity<Shell>,
     cx: &mut App,
 ) -> Option<impl IntoElement> {
     use crate::theme::{fade_in, lerp_rgb};
 
     let t = *crate::theme::active(cx);
     let editor_up = editor.upgrade()?;
-    let open = editor_up.read(cx).context_menu.is_some();
-    const POP_KEY: &str = "ctx-menu-pop";
-    if !open {
-        // Re-arm the pop tween and clear stale entry hover fades so the
-        // next opening doesn't render entries pre-hovered.
-        if let Some(s) = shell.upgrade() {
-            if s.read(cx).fade(POP_KEY) > 0.001 {
-                s.update(cx, |s, cx| s.animate_fade(POP_KEY, 0.0, cx));
-            }
-            s.update(cx, |s, _| {
-                s.fades.retain(|k, _| !k.starts_with("ctx-entry-"));
-                s.fade_pending.retain(|k, _| !k.starts_with("ctx-entry-"));
-                s.fade_tween_active.retain(|k| !k.starts_with("ctx-entry-"));
-            });
-        }
-        return None;
-    }
     let menu = editor_up.read(cx).context_menu.clone()?;
     let entries = menu.entries.clone();
-
-    // Pop-in tween: opacity + a small upward settle, driven by the shell's
-    // fade ticker (re-armed each render until it settles).
-    let pop = shell
-        .upgrade()
-        .map(|s| {
-            let cur = s.read(cx).fade(POP_KEY);
-            if cur < 0.999 {
-                s.update(cx, |s, cx| s.animate_fade(POP_KEY, 1.0, cx));
-                s.read(cx).fade(POP_KEY)
-            } else {
-                cur
-            }
-        })
-        .unwrap_or(1.0);
+    let pop = {
+        let p = editor_up.read(cx).context_menu_pop;
+        if p < 0.999 {
+            let _ = editor.update(cx, |ed, cx| ed.animate_context_menu_pop(1.0, cx));
+        }
+        p.max(0.01)
+    };
 
     let mut panel = div()
         .occlude()
@@ -140,15 +117,12 @@ pub fn draw(
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
 
     for (i, entry) in entries.into_iter().enumerate() {
-        let k = shell
-            .upgrade()
-            .map(|s| s.read(cx).fade(&format!("ctx-entry-{i}")))
-            .unwrap_or(0.0);
+        let k = editor_up.read(cx).context_menu_fade(&format!("ctx-entry-{i}"));
         let bg = lerp_rgb(t.bg_darker, t.bg_tertiary, k);
         let border = fade_in((t.border_color << 8) | 0xFF, k);
         let ed_click = editor.clone();
+        let ed_hover = editor.clone();
         let hover_key = format!("ctx-entry-{i}");
-        let shell_hover = shell.clone();
 
         panel = panel.child(
             div()
@@ -166,9 +140,9 @@ pub fn draw(
                 .border_1()
                 .border_color(rgba(border))
                 .on_hover(move |hovered, _, cx| {
-                    if let Some(sh) = shell_hover.upgrade() {
-                        let _ = sh.update(cx, |sh, cx| {
-                            sh.animate_fade(
+                    if let Some(ed) = ed_hover.upgrade() {
+                        let _ = ed.update(cx, |ed, cx| {
+                            ed.animate_context_menu_fade(
                                 &hover_key,
                                 if *hovered { 1.0 } else { 0.0 },
                                 cx,
@@ -186,7 +160,7 @@ pub fn draw(
                         .items_center()
                         .gap(px(4.))
                         .child(
-                            div().flex().items_center().gap(px(2.)).child(
+                            div().flex().items_center().mt(px(-1.)).gap(px(2.)).child(
                                 svg()
                                     .data(entry.icon)
                                     .w(px(ICON_SIZE))

@@ -51,6 +51,7 @@ pub fn targets(
     exclude_pts: &[PointId],
     exclude_segs: &[crate::core::ids::SegmentId],
     endpoints_only: bool,
+    visible: Rect,
 ) -> Vec<SnapTarget> {
     let _ = exclude_segs;
     let mut out = Vec::new();
@@ -95,6 +96,40 @@ pub fn targets(
                 x: a.x + ux * d,
                 y: a.y + uy * d,
                 kind: SnapKind::Endpoint,
+                snap_x: true,
+                snap_y: true,
+                span_lo: 0.,
+                span_hi: 0.,
+                span_is_x: false,
+            });
+        }
+    }
+    // Arc centers (circumcenters) — snappable midpoints for circles.
+    for (sid, seg) in doc.all_segments() {
+        if seg.kind != SegmentKind::Arc {
+            continue;
+        }
+        let Some(sc) = seg.ctrl else { continue };
+        let (Some(a), Some(b), Some(c)) =
+            (doc.point(seg.start), doc.point(seg.end), doc.point(sc))
+        else {
+            continue;
+        };
+        if exclude_pts.contains(&seg.start)
+            || exclude_pts.contains(&seg.end)
+            || exclude_pts.contains(&sc)
+            || seg.center.is_some_and(|id| exclude_pts.contains(&id))
+        {
+            continue;
+        }
+        if let Some((center, _)) = crate::editor::arc::circumcircle(a, b, c) {
+            if !visible.contains(center) {
+                continue;
+            }
+            out.push(SnapTarget {
+                x: center.x,
+                y: center.y,
+                kind: SnapKind::Midpoint,
                 snap_x: true,
                 snap_y: true,
                 span_lo: 0.,
@@ -185,7 +220,7 @@ pub fn best(
     visible: Rect,
 ) -> (Point2, Vec<SnapGuide>) {
     let mut best: Option<(f64, f64, f64, bool, bool, SnapTarget)> = None;
-    for tgt in targets(doc, exclude_pts, exclude_segs, endpoints_only) {
+    for tgt in targets(doc, exclude_pts, exclude_segs, endpoints_only, visible) {
         if !visible.contains(Point2::new(tgt.x, tgt.y)) {
             continue;
         }
@@ -204,6 +239,56 @@ pub fn best(
             best = Some((score, dx, dy, hit_x, hit_y, tgt));
         }
     }
+    // Arc bodies — closest point on the arc curve (larger tolerance).
+    let arc_tol = tol * 1.8;
+    for (sid, seg) in doc.all_segments() {
+        if seg.kind != SegmentKind::Arc {
+            continue;
+        }
+        if exclude_segs.contains(&sid) {
+            continue;
+        }
+        let Some(sc) = seg.ctrl else { continue };
+        if exclude_pts.contains(&seg.start)
+            || exclude_pts.contains(&seg.end)
+            || exclude_pts.contains(&sc)
+            || seg.center.is_some_and(|id| exclude_pts.contains(&id))
+        {
+            continue;
+        }
+        let (Some(a), Some(b), Some(c)) =
+            (doc.point(seg.start), doc.point(seg.end), doc.point(sc))
+        else {
+            continue;
+        };
+        let Some(proj) = closest_point_on_arc(p, a, b, c) else {
+            continue;
+        };
+        if !visible.contains(proj) {
+            continue;
+        }
+        let dx = proj.x - p.x;
+        let dy = proj.y - p.y;
+        let d = (dx * dx + dy * dy).sqrt();
+        if d > arc_tol {
+            continue;
+        }
+        let score = d;
+        if best.as_ref().map_or(true, |(s, _, _, _, _, _)| score < *s) {
+            let tgt = SnapTarget {
+                x: proj.x,
+                y: proj.y,
+                kind: SnapKind::Edge,
+                snap_x: true,
+                snap_y: true,
+                span_lo: 0.,
+                span_hi: 0.,
+                span_is_x: false,
+            };
+            best = Some((score, dx, dy, true, true, tgt));
+        }
+    }
+
     let Some((_, dx, dy, hit_x, hit_y, tgt)) = best else {
         return (Point2::new(0., 0.), Vec::new());
     };
@@ -279,6 +364,33 @@ pub fn cursor_snap(
         return (q, guide(q, SnapKind::Endpoint));
     }
 
+    // 1b) Arc centers (circumcenters) — treated as midpoints.
+    let mut best_center: Option<(f64, Point2)> = None;
+    for (_, seg) in doc.all_segments() {
+        if seg.kind != SegmentKind::Arc {
+            continue;
+        }
+        let Some(sc) = seg.ctrl else { continue };
+        let (Some(a), Some(b), Some(c)) =
+            (doc.point(seg.start), doc.point(seg.end), doc.point(sc))
+        else {
+            continue;
+        };
+        let Some((center, _)) = crate::editor::arc::circumcircle(a, b, c) else {
+            continue;
+        };
+        if !visible.contains(center) {
+            continue;
+        }
+        let d = distance(p, center);
+        if d <= tol && best_center.map_or(true, |(bd, _)| d < bd) {
+            best_center = Some((d, center));
+        }
+    }
+    if let Some((_, center)) = best_center {
+        return (center, guide(center, SnapKind::Midpoint));
+    }
+
     // 2) Midpoints.
     let mut best_mid: Option<(f64, Point2)> = None;
     for (sid, seg) in doc.all_segments() {
@@ -301,10 +413,10 @@ pub fn cursor_snap(
         return (m, guide(m, SnapKind::Midpoint));
     }
 
-    // 3) Edge bodies (interior only; endpoints handled above).
+    // 3) Edge bodies (interior only; endpoints handled above) — lines.
     let mut best_edge: Option<(f64, Point2)> = None;
     for (sid, seg) in doc.all_segments() {
-        if seg.kind == SegmentKind::Ruler {
+        if seg.kind != SegmentKind::Line {
             continue;
         }
         let Some((a, b)) = doc.segment_geom(sid) else {
@@ -326,6 +438,34 @@ pub fn cursor_snap(
         return (proj, guide(proj, SnapKind::Edge));
     }
 
+    // 4) Arc bodies — closest point on the arc curve (with larger tolerance).
+    let arc_tol = tol * 1.8;
+    let mut best_arc: Option<(f64, Point2)> = None;
+    for (_, seg) in doc.all_segments() {
+        if seg.kind != SegmentKind::Arc {
+            continue;
+        }
+        let Some(sc) = seg.ctrl else { continue };
+        let (Some(a), Some(b), Some(c)) =
+            (doc.point(seg.start), doc.point(seg.end), doc.point(sc))
+        else {
+            continue;
+        };
+        let Some(proj) = closest_point_on_arc(p, a, b, c) else {
+            continue;
+        };
+        if !visible.contains(proj) && !visible.contains(a) && !visible.contains(b) {
+            continue;
+        }
+        let d = distance(p, proj);
+        if d <= arc_tol && best_arc.map_or(true, |(bd, _)| d < bd) {
+            best_arc = Some((d, proj));
+        }
+    }
+    if let Some((_, proj)) = best_arc {
+        return (proj, guide(proj, SnapKind::Edge));
+    }
+
     (p, None)
 }
 
@@ -338,6 +478,49 @@ fn closest_point_on_segment(p: Point2, a: Point2, b: Point2) -> Point2 {
     }
     let t = (((p.x - a.x) * abx + (p.y - a.y) * aby) / len_sq).clamp(0., 1.);
     Point2::new(a.x + t * abx, a.y + t * aby)
+}
+
+fn closest_point_on_arc(p: Point2, a: Point2, b: Point2, c: Point2) -> Option<Point2> {
+    use crate::editor::arc::circumcircle;
+    let Some((o, r)) = circumcircle(a, b, c) else {
+        return None;
+    };
+    let dx = p.x - o.x;
+    let dy = p.y - o.y;
+    let d = (dx * dx + dy * dy).sqrt();
+    if d < 1e-9 {
+        return None;
+    }
+    let proj = Point2::new(o.x + dx / d * r, o.y + dy / d * r);
+    // Check if projection lies within the arc's angular interval (a -> b via c).
+    let ang = |q: Point2| (q.y - o.y).atan2(q.x - o.x);
+    let a0 = ang(a);
+    let b0 = ang(b);
+    let c0 = ang(c);
+    let p0 = ang(proj);
+    const TAU: f64 = std::f64::consts::TAU;
+    let norm = |mut t: f64| {
+        while t < 0. {
+            t += TAU;
+        }
+        while t >= TAU {
+            t -= TAU;
+        }
+        t
+    };
+    let s_pos = norm(b0 - a0);
+    let in_pos = norm(c0 - a0) < s_pos + 1e-9;
+    let sweep = if in_pos { s_pos } else { s_pos - TAU };
+    let in_arc = if sweep >= 0. {
+        norm(p0 - a0) <= sweep + 1e-7 && norm(p0 - a0) >= -1e-7
+    } else {
+        norm(a0 - p0) <= -sweep + 1e-7 && norm(a0 - p0) >= -1e-7
+    };
+    if in_arc {
+        Some(proj)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

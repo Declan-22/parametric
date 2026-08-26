@@ -43,6 +43,19 @@ impl<'a> Picker<'a> {
         let mut best: Option<(f64, SegmentId)> = None;
         for (id, seg) in self.doc.all_segments() {
             if seg.kind != SegmentKind::Line && seg.kind != SegmentKind::Ruler {
+                // Arcs hit-test against their sampled polyline.
+                if seg.kind == SegmentKind::Arc
+                    && let Some(samples) =
+                        crate::editor::arc::segment_samples(self.doc, id, 32)
+                {
+                    let d = samples
+                        .windows(2)
+                        .map(|w| point_segment_distance(at, w[0], w[1]))
+                        .fold(f64::MAX, f64::min);
+                    if d <= self.tol && best.map_or(true, |(bd, _)| d < bd) {
+                        best = Some((d, id));
+                    }
+                }
                 continue;
             }
             let Some((a, b)) = self.doc.segment_geom(id) else {

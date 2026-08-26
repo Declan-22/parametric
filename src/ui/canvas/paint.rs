@@ -86,6 +86,7 @@ pub fn build_draw_list(
     pending_ruler: Option<(Point2, Point2)>,
     pending_line: Option<(Point2, Point2)>,
     constraint_markers: &[crate::editor::dims::ConstraintMarker],
+    pending_circle: Option<crate::editor::PendingCircle>,
 ) -> Vec<Primitive> {
     let min = camera.screen_to_unit(Point2::new(0., 0.));
     let max = camera.screen_to_unit(Point2::new(
@@ -166,6 +167,41 @@ pub fn build_draw_list(
                             color,
                         });
                     }
+                    // Arc segments: sampled polyline of the arc through
+                    // start -> ctrl -> end. Incomplete arcs also show their
+                    // dashed complementary portion.
+                    if seg.kind == SegmentKind::Arc {
+                        let Some(samples) = crate::editor::arc::segment_samples(doc, sid, 64)
+                        else {
+                            continue;
+                        };
+                        if samples.iter().any(|p| visible.contains(*p)) {
+                            push_polyline(&mut list, &samples.iter().map(|p| scr(*p)).collect::<Vec<_>>(), 1.5, color);
+                        }
+                        // Dashed complement while incomplete — show whenever the
+                        // arc itself is selected, or any of its defining
+                        // points (including the center) are selected / being
+                        // dragged (resizing).
+                        let complete = crate::editor::arc::is_complete(doc, sid);
+                        let arc_selected = selection.contains(&el)
+                            || seg.ctrl.is_some_and(|c| {
+                                selection.contains(&ElementRef::Point(c))
+                                    || selection.contains(&ElementRef::Point(seg.start))
+                                    || selection.contains(&ElementRef::Point(seg.end))
+                            })
+                            || seg.center.is_some_and(|c| selection.contains(&ElementRef::Point(c)));
+                        if !complete
+                            && arc_selected
+                            && let Some(ctrl_id) = seg.ctrl
+                            && let (Some(sa), Some(sb)) =
+                                (doc.point(seg.start), doc.point(seg.end))
+                            && let Some(cpos) = doc.point(ctrl_id)
+                        {
+                            let comp = crate::editor::arc::complement_samples(sa, sb, cpos, 48);
+                            let pts: Vec<(f32, f32)> = comp.iter().map(|p| scr(*p)).collect();
+                            dashed_polyline(&mut list, &pts, accent);
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -222,6 +258,45 @@ pub fn build_draw_list(
             if let Some(p) = doc.point(pid) {
                 let (x, y) = scr(p);
                 list.push(Primitive::Circle { cx: x, cy: y, radius: 4. });
+            }
+        }
+    }
+    // Arc center handles — show whenever the arc is selected in any way
+    // (segment itself, or any of its defining points including the center).
+    {
+        let selected_pids: std::collections::HashSet<_> = selection
+            .iter()
+            .flat_map(|el| doc.element_points(*el))
+            .collect();
+        for (sid, seg) in doc.all_segments() {
+            if seg.kind != SegmentKind::Arc {
+                continue;
+            }
+            let is_touched = selection.contains(&ElementRef::Segment(sid))
+                || seg.ctrl.is_some_and(|c| selected_pids.contains(&c))
+                || selected_pids.contains(&seg.start)
+                || selected_pids.contains(&seg.end)
+                || seg.center.is_some_and(|c| selected_pids.contains(&c));
+            if !is_touched {
+                continue;
+            }
+            // Prefer the stored center point (real document point) if present.
+            let center_pos = seg
+                .center
+                .and_then(|id| doc.point(id))
+                .or_else(|| {
+                    let (Some(a), Some(b), Some(c)) = (
+                        doc.point(seg.start),
+                        doc.point(seg.end),
+                        seg.ctrl.and_then(|id| doc.point(id)),
+                    ) else {
+                        return None;
+                    };
+                    crate::editor::arc::circumcircle(a, b, c).map(|(o, _)| o)
+                });
+            if let Some(center) = center_pos {
+                let (cx0, cy0) = scr(center);
+                list.push(Primitive::Circle { cx: cx0, cy: cy0, radius: 3. });
             }
         }
     }
@@ -316,10 +391,111 @@ pub fn build_draw_list(
         let (bx, by) = scr(b);
         list.push(Primitive::Line { ax, ay, bx, by, width: 1., color: accent });
     }
+
+    // In-progress circle preview, per stage:
+    //  2 (a set, b not yet): chord A -> cursor like the Line tool;
+    //  3 (a+b set): arc through a->cursor->b + dashed complement on the
+    //  far side + dashed radius from the chord midpoint to the cursor.
+    if let Some(pc) = pending_circle {
+        match pc.stage() {
+            2 => {
+                if let Some(a) = pc.a {
+                    // Chord preview to the ghost cursor (second point not yet placed).
+                    push_chord_preview(&mut list, &scr, a, pc.cursor, accent);
+                }
+            }
+            _ => {
+                if let (Some(a), Some(b)) = (pc.a, pc.b) {
+                    let arc = crate::editor::arc::samples_through(a, b, pc.cursor, 64);
+                    let pts: Vec<(f32, f32)> = arc.iter().map(|p| scr(*p)).collect();
+                    push_polyline(&mut list, &pts, 1.5, color);
+                    let comp = crate::editor::arc::complement_samples(a, b, pc.cursor, 48);
+                    dashed_polyline(&mut list, &comp.iter().map(|p| scr(*p)).collect::<Vec<_>>(), accent);
+                    // Radius guide: true center -> cursor (visible handle).
+                    if let Some((center, _)) = crate::editor::arc::circumcircle(a, b, pc.cursor) {
+                        let (mx, my) = scr(center);
+                        let (cx0, cy0) = scr(pc.cursor);
+                        dashed_polyline(&mut list, &[(mx, my), (cx0, cy0)], accent);
+                        list.push(Primitive::Circle { cx: mx, cy: my, radius: 3. });
+                    }
+                }
+            }
+        }
+    }
     list
 }
 
+// Thin accent chord line with endpoint handles (circle tool stages 1-2).
+fn push_chord_preview(
+    list: &mut Vec<Primitive>,
+    scr: &impl Fn(Point2) -> (f32, f32),
+    a: Point2,
+    b: Point2,
+    accent: gpui::Background,
+) {
+    let (ax, ay) = scr(a);
+    let (bx, by) = scr(b);
+    list.push(Primitive::Line { ax, ay, bx, by, width: 1., color: accent });
+    list.push(Primitive::Circle { cx: ax, cy: ay, radius: 3. });
+    list.push(Primitive::Circle { cx: bx, cy: by, radius: 3. });
+}
+
 const LINE_W: f32 = 1.5;
+
+// Solid polyline (arc rendering).
+fn push_polyline(list: &mut Vec<Primitive>, pts: &[(f32, f32)], width: f32, color: gpui::Background) {
+    for w in pts.windows(2) {
+        list.push(Primitive::Line {
+            ax: w[0].0,
+            ay: w[0].1,
+            bx: w[1].0,
+            by: w[1].1,
+            width,
+            color,
+        });
+    }
+}
+
+// Dashed polyline (missing arc portion) — continuous dash pattern
+// along the whole polyline (fewer dashes for shorter arcs, not smaller dashes).
+fn dashed_polyline(list: &mut Vec<Primitive>, pts: &[(f32, f32)], color: gpui::Background) {
+    const DASH: f32 = 6.;
+    const GAP: f32 = 4.;
+    const PERIOD: f32 = DASH + GAP;
+    let mut acc = 0.0;
+    for w in pts.windows(2) {
+        let (ax, ay) = w[0];
+        let (bx, by) = w[1];
+        let dx = bx - ax;
+        let dy = by - ay;
+        let len = (dx * dx + dy * dy).sqrt();
+        if len < 1e-3 {
+            acc += len;
+            continue;
+        }
+        let ux = dx / len;
+        let uy = dy / len;
+        let mut t = 0.0;
+        while t < len {
+            let phase = (acc + t) % PERIOD;
+            let is_dash = phase < DASH;
+            let remaining = if is_dash { DASH - phase } else { PERIOD - phase };
+            let seg = remaining.min(len - t);
+            if is_dash {
+                list.push(Primitive::Line {
+                    ax: ax + ux * t,
+                    ay: ay + uy * t,
+                    bx: ax + ux * (t + seg),
+                    by: ay + uy * (t + seg),
+                    width: 1.,
+                    color,
+                });
+            }
+            t += seg;
+        }
+        acc += len;
+    }
+}
 
 // Accent outline overlay for one element.
 fn element_outline(
@@ -338,13 +514,18 @@ fn element_outline(
             }
         }
         ElementRef::Segment(sid) => {
-            if let Some((a, b)) = doc.segment_geom(sid) {
+            if let Some(seg) = doc.segment(sid)
+                && seg.kind == SegmentKind::Arc
+                && let Some(samples) = crate::editor::arc::segment_samples(doc, sid, 48)
+            {
+                let pts: Vec<(f32, f32)> = samples.iter().map(|p| scr(*p)).collect();
+                push_polyline(list, &pts, 2.5, accent);
+            } else if let Some((a, b)) = doc.segment_geom(sid) {
                 let (ax, ay) = scr(a);
                 let (bx, by) = scr(b);
                 list.push(Primitive::Line { ax, ay, bx, by, width: 2.5, color: accent });
             }
-        }
-        ElementRef::Fill(fid) => {
+        }        ElementRef::Fill(fid) => {
             if let Some(pts) = crate::editor::pick::loop_points(doc, fid) {
                 for i in 0..pts.len() {
                     let (ax, ay) = scr(pts[i]);

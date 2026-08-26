@@ -32,8 +32,9 @@ pub enum SegmentKind {
     // A measuring ruler: renders with procedural inch ticks and labels,
     // carries no constraints, no fill, no dims.
     Ruler,
-    // Arc support lands later; the enum is reserved now so stored data and
-    // all match sites already expect it.
+    // Circular arc through start, ctrl (a point ON the arc), end. Becomes
+    // a full circle when start/end share a Coincident constraint.
+    Arc,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -44,15 +45,21 @@ pub struct Segment {
     // Screen-px stroke rendered for standalone lines; 0 = invisible
     // geometry (rectangle edges, etc.).
     pub stroke_width: f64,
+    // Arc control point (a REAL point on the arc) for kind == Arc.
+    // None for lines/rulers. Endpoints + ctrl define the circumcircle.
+    pub ctrl: Option<PointId>,
+    // Circumcenter point for arcs — a REAL document point that stays
+    // centered. None for non-arcs. Enables snapping/constraints/hover.
+    pub center: Option<PointId>,
 }
 
 impl Segment {
     fn line(start: PointId, end: PointId) -> Self {
-        Self { start, end, kind: SegmentKind::Line, stroke_width: 0. }
+        Self { start, end, kind: SegmentKind::Line, stroke_width: 0., ctrl: None, center: None }
     }
 
     fn with_kind(start: PointId, end: PointId, kind: SegmentKind) -> Self {
-        Self { start, end, kind, stroke_width: 0. }
+        Self { start, end, kind, stroke_width: 0., ctrl: None, center: None }
     }
 }
 
@@ -207,7 +214,7 @@ impl Document {
         let dead: Vec<SegmentId> = self
             .segments
             .iter()
-            .filter(|(_, _, s)| s.start == id || s.end == id)
+            .filter(|(_, _, s)| s.start == id || s.end == id || s.ctrl == Some(id) || s.center == Some(id))
             .map(|(idx, generation, _)| SegmentId { idx, generation: generation })
             .collect();
         for sid in dead {
@@ -239,6 +246,28 @@ impl Document {
             end,
             kind: SegmentKind::Line,
             stroke_width,
+            ctrl: None,
+            center: None,
+        });
+        SegmentId { idx, generation }
+    }
+
+    /// Adds a circular arc through start -> ctrl -> end, with a real
+    /// center point (kept in sync by the editor).
+    pub fn add_arc_segment(
+        &mut self,
+        start: PointId,
+        ctrl: PointId,
+        end: PointId,
+        center: PointId,
+    ) -> SegmentId {
+        let (idx, generation) = self.segments.insert(Segment {
+            start,
+            end,
+            kind: SegmentKind::Arc,
+            stroke_width: 0.,
+            ctrl: Some(ctrl),
+            center: Some(center),
         });
         SegmentId { idx, generation }
     }
@@ -348,7 +377,16 @@ impl Document {
         match el {
             ElementRef::Point(p) => vec![p],
             ElementRef::Segment(s) => match self.segment(s) {
-                Some(seg) => vec![seg.start, seg.end],
+                Some(seg) => {
+                    let mut v = vec![seg.start, seg.end];
+                    if let Some(c) = seg.ctrl {
+                        v.push(c);
+                    }
+                    if let Some(c) = seg.center {
+                        v.push(c);
+                    }
+                    v
+                }
                 None => Vec::new(),
             },
             ElementRef::Fill(f) => match self.fill(f) {
@@ -401,6 +439,12 @@ impl Document {
                 if s.end == drop {
                     s.end = keep;
                 }
+                if s.ctrl == Some(drop) {
+                    s.ctrl = Some(keep);
+                }
+                if s.center == Some(drop) {
+                    s.center = Some(keep);
+                }
             }
         }
         for c in &mut self.constraints {
@@ -429,6 +473,39 @@ impl Document {
         self.dimensions.push(dim);
     }
 
+    /// Recomputes every arc's center point from its current 3 defining
+    /// points. Called after any point move.
+    pub fn sync_arc_centers(&mut self) {
+        let mut updates: Vec<(PointId, Point2)> = Vec::new();
+        for (_, seg) in self.all_segments() {
+            if seg.kind != SegmentKind::Arc {
+                continue;
+            }
+            let Some(center_id) = seg.center else { continue };
+            let Some(ctrl_id) = seg.ctrl else { continue };
+            let (Some(a), Some(b), Some(c)) = (
+                self.point(seg.start),
+                self.point(seg.end),
+                self.point(ctrl_id),
+            ) else {
+                continue;
+            };
+            let d = 2. * (a.x * (b.y - c.y) + b.x * (c.y - a.y) + c.x * (a.y - b.y));
+            if d.abs() < 1e-9 {
+                continue;
+            }
+            let a2 = a.x * a.x + a.y * a.y;
+            let b2 = b.x * b.x + b.y * b.y;
+            let c2 = c.x * c.x + c.y * c.y;
+            let ux = (a2 * (b.y - c.y) + b2 * (c.y - a.y) + c2 * (a.y - b.y)) / d;
+            let uy = (a2 * (c.x - b.x) + b2 * (a.x - c.x) + c2 * (b.x - a.x)) / d;
+            updates.push((center_id, Point2::new(ux, uy)));
+        }
+        for (pid, pos) in updates {
+            self.move_point(pid, pos);
+        }
+    }
+
     // -- raw inserts (persistence round-trips ids exactly) --
 
     pub fn insert_point_with_id(&mut self, id: PointId, pos: Point2) {
@@ -443,9 +520,11 @@ impl Document {
         end: PointId,
         kind: SegmentKind,
         stroke_width: f64,
+        ctrl: Option<PointId>,
+        center: Option<PointId>,
     ) {
         Self::reserve(&mut self.segments, id.idx, id.generation);
-        self.segments.set_at(id.idx, Segment { start, end, kind, stroke_width });
+        self.segments.set_at(id.idx, Segment { start, end, kind, stroke_width, ctrl, center });
     }
 
     pub fn insert_fill_with_id(&mut self, id: FillId, segments: Vec<SegmentId>) {

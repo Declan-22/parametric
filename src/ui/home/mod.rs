@@ -2,7 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
     App, Bounds, IntoElement, MouseButton, Pixels, Point, RenderOnce, Size, WeakEntity, Window, canvas, div,
-    fill, prelude::*, px, rgb, rgba,
+    fill, prelude::*, px, rgb, rgba, svg,
 };
 
 use crate::persistence::registry::DesignMeta;
@@ -18,32 +18,32 @@ pub const THUMB_HEIGHT: f32 = 132.;
 #[derive(IntoElement)]
 pub struct HomeView {
     pub shell: WeakEntity<Shell>,
+    pub designs: Vec<DesignMeta>,
+    pub new_design_opacity: f32,
+    pub renaming: Option<crate::ui::shell::RenameState>,
+    pub caret_visible: bool,
 }
 
 impl RenderOnce for HomeView {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let t = *crate::theme::active(cx);
-        let designs = self
-            .shell
-            .upgrade()
-            .map(|s| s.read(cx).designs(cx))
-            .unwrap_or_default();
+        let designs = self.designs;
 
         let shell = self.shell.clone();
         let shell_hover = self.shell.clone();
-        let new_opacity = self
-            .shell
-            .upgrade()
-            .map(|s| s.read(cx).new_design_opacity)
-            .unwrap_or(1.0);
+        let new_opacity = self.new_design_opacity;
         let new_btn = div()
             .id("new-design")
             .flex()
             .items_center()
+            .gap(px(6.))
             .px(px(10.))
-            .h(px(28.))
-            .rounded(px(6.))
+            .h(px(32.))
+            .rounded(px(8.))
             .cursor_pointer()
+            .border_1()
+            .border_color(rgb(t.accent_border))
+            .shadow(vec![t.shadow_sm()])
             // High-contrast action button; hover fades it to 80% opacity.
             .bg(rgb(t.accent))
             .text_sm()
@@ -58,7 +58,15 @@ impl RenderOnce for HomeView {
             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                 let _ = shell.update(cx, |shell, cx| shell.create_design(cx));
             })
-            .child("+ New design");
+            .child(
+                svg()
+                    .data(br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24"><path d="M0 0h24v24H0z" fill="none" /><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" /></svg>"#)
+                    .w(px(14.))
+                    .h(px(14.))
+                    .mt(px(-1.))
+                    .text_color(rgb(0xffffff)),
+            )
+            .child("New design");
 
         div()
             .id("home")
@@ -66,9 +74,24 @@ impl RenderOnce for HomeView {
             .overflow_y_scroll()
             .child(div().flex().justify_end().p(px(16.)).child(new_btn))
             .child(div().flex().flex_wrap().gap(px(16.)).px(px(16.)).children(
-                designs.into_iter().map(|meta| DesignCard {
-                    meta,
-                    shell: self.shell.clone(),
+                designs.into_iter().map(|meta| {
+                    let is_renaming = self.renaming.as_ref().map(|r| r.id) == Some(meta.id);
+                    let rename_value = if is_renaming {
+                        self.renaming
+                            .as_ref()
+                            .filter(|r| r.id == meta.id)
+                            .map(|r| r.value.clone())
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    DesignCard {
+                        meta,
+                        shell: self.shell.clone(),
+                        is_renaming,
+                        caret_visible: self.caret_visible,
+                        rename_value,
+                    }
                 }),
             ))
     }
@@ -78,6 +101,9 @@ impl RenderOnce for HomeView {
 struct DesignCard {
     meta: DesignMeta,
     shell: WeakEntity<Shell>,
+    is_renaming: bool,
+    caret_visible: bool,
+    rename_value: String,
 }
 
 impl RenderOnce for DesignCard {
@@ -106,15 +132,16 @@ impl RenderOnce for DesignCard {
                         &camera,
                         bounds.size,
                         t,
-                        None,   // pending
-                        &[],    // selection
-                        None,   // hover
-                        &[],    // dims
-                        &[],    // snap guides
-                        None,   // marquee
-                        None,   // pending ruler
-                        None,   // pending line
-                        &[],    // constraint markers
+                        None, // pending
+                        &[],  // selection
+                        None, // hover
+                        &[],  // dims
+                        &[],  // snap guides
+                        None, // marquee
+                        None, // pending ruler
+                        None, // pending line
+                        &[],  // constraint markers
+                        None, // pending circle
                     ),
                     None => Vec::new(),
                 }
@@ -130,7 +157,10 @@ impl RenderOnce for DesignCard {
                         window.paint_quad(fill(
                             Bounds {
                                 origin: Point { x: px(x), y: px(y) },
-                                size: Size { width: px(w), height: px(h) },
+                                size: Size {
+                                    width: px(w),
+                                    height: px(h),
+                                },
                             },
                             color,
                         ));
@@ -145,33 +175,9 @@ impl RenderOnce for DesignCard {
             }
         };
 
-        let is_renaming = self
-            .shell
-            .upgrade()
-            .map(|s| s.read(cx).renaming.as_ref().map(|r| r.id) == Some(meta_id))
-            .unwrap_or(false);
-        let shell_caret_visible = if is_renaming {
-            self.shell
-                .upgrade()
-                .map(|s| s.read(cx).caret_visible)
-                .unwrap_or(true)
-        } else {
-            false
-        };
-        let rename_value = if is_renaming {
-            self.shell
-                .upgrade()
-                .and_then(|s| {
-                    s.read(cx)
-                        .renaming
-                        .as_ref()
-                        .filter(|r| r.id == meta_id)
-                        .map(|r| r.value.clone())
-                })
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
+        let is_renaming = self.is_renaming;
+        let shell_caret_visible = self.caret_visible;
+        let rename_value = self.rename_value.clone();
 
         div()
             .id(gpui::ElementId::NamedInteger(
@@ -287,9 +293,10 @@ fn edited_ago(updated_at: i64) -> String {
 // dropdown menu (bg_darker panel, bordered hover entries).
 pub fn render_context_menu(
     menu: &crate::ui::shell::DesignContextMenu,
-    shell: WeakEntity<Shell>,
+    shell_entity: WeakEntity<Shell>,
+    shell: &Shell,
     t: Theme,
-    cx: &App,
+    _cx: &App,
 ) -> impl IntoElement {
     use crate::theme::{fade_in, lerp_rgb, lerp_rgba};
     use gpui::{MouseDownEvent, SharedString, rgba};
@@ -298,15 +305,10 @@ pub fn render_context_menu(
     let left = f32::from(menu.position.x);
     let top = f32::from(menu.position.y);
 
-    let fade_of = |index: usize| -> f32 {
-        shell
-            .upgrade()
-            .map(|s| s.read(cx).fade(&format!("ctx-{index}")))
-            .unwrap_or(0.0)
-    };
+    let fade_of = |index: usize| -> f32 { shell.fade(&format!("ctx-{index}")) };
 
-    let entry = |label: &'static str, index: usize| -> gpui::AnyElement {
-        let shell = shell.clone();
+    let entry = |label: &'static str, index: usize, destructive: bool| -> gpui::AnyElement {
+        let shell_weak = shell_entity.clone();
         let k = fade_of(index);
         let bg = lerp_rgb(t.bg_darker, t.bg_tertiary, k);
         let border = lerp_rgba(
@@ -325,16 +327,20 @@ pub fn render_context_menu(
             .px(px(10.))
             .rounded(px(6.))
             .text_sm()
-            .text_color(rgb(t.text_primary))
+            .text_color(if destructive {
+                rgb(0xE53E3E)
+            } else {
+                rgb(t.text_primary)
+            })
             .cursor_pointer()
             .border_1()
             .border_color(rgba(border))
             .bg(rgb(bg))
             .shadow(vec![shadow])
             .on_hover({
-                let shell = shell.clone();
+                let shell_weak2 = shell_entity.clone();
                 move |hovered, _, cx| {
-                    let _ = shell.update(cx, |shell, cx| {
+                    let _ = shell_weak2.update(cx, |shell, cx| {
                         shell.animate_fade(
                             &format!("ctx-{index}"),
                             if *hovered { 1.0 } else { 0.0 },
@@ -343,17 +349,21 @@ pub fn render_context_menu(
                     });
                 }
             })
-            .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
-                cx.stop_propagation();
-                let id = menu_id;
-                let _ = shell.update(cx, |shell, cx| match label {
-                    "Open" => {
-                        shell.context_menu = None;
-                        shell.open_design(id, cx);
-                    }
-                    "Rename" => shell.start_rename(id, window, cx),
-                    _ => {}
-                });
+            .on_mouse_down(MouseButton::Left, {
+                let shell_weak2 = shell_entity.clone();
+                move |_: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    let id = menu_id;
+                    let _ = shell_weak2.update(cx, |shell, cx| match label {
+                        "Open" => {
+                            shell.context_menu = None;
+                            shell.open_design(id, cx);
+                        }
+                        "Rename" => shell.start_rename(id, window, cx),
+                        "Delete" => shell.request_delete(id, cx),
+                        _ => {}
+                    });
+                }
             })
             .child(label)
             .into_any_element()
@@ -376,6 +386,7 @@ pub fn render_context_menu(
         .rounded(px(8.))
         .shadow(vec![t.shadow_sm()])
         .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-        .child(entry("Open", 0))
-        .child(entry("Rename", 1))
+        .child(entry("Open", 0, false))
+        .child(entry("Rename", 1, false))
+        .child(entry("Delete", 2, true))
 }

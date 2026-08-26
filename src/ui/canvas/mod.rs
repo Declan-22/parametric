@@ -308,6 +308,7 @@ impl CanvasView {
                 pending_ruler,
                 pending_line,
                 &ed.constraint_markers,
+                ed.pending_circle,
             );
             (list, hitbox)
         };

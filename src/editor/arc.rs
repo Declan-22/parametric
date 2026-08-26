@@ -1,0 +1,142 @@
+use crate::core::document::{Document, SegmentKind};
+use crate::core::geometry::Point2;
+use crate::core::ids::SegmentId;
+
+// Circular-arc math. An Arc segment passes through start -> ctrl -> end
+// (the unique circumcircle); the ctrl point is a REAL document point.
+
+/// Circumcenter and radius of the circle through a, b, c.
+pub fn circumcircle(a: Point2, b: Point2, c: Point2) -> Option<(Point2, f64)> {
+    let d = 2. * (a.x * (b.y - c.y) + b.x * (c.y - a.y) + c.x * (a.y - b.y));
+    if d.abs() < 1e-9 {
+        return None;
+    }
+    let a2 = a.x * a.x + a.y * a.y;
+    let b2 = b.x * b.x + b.y * b.y;
+    let c2 = c.x * c.x + c.y * c.y;
+    let ux = (a2 * (b.y - c.y) + b2 * (c.y - a.y) + c2 * (a.y - b.y)) / d;
+    let uy = (a2 * (c.x - b.x) + b2 * (a.x - c.x) + c2 * (b.x - a.x)) / d;
+    let center = Point2::new(ux, uy);
+    let r = ((a.x - ux).powi(2) + (a.y - uy).powi(2)).sqrt();
+    Some((center, r))
+}
+
+/// Sampled points along the arc from a to b PASSING THROUGH c.
+pub fn samples_through(a: Point2, b: Point2, c: Point2, n: usize) -> Vec<Point2> {
+    let Some((o, _)) = circumcircle(a, b, c) else {
+        // Degenerate (collinear): fall back to chord via c.
+        return vec![a, c, b];
+    };
+    let ang = |p: Point2| (p.y - o.y).atan2(p.x - o.x);
+    let a0 = ang(a);
+    let b0 = ang(b);
+    let c0 = ang(c);
+    const TAU: f64 = std::f64::consts::TAU;
+    let norm = |mut t: f64| {
+        while t < 0. {
+            t += TAU;
+        }
+        while t >= TAU {
+            t -= TAU;
+        }
+        t
+    };
+    // Pick the sweep that actually contains c: the direction where c's
+    // midpoint is closest to c.
+    let s_pos = norm(b0 - a0);
+    let s_neg = s_pos - TAU; // negative equivalent
+    let r = ((a.x - o.x).powi(2) + (a.y - o.y).powi(2)).sqrt();
+    let mid_dist = |sweep: f64| {
+        let mid_ang = a0 + sweep / 2.;
+        let mid = Point2::new(o.x + r * mid_ang.cos(), o.y + r * mid_ang.sin());
+        let dx = mid.x - c.x;
+        let dy = mid.y - c.y;
+        dx * dx + dy * dy
+    };
+    // Two candidates: the short way and the long way — one contains c.
+    // Test both orderings of a/b vs c: we need the direction where the
+    // midpoint of the arc is nearest to c.
+    let d_pos = {
+        // a -> b positive sweep
+        let d1 = mid_dist(s_pos);
+        // Also need to test if c lies exactly on that sweep (not just midpoint proximity).
+        // Verify c is within (a0, a0+s_pos): check norm(c0-a0) < s_pos
+        let in_pos = norm(c0 - a0) < s_pos + 1e-9 && norm(c0 - a0) > -1e-9;
+        if in_pos { d1 } else { f64::MAX }
+    };
+    let d_neg = {
+        let d2 = mid_dist(s_neg);
+        let in_neg = norm(a0 - c0) < -s_neg + 1e-9;
+        if in_neg { d2 } else { f64::MAX }
+    };
+    let sweep = if d_pos <= d_neg { s_pos } else { s_neg };
+    let a1 = a0 + sweep;
+    let steps = n.max(2);
+    let mut out = Vec::with_capacity(steps + 1);
+    for k in 0..=steps {
+        let t = k as f64 / steps as f64;
+        let theta = a0 + (a1 - a0) * t;
+        out.push(Point2::new(o.x + r * theta.cos(), o.y + r * theta.sin()));
+    }
+    out
+}
+
+/// The COMPLEMENTARY arc — the opposite side of the circle between a and
+/// b, bulging AWAY from c. Together with `samples_through(a,b,c)` this
+/// forms the full circle. Always runs a -> b via the side NOT containing c.
+pub fn complement_samples(a: Point2, b: Point2, c: Point2, n: usize) -> Vec<Point2> {
+    let Some((o, _)) = circumcircle(a, b, c) else {
+        return vec![a, b];
+    };
+    let ang = |p: Point2| (p.y - o.y).atan2(p.x - o.x);
+    let a0 = ang(a);
+    let b0 = ang(b);
+    let c0 = ang(c);
+    const TAU: f64 = std::f64::consts::TAU;
+    let norm = |mut t: f64| {
+        while t < 0. {
+            t += TAU;
+        }
+        while t >= TAU {
+            t -= TAU;
+        }
+        t
+    };
+    let s_pos = norm(b0 - a0);
+    let s_neg = s_pos - TAU;
+    let in_pos = norm(c0 - a0) < s_pos + 1e-9;
+    let sweep = if in_pos { s_pos } else { s_neg };
+    // Opposite side: same endpoints, opposite direction.
+    let comp_sweep = if sweep >= 0. { sweep - TAU } else { sweep + TAU };
+    let steps = n.max(2);
+    let r = ((a.x - o.x).powi(2) + (a.y - o.y).powi(2)).sqrt();
+    let mut out = Vec::with_capacity(steps + 1);
+    for k in 0..=steps {
+        let t = k as f64 / steps as f64;
+        let theta = a0 + comp_sweep * t;
+        out.push(Point2::new(o.x + r * theta.cos(), o.y + r * theta.sin()));
+    }
+    out
+}
+
+/// True when the arc's endpoints are glued by a Coincident constraint,
+/// meaning the complementary arc fills the gap and forms a full circle.
+pub fn is_complete(doc: &Document, sid: SegmentId) -> bool {
+    let Some(seg) = doc.segment(sid) else { return false };
+    doc.constraints.iter().any(|c| {
+        c.kind == crate::core::constraints::ConstraintKind::Coincident
+            && ((c.a == seg.start && c.b == seg.end) || (c.a == seg.end && c.b == seg.start))
+    })
+}
+
+/// Sampled polyline of an arc segment for rendering/hit-testing.
+pub fn segment_samples(doc: &Document, sid: SegmentId, n: usize) -> Option<Vec<Point2>> {
+    let seg = doc.segment(sid)?;
+    if seg.kind != SegmentKind::Arc {
+        return None;
+    }
+    let a = doc.point(seg.start)?;
+    let b = doc.point(seg.end)?;
+    let c = doc.point(seg.ctrl?)?;
+    Some(samples_through(a, b, c, n))
+}

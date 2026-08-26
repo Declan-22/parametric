@@ -1,3 +1,4 @@
+pub mod arc;
 mod camera;
 pub mod dims;
 pub mod pick;
@@ -8,7 +9,7 @@ mod tools;
 pub use camera::Camera;
 
 pub use snapping::SnapGuide;
-pub use tools::{PendingLine, PendingRuler, PendingShape, Tool};
+pub use tools::{PendingCircle, PendingLine, PendingRuler, PendingShape, Tool};
 
 use crate::core::constraints::{ConstraintKind, ElementRef};
 use crate::core::document::{Document, Layer};
@@ -51,6 +52,7 @@ pub struct Editor {
     pub pending_shape: Option<PendingShape>,
     pub pending_ruler: Option<PendingRuler>,
     pub pending_line: Option<PendingLine>,
+    pub pending_circle: Option<PendingCircle>,
     // Pending shape created by a single click (commit on next click).
     pub pending_via_click: bool,
     pub selection: Vec<ElementRef>,
@@ -76,6 +78,12 @@ pub struct Editor {
     pub context_menu: Option<crate::ui::canvas::context_menu::ContextMenu>,
     // Pairs awaiting the user's bond choice while the menu is open.
     pub pending_bonds: Vec<(PointId, PointId)>,
+    // Canvas context menu hover/pop fades — stored on Editor (not Shell) so
+    // reading them during Shell::render doesn't re-entrantly borrow Shell.
+    pub(crate) context_menu_fades: std::collections::HashMap<String, f32>,
+    pub(crate) context_menu_fade_pending: std::collections::HashMap<String, f32>,
+    pub(crate) context_menu_fade_active: std::collections::HashSet<String>,
+    pub(crate) context_menu_pop: f32,
     // Undo/redo history (full-document snapshots; commands/ module drives).
     pub(crate) undo_stack: Vec<Document>,
     pub(crate) redo_stack: Vec<Document>,
@@ -117,6 +125,7 @@ impl Editor {
             pending_shape: None,
             pending_ruler: None,
             pending_line: None,
+            pending_circle: None,
             pending_via_click: false,
             selection: Vec::new(),
             selected_constraints: Vec::new(),
@@ -131,6 +140,10 @@ impl Editor {
             hovered_constraint: None,
             context_menu: None,
             pending_bonds: Vec::new(),
+            context_menu_fades: std::collections::HashMap::new(),
+            context_menu_fade_pending: std::collections::HashMap::new(),
+            context_menu_fade_active: std::collections::HashSet::new(),
+            context_menu_pop: 0.0,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             gesture_snapshot: None,
@@ -152,6 +165,7 @@ impl Editor {
         self.pending_shape = None;
         self.pending_ruler = None;
         self.pending_line = None;
+        self.pending_circle = None;
         self.pending_via_click = false;
         self.selection.clear();
         self.selected_constraints.clear();
@@ -327,6 +341,41 @@ impl Editor {
                     self.pending_via_click = true;
                     true
                 }
+                Tool::Circle => {
+                    // 3-click arc: a -> b -> c (on-arc) commits.
+                    if let Some(pending) = &self.pending_circle {
+                        if pending.a.is_some() && pending.b.is_some() {
+                            let pending = self.pending_circle.take().unwrap();
+                            self.pending_via_click = false;
+                            self.snap_guides.clear();
+                            self.tool = Tool::Move;
+                            if let (Some(a), Some(b)) = (pending.a, pending.b) {
+                                let c = pending.cursor;
+                                let layer_id = self.doc.layers[0].id;
+                                let seg = self.create_arc(layer_id, a, b, c);
+                                self.selection = vec![ElementRef::Segment(seg)];
+                            }
+                            return true;
+                        }
+                    }
+                    let (at, guides) = self.snap_creation_point(self.cursor_doc(cursor));
+                    self.snap_guides = guides;
+                    match self.pending_circle.as_mut() {
+                        // Second click: fix the chord's far end.
+                        Some(p) if p.a.is_some() && p.b.is_none() => {
+                            p.b = Some(at);
+                            p.cursor = at;
+                            self.pending_via_click = true;
+                        }
+                        // First click: chord start.
+                        _ => {
+                            self.pending_circle =
+                                Some(PendingCircle { a: Some(at), b: None, cursor: at });
+                            self.pending_via_click = true;
+                        }
+                    }
+                    true
+                }
                 Tool::Move => self.move_tool_down(cursor, shift, click_count),
             }
             }
@@ -343,6 +392,13 @@ impl Editor {
         let p = self.cursor_doc(cursor);
         // Pressing the canvas dismisses constraint-chip selection.
         self.selected_constraints.clear();
+        // Arc center handles (derived, not document points): grabbing one
+        // translates the whole arc. Check before the picker so the center
+        // wins over nearby geometry.
+        if let Some(center_drag) = self.arc_center_drag(p) {
+            self.dragging = Some(center_drag);
+            return true;
+        }
         let picker = pick::Picker::new(&self.doc, &self.camera, HANDLE_TOL_PX);
         // Shift extends the selection instead of replacing it.
         self.marquee_add = shift;
@@ -398,6 +454,9 @@ impl Editor {
                     ElementRef::Point(pid) if self.selection.len() == 1 => Some(pid),
                     _ => None,
                 };
+                // ARC center handle translates whole arc — handled as a derived
+                // point in canvas_down hit-testing (see below), not here.
+                let arc_ctrl_pts: Option<Vec<PointId>> = None;
                 let ring_of = |pids: &[PointId]| -> Vec<(PointId, Point2)> {
                     let mut aux: Vec<(PointId, Point2)> = Vec::new();
                     for &pid in pids {
@@ -421,7 +480,13 @@ impl Editor {
                     }
                     aux
                 };
-                let (drag_pts, aux_pts) = if let Some(pid) = solo_point {
+                let (drag_pts, aux_pts) = if let Some(pts) = arc_ctrl_pts {
+                    let drag = pts
+                        .iter()
+                        .filter_map(|&pid| self.doc.point(pid).map(|pos| (pid, pos)))
+                        .collect();
+                    (drag, Vec::new())
+                } else if let Some(pid) = solo_point {
                     let start = self.doc.point(pid).unwrap();
                     let aux = ring_of(&[pid]);
                     (vec![(pid, start)], aux)
@@ -504,6 +569,16 @@ impl Editor {
             let (at, guides) = self.snap_creation_point(at);
             self.snap_guides = guides;
             if let Some(pending) = self.pending_line.as_mut() {
+                pending.cursor = at;
+            }
+            return true;
+        }
+
+        // Circle rubber band: cursor is the third (on-arc) point.
+        if self.pending_circle.is_some() {
+            let (at, guides) = self.snap_creation_point(self.cursor_doc(cursor));
+            self.snap_guides = guides;
+            if let Some(pending) = self.pending_circle.as_mut() {
                 pending.cursor = at;
             }
             return true;
@@ -676,6 +751,7 @@ impl Editor {
         for (id, pos) in solution.positions {
             self.doc.move_point(id, pos);
         }
+        self.doc.sync_arc_centers();
         true
     }
 
@@ -688,6 +764,44 @@ impl Editor {
                 && s.stroke_width > 0.
                 && !self.doc.all_fills().any(|(_, f)| f.segments.contains(&sid))
         })
+    }
+
+    /// If `p` is near a selected arc's circumcenter, return a drag that
+    /// moves the whole arc (all points including center).
+    fn arc_center_drag(&self, p: Point2) -> Option<DragState> {
+        let tol = HANDLE_TOL_PX / self.camera.zoom;
+        for (sid, seg) in self.doc.all_segments() {
+            if seg.kind != crate::core::document::SegmentKind::Arc {
+                continue;
+            }
+            let Some(sc) = seg.ctrl else { continue };
+            let (Some(a), Some(b), Some(c)) =
+                (self.doc.point(seg.start), self.doc.point(seg.end), self.doc.point(sc))
+            else {
+                continue;
+            };
+            let center_pos = seg
+                .center
+                .and_then(|id| self.doc.point(id))
+                .or_else(|| crate::editor::arc::circumcircle(a, b, c).map(|(o, _)| o));
+            let Some(center) = center_pos else {
+                continue;
+            };
+            if crate::editor::pick::distance(p, center) <= tol {
+                let mut ids = vec![seg.start, seg.end, sc];
+                if let Some(cid) = seg.center {
+                    ids.push(cid);
+                }
+                let pts: Vec<(PointId, Point2)> = ids
+                    .into_iter()
+                    .filter_map(|pid| self.doc.point(pid).map(|pos| (pid, pos)))
+                    .collect();
+                if pts.len() >= 3 {
+                    return Some(DragState { points: pts, aux: Vec::new(), start_cursor: p });
+                }
+            }
+        }
+        None
     }
 
     // -- dimensions (delegates to the dims subsystem) --
@@ -771,7 +885,11 @@ impl Editor {
         if self.tool == Tool::Pan {
             return CursorStyle::OpenHand;
         }
-        if self.tool == Tool::Rectangle || self.tool == Tool::Ruler || self.tool == Tool::Line {
+        if self.tool == Tool::Rectangle
+            || self.tool == Tool::Ruler
+            || self.tool == Tool::Line
+            || self.tool == Tool::Circle
+        {
             return CursorStyle::Crosshair;
         }
         CursorStyle::Arrow
@@ -967,6 +1085,35 @@ impl Editor {
         seg
     }
 
+    /// Emits a circular arc: 3 real points (a, c on-arc control, b) + a
+    /// real center point (circumcenter). No constraints, no fill.
+    pub fn create_arc(
+        &mut self,
+        layer_id: u64,
+        a: Point2,
+        b: Point2,
+        c: Point2,
+    ) -> crate::core::ids::SegmentId {
+        let p1 = self.doc.add_point(a);
+        let p2 = self.doc.add_point(b);
+        let pc = self.doc.add_point(c);
+        let center_pos = crate::editor::arc::circumcircle(a, b, c)
+            .map(|(o, _)| o)
+            .unwrap_or(Point2::new((a.x + b.x) / 2., (a.y + b.y) / 2.));
+        let p_center = self.doc.add_point(center_pos);
+        let seg = self.doc.add_arc_segment(p1, pc, p2, p_center);
+        for el in [
+            ElementRef::Point(p1),
+            ElementRef::Point(p2),
+            ElementRef::Point(pc),
+            ElementRef::Point(p_center),
+            ElementRef::Segment(seg),
+        ] {
+            self.doc.push_to_layer(layer_id, el);
+        }
+        seg
+    }
+
     /// Deletes an element from the document and clears it from selection.
     pub fn delete_element(&mut self, el: ElementRef) {
         match el {
@@ -979,7 +1126,16 @@ impl Editor {
                 let ends: Vec<PointId> = self
                     .doc
                     .segment(s)
-                    .map(|seg| vec![seg.start, seg.end])
+                    .map(|seg| {
+                        let mut v = vec![seg.start, seg.end];
+                        if let Some(c) = seg.ctrl {
+                            v.push(c);
+                        }
+                        if let Some(c) = seg.center {
+                            v.push(c);
+                        }
+                        v
+                    })
                     .unwrap_or_default();
                 self.doc.remove_segment(s);
                 for pid in ends {
@@ -1062,6 +1218,7 @@ impl Editor {
             let (vw, vh) = (self.viewport_size.0 as f32, self.viewport_size.1 as f32);
             menu.clamp_to(vw, vh);
             self.pending_bonds = pairs;
+            self.context_menu_pop = 0.0;
             self.context_menu = Some(menu);
         }
     }
@@ -1123,8 +1280,88 @@ impl Editor {
         let had = self.context_menu.take().is_some();
         if had {
             self.pending_bonds.clear();
+            self.context_menu_pop = 0.0;
+            self.context_menu_fades.clear();
+            self.context_menu_fade_pending.clear();
+            self.context_menu_fade_active.clear();
         }
         had
+    }
+
+    pub(crate) fn context_menu_fade(&self, key: &str) -> f32 {
+        self.context_menu_fades.get(key).copied().unwrap_or(0.0)
+    }
+
+    pub(crate) fn animate_context_menu_fade(
+        &mut self,
+        key: &str,
+        target: f32,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.context_menu_fade_pending.insert(key.to_string(), target);
+        if !self.context_menu_fade_active.insert(key.to_string()) {
+            return;
+        }
+        let key_owned = key.to_string();
+        let this = cx.entity().downgrade();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(12))
+                    .await;
+                let mut done = false;
+                let _ = this.update(cx, |ed, cx| {
+                    if let Some(&target) = ed.context_menu_fade_pending.get(&key_owned) {
+                        let cur = ed.context_menu_fade(&key_owned);
+                        let next = cur + (target - cur) * 0.4;
+                        if (next - target).abs() < 0.01 {
+                            ed.context_menu_fades.insert(key_owned.clone(), target);
+                            done = true;
+                        } else {
+                            ed.context_menu_fades.insert(key_owned.clone(), next);
+                        }
+                        cx.notify();
+                    } else {
+                        done = true;
+                    }
+                });
+                if !done {
+                    continue;
+                }
+                let _ = this.update(cx, |ed, _| {
+                    ed.context_menu_fade_pending.remove(&key_owned);
+                    ed.context_menu_fade_active.remove(&key_owned);
+                });
+                break;
+            }
+        })
+        .detach();
+    }
+
+    pub(crate) fn animate_context_menu_pop(
+        &mut self,
+        target: f32,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let start = self.context_menu_pop;
+        if (start - target).abs() < f32::EPSILON {
+            return;
+        }
+        let this = cx.entity().downgrade();
+        cx.spawn(async move |this, cx| {
+            let steps = 8;
+            for i in 1..=steps {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(10))
+                    .await;
+                let _ = this.update(cx, |ed, cx| {
+                    let t = i as f32 / steps as f32;
+                    ed.context_menu_pop = start + (target - start) * (1.0 - (1.0 - t).powi(3));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
     /// Re-derives session state after the document was swapped by
@@ -1144,6 +1381,7 @@ impl Editor {
         self.pending_shape = None;
         self.pending_ruler = None;
         self.pending_line = None;
+        self.pending_circle = None;
         self.pending_via_click = false;
         self.dragging = None;
         self.marquee = None;

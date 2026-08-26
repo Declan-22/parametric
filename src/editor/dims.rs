@@ -94,7 +94,9 @@ pub fn update(ed: &mut Editor) {
         };
         let mut edges: Vec<(Point2, Point2, Option<Point2>)> = Vec::new();
         for (sid, seg) in ed.doc.all_segments() {
-            if seg.kind == crate::core::document::SegmentKind::Ruler {
+            if seg.kind == crate::core::document::SegmentKind::Ruler
+                || seg.kind == crate::core::document::SegmentKind::Arc
+            {
                 continue;
             }
             let (Some(sa), Some(sb)) = (start_of(seg.start), start_of(seg.end)) else {
@@ -116,6 +118,49 @@ pub fn update(ed: &mut Editor) {
         }
         for (a, b, prefer) in dedup_collinear(edges) {
             push_line_dim(ed, a, b, prefer);
+        }
+    }
+
+    // Circle tool stage 3: true radius (center -> cursor).
+    if let Some(pc) = &ed.pending_circle
+        && let (Some(a), Some(b)) = (pc.a, pc.b)
+        && let Some((center, r)) = crate::editor::arc::circumcircle(a, b, pc.cursor)
+    {
+        ed.dim_renders.push(linear_dim(
+            &ed.doc, &ed.camera, center, pc.cursor, 0., r,
+        ));
+    }
+
+    // Arc resize: dragging ANY point of an arc (endpoints, on-arc ctrl,
+    // or center) shows its radius — so unconstrained drags, chord moves,
+    // and center drags all get feedback.
+    if let Some(drag) = &ed.dragging {
+        let dragged: std::collections::HashSet<_> =
+            drag.points.iter().map(|(id, _)| *id).collect();
+        for (_, seg) in ed.doc.all_segments() {
+            if seg.kind != crate::core::document::SegmentKind::Arc {
+                continue;
+            }
+            let is_dragged = seg.ctrl.is_some_and(|c| dragged.contains(&c))
+                || dragged.contains(&seg.start)
+                || dragged.contains(&seg.end)
+                || seg.center.is_some_and(|c| dragged.contains(&c));
+            if !is_dragged {
+                continue;
+            }
+            let (Some(a), Some(b), Some(c)) = (
+                ed.doc.point(seg.start),
+                ed.doc.point(seg.end),
+                seg.ctrl.and_then(|id| ed.doc.point(id)),
+            ) else {
+                continue;
+            };
+            if let Some((center, r)) = crate::editor::arc::circumcircle(a, b, c) {
+                // Radius dim from true center to the on-arc point.
+                ed.dim_renders.push(linear_dim(
+                    &ed.doc, &ed.camera, center, c, 0., r,
+                ));
+            }
         }
     }
 

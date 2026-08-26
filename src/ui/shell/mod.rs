@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use gpui::{App, Context, Entity, MouseButton, Point, Window, div, prelude::*, px, rgb};
+use gpui::{App, Context, Entity, MouseButton, Point, Window, div, prelude::*, px, rgb, rgba};
 
 use crate::core::geometry::Point2;
 use crate::core::constraints::ElementRef;
@@ -41,6 +41,7 @@ pub(crate) struct DesignContextMenu {
 }
 
 // In-progress inline rename of a design.
+#[derive(Clone)]
 pub(crate) struct RenameState {
     pub id: i64,
     pub value: String,
@@ -54,6 +55,7 @@ pub struct Shell {
     pub(crate) thumbs: HashMap<i64, (i64, Thumb)>,
     pub(crate) context_menu: Option<DesignContextMenu>,
     pub(crate) renaming: Option<RenameState>,
+    pub(crate) pending_delete: Option<i64>,
     // Focus handle used to capture keystrokes while renaming.
     pub(crate) rename_focus: gpui::FocusHandle,
     pub(crate) canvas_focus: gpui::FocusHandle,
@@ -67,6 +69,7 @@ pub struct Shell {
     pub(crate) active_menu: Option<usize>,
     pub(crate) menu_animation: f32,
     pub(crate) icon_animation: f32,
+    pub(crate) delete_modal_animation: f32,
     pub(crate) cursor_trail: Vec<(Point<gpui::Pixels>, Instant)>,
     pub(crate) hovered_entry: Option<usize>,
 }
@@ -89,6 +92,7 @@ impl Shell {
             thumbs: HashMap::new(),
             context_menu: None,
             renaming: None,
+            pending_delete: None,
             rename_focus: cx.focus_handle(),
             canvas_focus: cx.focus_handle(),
             caret_visible: true,
@@ -100,6 +104,7 @@ impl Shell {
             active_menu: None,
             menu_animation: 0.0,
             icon_animation: 0.0,
+            delete_modal_animation: 0.0,
             cursor_trail: Vec::new(),
             hovered_entry: None,
         }
@@ -204,6 +209,10 @@ impl Shell {
             return;
         }
         self.context_menu = None;
+        // Clear hover fades so the menu doesn't reopen pre-hovered.
+        self.fades.retain(|k, _| !k.starts_with("ctx-"));
+        self.fade_pending.retain(|k, _| !k.starts_with("ctx-"));
+        self.fade_tween_active.retain(|k| !k.starts_with("ctx-"));
         cx.notify();
     }
 
@@ -279,6 +288,56 @@ impl Shell {
         if self.renaming.take().is_some() {
             cx.notify();
         }
+    }
+
+    pub(crate) fn request_delete(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.context_menu = None;
+        // Clear stale context menu hover fades.
+        self.fades.retain(|k, _| !k.starts_with("ctx-"));
+        self.fade_pending.retain(|k, _| !k.starts_with("ctx-"));
+        self.fade_tween_active.retain(|k| !k.starts_with("ctx-"));
+        self.pending_delete = Some(id);
+        self.delete_modal_animation = 0.0;
+        self.start_delete_modal_animation(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_delete(&mut self, cx: &mut Context<Self>) {
+        if self.pending_delete.take().is_some() {
+            self.delete_modal_animation = 0.0;
+            // Clear modal button hovers.
+            self.fades.retain(|k, _| !k.starts_with("delete-"));
+            self.fade_pending.retain(|k, _| !k.starts_with("delete-"));
+            self.fade_tween_active.retain(|k| !k.starts_with("delete-"));
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn confirm_delete(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.pending_delete.take() else {
+            return;
+        };
+        self.delete_modal_animation = 0.0;
+        self.fades.retain(|k, _| !k.starts_with("delete-"));
+        self.fade_pending.retain(|k, _| !k.starts_with("delete-"));
+        self.fade_tween_active.retain(|k| !k.starts_with("delete-"));
+        if let Some(reg) = cx.try_global::<Registry>() {
+            if let Some(path) = reg.design_path(id) {
+                let _ = std::fs::remove_file(&path);
+                for ext in ["-wal", "-shm"] {
+                    let sidecar = PathBuf::from(format!("{}{ext}", path.display()));
+                    let _ = std::fs::remove_file(sidecar);
+                }
+            }
+            let _ = reg.delete_design(id);
+        }
+        self.thumbs.remove(&id);
+        // If we were viewing the deleted design, go home.
+        if self.view == View::Design(id) {
+            self.editor = None;
+            self.view = View::Home;
+        }
+        cx.notify();
     }
 
     // -- thumbnails --
@@ -568,6 +627,26 @@ impl Shell {
         })
         .detach();
     }
+
+    pub(crate) fn start_delete_modal_animation(&mut self, cx: &mut Context<Self>) {
+        self.delete_modal_animation = 0.0;
+        let this = cx.entity().downgrade();
+        cx.spawn(async move |this, cx| {
+            let steps = 8;
+            for i in 1..=steps {
+                cx.background_executor()
+                    .timer(Duration::from_millis(10))
+                    .await;
+                let _ = this.update(cx, |shell, cx| {
+                    // Ease out cubic for a soft pop.
+                    let t = i as f32 / steps as f32;
+                    shell.delete_modal_animation = 1.0 - (1.0 - t).powi(3);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
 }
 
 // Camera that fits the document's content into a viewport with padding.
@@ -737,12 +816,17 @@ impl Render for Shell {
             })
             .child(match self.view {
                 View::Home => {
+                    let designs = self.designs(cx);
                     let mut home = div()
                         .flex_1()
                         .relative()
                         .overflow_hidden()
                         .child(HomeView {
                             shell: cx.entity().downgrade(),
+                            designs,
+                            new_design_opacity: self.new_design_opacity,
+                            renaming: self.renaming.clone(),
+                            caret_visible: self.caret_visible,
                         });
                     // Click-away catcher for the context menu and the
                     // inline rename input.
@@ -771,6 +855,7 @@ impl Render for Shell {
                         home = home.child(crate::ui::home::render_context_menu(
                             &cm,
                             cx.entity().downgrade(),
+                            &*self,
                             *t,
                             cx,
                         ));
@@ -794,6 +879,152 @@ impl Render for Shell {
                         })
                         .into_any_element()
                 }
+            })
+            .when(self.pending_delete.is_some(), |root| {
+                let pending = self.pending_delete.unwrap();
+                let name = self
+                    .designs(cx)
+                    .into_iter()
+                    .find(|d| d.id == pending)
+                    .map(|d| d.name)
+                    .unwrap_or_else(|| "this design".into());
+                let anim = self.delete_modal_animation.clamp(0.0, 1.0);
+                let shell_cancel_bg = cx.entity().downgrade();
+                let shell_cancel = cx.entity().downgrade();
+                let shell_confirm = cx.entity().downgrade();
+                root.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .bg(rgba(0x00000073))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .opacity(anim)
+                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                            let _ = shell_cancel_bg.update(cx, |shell, cx| shell.cancel_delete(cx));
+                        })
+                        .child(
+                            div()
+                                .w(px(380.))
+                                .flex()
+                                .flex_col()
+                                .gap(px(14.))
+                                .p(px(20.))
+                                .bg(rgb(t.bg_darker))
+                                .border_1()
+                                .border_color(rgb(t.component_border_color))
+                                .rounded(px(12.))
+                                .shadow(vec![t.shadow_md()])
+                                .opacity(anim)
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(4.))
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                .text_color(rgb(t.text_primary))
+                                                .child("Delete design?"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(rgb(t.text_secondary))
+                                                .child(format!("\"{name}\" will be permanently deleted.")),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .justify_end()
+                                        .gap(px(8.))
+                                        .mt(px(4.))
+                                        .child({
+                                            let k = self.fade("delete-cancel");
+                                            let shell_h = shell_cancel.clone();
+                                            div()
+                                                .id("delete-cancel")
+                                                .h(px(28.))
+                                                .px(px(14.))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .rounded(px(6.))
+                                                .bg(rgb(crate::theme::lerp_rgb(
+                                                    t.bg_tertiary,
+                                                    t.bg_secondary,
+                                                    k,
+                                                )))
+                                                .border_1()
+                                                .border_color(rgb(crate::theme::lerp_rgb(
+                                                    t.component_border_color,
+                                                    t.border_color,
+                                                    k,
+                                                )))
+                                                .text_sm()
+                                                .text_color(rgb(t.text_primary))
+                                                .cursor_pointer()
+                                                .on_hover(move |hovered, _, cx| {
+                                                    let _ = shell_h.update(cx, |shell, cx| {
+                                                        shell.animate_fade(
+                                                            "delete-cancel",
+                                                            if *hovered { 1. } else { 0. },
+                                                            cx,
+                                                        )
+                                                    });
+                                                })
+                                                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                                    let _ = shell_cancel.update(cx, |shell, cx| {
+                                                        shell.cancel_delete(cx)
+                                                    });
+                                                })
+                                                .child("Cancel")
+                                        })
+                                        .child({
+                                            let k = self.fade("delete-confirm");
+                                            let shell_h = shell_confirm.clone();
+                                            div()
+                                                .id("delete-confirm")
+                                                .h(px(28.))
+                                                .px(px(14.))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .rounded(px(6.))
+                                                .bg(rgb(crate::theme::lerp_rgb(
+                                                    0xE53E3E, 0xF07070, k,
+                                                )))
+                                                .border_1()
+                                                .border_color(rgb(crate::theme::lerp_rgb(
+                                                    0xC53030, 0xE06060, k,
+                                                )))
+                                                .text_sm()
+                                                .font_weight(gpui::FontWeight::MEDIUM)
+                                                .text_color(rgb(0xFFFFFF))
+                                                .cursor_pointer()
+                                                .on_hover(move |hovered, _, cx| {
+                                                    let _ = shell_h.update(cx, |shell, cx| {
+                                                        shell.animate_fade(
+                                                            "delete-confirm",
+                                                            if *hovered { 1. } else { 0. },
+                                                            cx,
+                                                        )
+                                                    });
+                                                })
+                                                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                                    let _ = shell_confirm.update(cx, |shell, cx| {
+                                                        shell.confirm_delete(cx)
+                                                    });
+                                                })
+                                                .child("Delete")
+                                        }),
+                                ),
+                        ),
+                )
             })
             .when(self.menu_open, |d| {
                 let shell = cx.entity().downgrade();

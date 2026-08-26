@@ -100,6 +100,12 @@ impl Registry {
         Ok(())
     }
 
+    pub fn delete_design(&self, id: i64) -> rusqlite::Result<()> {
+        self.conn
+            .execute("DELETE FROM designs WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
     pub fn design_path(&self, id: i64) -> Option<PathBuf> {
         self.conn
             .query_row(

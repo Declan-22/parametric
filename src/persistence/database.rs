@@ -5,7 +5,7 @@ use crate::core::document::{Document, Layer, SegmentKind};
 use crate::core::geometry::Point2;
 use crate::core::ids::{FillId, PointId, SegmentId};
 
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 6;
 
 pub struct Database {
     conn: Connection,
@@ -39,7 +39,7 @@ impl Database {
         )?;
         // v3 was a full break from the shape-based model; v4 added segment
         // stroke widths. Old databases don't migrate — dropped and rebuilt.
-        if self.schema_version()? < 4 {
+        if self.schema_version()? < 6 {
             self.conn.execute_batch(
                 "DROP TABLE IF EXISTS shapes;
                  DROP TABLE IF EXISTS constraints;
@@ -74,7 +74,11 @@ impl Database {
                 start_gen INTEGER NOT NULL,
                 end_idx INTEGER NOT NULL,
                 end_gen INTEGER NOT NULL,
-                stroke_width REAL NOT NULL DEFAULT 0
+                stroke_width REAL NOT NULL DEFAULT 0,
+                ctrl_idx INTEGER,
+                ctrl_gen INTEGER,
+                center_idx INTEGER,
+                center_gen INTEGER
             );
             CREATE TABLE IF NOT EXISTS fills (
                 idx INTEGER PRIMARY KEY,
@@ -163,10 +167,19 @@ impl Database {
                 let kind = match s.kind {
                     SegmentKind::Line => "line",
                     SegmentKind::Ruler => "ruler",
+                    SegmentKind::Arc => "arc",
+                };
+                let (ctrl_idx, ctrl_gen) = match s.ctrl {
+                    Some(c) => (Some(c.idx as i64), Some(c.generation as i64)),
+                    None => (None, None),
+                };
+                let (center_idx, center_gen) = match s.center {
+                    Some(c) => (Some(c.idx as i64), Some(c.generation as i64)),
+                    None => (None, None),
                 };
                 self.conn.execute(
-                    "INSERT INTO segments(idx, generation, kind, start_idx, start_gen, end_idx, end_gen, stroke_width)
-                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    "INSERT INTO segments(idx, generation, kind, start_idx, start_gen, end_idx, end_gen, stroke_width, ctrl_idx, ctrl_gen, center_idx, center_gen)
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     rusqlite::params![
                         sid.idx as i64,
                         sid.generation as i64,
@@ -175,7 +188,11 @@ impl Database {
                         s.start.generation as i64,
                         s.end.idx as i64,
                         s.end.generation as i64,
-                        s.stroke_width
+                        s.stroke_width,
+                        ctrl_idx,
+                        ctrl_gen,
+                        center_idx,
+                        center_gen
                     ],
                 )?;
             }
@@ -276,7 +293,7 @@ impl Database {
         drop(stmt);
 
         let mut stmt = self.conn.prepare(
-            "SELECT idx, generation, kind, start_idx, start_gen, end_idx, end_gen, stroke_width
+            "SELECT idx, generation, kind, start_idx, start_gen, end_idx, end_gen, stroke_width, ctrl_idx, ctrl_gen, center_idx, center_gen
              FROM segments ORDER BY idx",
         )?;
         let mut rows = stmt.query([])?;
@@ -285,7 +302,24 @@ impl Database {
             let kind = match kind_raw.as_str() {
                 "line" => SegmentKind::Line,
                 "ruler" => SegmentKind::Ruler,
+                "arc" => SegmentKind::Arc,
                 _ => continue,
+            };
+            let ctrl = {
+                let idx: Option<i64> = row.get(8).ok().flatten();
+                let generation: Option<i64> = row.get(9).ok().flatten();
+                match (idx, generation) {
+                    (Some(i), Some(g)) => Some(PointId { idx: i as u32, generation: g as u32 }),
+                    _ => None,
+                }
+            };
+            let center = {
+                let idx: Option<i64> = row.get(10).ok().flatten();
+                let generation: Option<i64> = row.get(11).ok().flatten();
+                match (idx, generation) {
+                    (Some(i), Some(g)) => Some(PointId { idx: i as u32, generation: g as u32 }),
+                    _ => None,
+                }
             };
             insert_segment_raw(
                 &mut doc,
@@ -303,6 +337,8 @@ impl Database {
                 },
                 kind,
                 row.get::<_, f64>(7).unwrap_or(0.),
+                ctrl,
+                center,
             );
         }
         drop(rows);
@@ -436,8 +472,10 @@ fn insert_segment_raw(
     end: PointId,
     kind: SegmentKind,
     stroke_width: f64,
+    ctrl: Option<PointId>,
+    center: Option<PointId>,
 ) {
-    doc.insert_segment_with_id(id, start, end, kind, stroke_width);
+    doc.insert_segment_with_id(id, start, end, kind, stroke_width, ctrl, center);
 }
 
 fn insert_fills_raw(doc: &mut Document, fills: Vec<(u32, u32, Vec<SegmentId>)>) {

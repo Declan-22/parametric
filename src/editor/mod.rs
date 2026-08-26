@@ -72,6 +72,10 @@ pub struct Editor {
     pub constraint_markers: Vec<dims::ConstraintMarker>,
     // Chip currently under the cursor (hit-tested in screen px).
     pub hovered_constraint: Option<String>,
+    // Pending snap-bond choice menu: points ended on top of other points.
+    pub context_menu: Option<crate::ui::canvas::context_menu::ContextMenu>,
+    // Pairs awaiting the user's bond choice while the menu is open.
+    pub pending_bonds: Vec<(PointId, PointId)>,
     // Last known cursor + modifier state so changes can re-derive drags.
     pub last_cursor: Option<gpui::Point<gpui::Pixels>>,
     // Last known canvas size in px, for viewport-culled snapping.
@@ -121,6 +125,8 @@ impl Editor {
             dim_renders: Vec::new(),
             constraint_markers: Vec::new(),
             hovered_constraint: None,
+            context_menu: None,
+            pending_bonds: Vec::new(),
             last_cursor: None,
             viewport_size: (0., 0.),
             shift: false,
@@ -142,6 +148,8 @@ impl Editor {
         self.pending_via_click = false;
         self.selection.clear();
         self.selected_constraints.clear();
+        self.context_menu = None;
+        self.pending_bonds = Vec::new();
         self.marquee = None;
         self.group_drag_last = None;
         self.dragging = None;
@@ -197,6 +205,10 @@ impl Editor {
         shift: bool,
         click_count: usize,
     ) -> bool {
+        // Any click dismisses the pending bond-choice menu first.
+        if self.context_menu.take().is_some() {
+            return true;
+        }
         match button {
             gpui::MouseButton::Middle => {
                 self.begin_pan(cursor);
@@ -533,6 +545,18 @@ impl Editor {
             }
             i += 1;
         }
+        // Points CO-LOCATED with a dragged point's start (e.g. a partner
+        // whose coincident constraint was just deleted) must not be snap
+        // targets either — otherwise the point can never be pulled away.
+        let tol = self.snap_tol_doc();
+        let starts: Vec<Point2> = drag.points.iter().map(|&(_, s)| s).collect();
+        for (pid, p) in self.doc.all_points() {
+            if !exclude.contains(&pid)
+                && starts.iter().any(|s| pick::distance(*s, p) <= tol)
+            {
+                exclude.push(pid);
+            }
+        }
 
         // Single-endpoint drags of STANDALONE lines only snap when the
         // endpoint truly lands on another point — a passing axis alignment
@@ -686,7 +710,7 @@ impl Editor {
         // a Coincident constraint glues the pair (solver-enforced, shown as
         // a deletable chip).
         if self.dragging.is_some() {
-            self.bond_snapped_points();
+            self.queue_bond_menu();
         }
         // Panning ends on release of EITHER panning button — a stuck
         // pan_start made the camera chase the cursor forever.
@@ -908,35 +932,121 @@ impl Editor {
         self.selection.retain(|&e| e != el);
     }
 
-    // True when the element itself, or anything SELECTED that contains it,
-    /// Bonds dragged points that ended on top of other points with
-    /// Coincident constraints (endpoint-to-endpoint only).
-    fn bond_snapped_points(&mut self) {
+    /// Queues the bond-choice context menu for points dropped onto points.
+    fn queue_bond_menu(&mut self) {
         let tol = self.snap_tol_doc();
         let Some(drag) = &self.dragging else { return };
         let dragged: Vec<PointId> =
             drag.points.iter().chain(drag.aux.iter()).map(|&(id, _)| id).collect();
-        let mut bonds: Vec<(PointId, PointId)> = Vec::new();
+        let mut pairs: Vec<(PointId, PointId)> = Vec::new();
         for &pid in &dragged {
             let Some(p) = self.doc.point(pid) else { continue };
             for (qid, q) in self.doc.all_points() {
                 if qid == pid || dragged.contains(&qid) {
                     continue;
                 }
-                if pick::distance(p, q) <= tol {
-                    // Skip pairs already glued in either order.
-                    if !self.doc.constraints.iter().any(|c| {
+                if pick::distance(p, q) > tol {
+                    continue;
+                }
+                // Skip pairs already glued in either order or queued twice.
+                if pairs.contains(&(pid, qid))
+                    || pairs.contains(&(qid, pid))
+                    || self.doc.constraints.iter().any(|c| {
                         c.kind == ConstraintKind::Coincident
                             && ((c.a == pid && c.b == qid) || (c.a == qid && c.b == pid))
-                    }) {
-                        bonds.push((pid, qid));
-                    }
+                    })
+                {
+                    continue;
                 }
+                pairs.push((pid, qid));
             }
         }
-        for (a, b) in bonds {
-            self.doc.add_constraint(ConstraintKind::Coincident, a, b);
+        if pairs.is_empty() {
+            return;
         }
+        // Anchor beside the first junction, then clamp on screen.
+        if let Some(p) = self.doc.point(pairs[0].0) {
+            use crate::ui::canvas::context_menu::{ContextMenu, ContextAction, ContextMenuEntry,
+                ICON_COINCIDENT, ICON_MERGE_POINTS};
+            let s = self.camera.unit_to_screen(p);
+            let mut menu = ContextMenu {
+                x: s.x as f32 + 16.,
+                y: s.y as f32 - 8.,
+                entries: vec![
+                    ContextMenuEntry {
+                        icon: ICON_COINCIDENT,
+                        label: "Coincident",
+                        shortcut: "1",
+                        action: ContextAction::BondCoincident,
+                    },
+                    ContextMenuEntry {
+                        icon: ICON_MERGE_POINTS,
+                        label: "Merge Points",
+                        shortcut: "2",
+                        action: ContextAction::BondMerge,
+                    },
+                ],
+            };
+            let (vw, vh) = (self.viewport_size.0 as f32, self.viewport_size.1 as f32);
+            menu.clamp_to(vw, vh);
+            self.pending_bonds = pairs;
+            self.context_menu = Some(menu);
+        }
+    }
+
+    /// Applies the bond choice to every pending pair.
+    fn apply_bond_choice(&mut self, combine: bool) -> bool {
+        if self.pending_bonds.is_empty() {
+            return false;
+        }
+        self.context_menu = None;
+        let pairs = std::mem::take(&mut self.pending_bonds);
+        for (a, b) in pairs {
+            if combine {
+                self.doc.merge_point(a, b);
+            } else {
+                self.doc.add_constraint(ConstraintKind::Coincident, a, b);
+            }
+        }
+        self.selection.retain(|el| match *el {
+            ElementRef::Point(p) => self.doc.point(p).is_some(),
+            ElementRef::Segment(s) => self.doc.segment(s).is_some(),
+            _ => true,
+        });
+        true
+    }
+
+    /// Applies a context menu entry's action. Returns whether anything
+    /// changed.
+    pub fn apply_context_action(
+        &mut self,
+        action: crate::ui::canvas::context_menu::ContextAction,
+    ) -> bool {
+        use crate::ui::canvas::context_menu::ContextAction;
+        match action {
+            ContextAction::BondCoincident => self.apply_bond_choice(false),
+            ContextAction::BondMerge => self.apply_bond_choice(true),
+        }
+    }
+
+    /// Triggers the Nth context menu entry (keyboard shortcuts).
+    pub fn trigger_context_shortcut(&mut self, index: usize) -> bool {
+        let Some(menu) = &self.context_menu else {
+            return false;
+        };
+        let Some(entry) = menu.entries.get(index).map(|e| e.action) else {
+            return false;
+        };
+        self.apply_context_action(entry)
+    }
+
+    /// Closes the context menu without applying anything.
+    pub fn dismiss_context_menu(&mut self) -> bool {
+        let had = self.context_menu.take().is_some();
+        if had {
+            self.pending_bonds.clear();
+        }
+        had
     }
 
     // True when the element itself, or anything SELECTED that contains it,

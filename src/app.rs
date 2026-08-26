@@ -56,6 +56,10 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-c", Copy, None),
         KeyBinding::new("ctrl-v", Paste, None),
         KeyBinding::new("delete", DeleteSelection, None),
+        // Snap-bond choice menu quick keys.
+        KeyBinding::new("1", BondCoincident, None),
+        KeyBinding::new("2", BondCombinePoints, None),
+        KeyBinding::new("escape", BondDismiss, None),
     ]);
 }
 

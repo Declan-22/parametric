@@ -19,6 +19,10 @@ actions!(
         Paste,
         DeleteSelection,
         SelectAll,
+        // Snap-bond choice menu (points dropped onto points)
+        BondCoincident,
+        BondCombinePoints,
+        BondDismiss,
         // View
         ZoomIn,
         ZoomOut,

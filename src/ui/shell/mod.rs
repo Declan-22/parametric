@@ -611,6 +611,30 @@ impl Render for Shell {
             .on_action(cx.listener(|shell, _: &crate::ui::actions::DeleteSelection, _, cx| {
                 shell.delete_selection(cx);
             }))
+            .on_action(cx.listener(|shell, _: &crate::ui::actions::BondCoincident, _, cx| {
+                if let Some(ed) = shell.editor.as_ref() {
+                    let _ = ed.update(cx, |ed, _| ed.trigger_context_shortcut(0));
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(
+                |shell, _: &crate::ui::actions::BondCombinePoints, _, cx| {
+                    let Some(ed) = shell.editor.as_ref() else {
+                        return;
+                    };
+                    let changed = ed.update(cx, |ed, _| ed.trigger_context_shortcut(1));
+                    if changed {
+                        shell.invalidate_thumbs_all();
+                    }
+                    cx.notify();
+                },
+            ))
+            .on_action(cx.listener(|shell, _: &crate::ui::actions::BondDismiss, _, cx| {
+                if let Some(ed) = shell.editor.as_ref() {
+                    let _ = ed.update(cx, |ed, _| ed.dismiss_context_menu());
+                    cx.notify();
+                }
+            }))
             .on_key_down(move |e: &gpui::KeyDownEvent, _, cx| {
                 // Only capture keys while the inline rename input is active.
                 if shell_keys.upgrade().and_then(|s| Some(s.read(cx).renaming.is_some())) != Some(true) {

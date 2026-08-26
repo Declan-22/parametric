@@ -385,6 +385,46 @@ impl Document {
         }
     }
 
+    /// Fuses `drop` into `keep`: every reference to `drop` (segments,
+    /// constraints, dimensions, layer listings) is rewritten to `keep`,
+    /// then `drop` is deleted. Degenerate self-referential constraints and
+    /// dimensions are dropped.
+    pub fn merge_point(&mut self, keep: PointId, drop: PointId) {
+        if keep == drop || self.point(drop).is_none() {
+            return;
+        }
+        for slot in &mut self.segments.slots {
+            if let Some(s) = &mut slot.value {
+                if s.start == drop {
+                    s.start = keep;
+                }
+                if s.end == drop {
+                    s.end = keep;
+                }
+            }
+        }
+        for c in &mut self.constraints {
+            if c.a == drop {
+                c.a = keep;
+            }
+            if c.b == drop {
+                c.b = keep;
+            }
+        }
+        for d in &mut self.dimensions {
+            if d.a == drop {
+                d.a = keep;
+            }
+            if d.b == drop {
+                d.b = keep;
+            }
+        }
+        self.constraints.retain(|c| c.a != c.b);
+        self.dimensions.retain(|d| d.a != d.b);
+        self.detach_from_layers(ElementRef::Point(drop));
+        self.points.remove(drop.idx);
+    }
+
     pub fn add_dimension(&mut self, dim: Dimension) {
         self.dimensions.push(dim);
     }

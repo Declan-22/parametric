@@ -1,12 +1,13 @@
 use gpui::{
     App, Bounds, HitboxBehavior, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, RenderOnce, ScrollDelta, ScrollWheelEvent, Size, Window, canvas,
-    div, fill, prelude::*, px, rgb,
+    MouseUpEvent, Pixels, Point, RenderOnce, ScrollDelta, ScrollWheelEvent, Size,
+    Window, canvas, div, fill, prelude::*, px, rgb,
 };
 
 use crate::editor::Editor;
 use crate::ui::shell::title_bar::TITLE_BAR_HEIGHT;
 
+pub mod context_menu;
 pub mod paint;
 
 // Canvas view: renders the document through the editor camera and owns the
@@ -59,19 +60,27 @@ impl RenderOnce for CanvasView {
             .on_mouse_down(MouseButton::Left, move |e: &MouseDownEvent, window, cx| {
                 window.focus(&focus_l, cx);
                 let _ = editor_down_l.update(cx, |ed, cx| {
-                    if ed.canvas_down(MouseButton::Left, e.position, e.modifiers.shift, e.click_count) {
+                    if ed.canvas_down(
+                        MouseButton::Left,
+                        e.position,
+                        e.modifiers.shift,
+                        e.click_count,
+                    ) {
                         cx.notify();
                     }
                 });
             })
-            .on_mouse_down(MouseButton::Middle, move |e: &MouseDownEvent, window, cx| {
-                window.focus(&focus_m, cx);
-                let _ = editor_down_m.update(cx, |ed, cx| {
-                    if ed.canvas_down(MouseButton::Middle, e.position, false, 1) {
-                        cx.notify();
-                    }
-                });
-            })
+            .on_mouse_down(
+                MouseButton::Middle,
+                move |e: &MouseDownEvent, window, cx| {
+                    window.focus(&focus_m, cx);
+                    let _ = editor_down_m.update(cx, |ed, cx| {
+                        if ed.canvas_down(MouseButton::Middle, e.position, false, 1) {
+                            cx.notify();
+                        }
+                    });
+                },
+            )
             .on_mouse_move(move |e: &MouseMoveEvent, _, cx| {
                 let shift = e.modifiers.shift;
                 let _ = editor_move.update(cx, |ed, cx| {
@@ -115,6 +124,11 @@ impl RenderOnce for CanvasView {
             })
             .child(self.paint_layer())
             .child(self.dimension_layer())
+            .children(context_menu::draw(
+                self.editor.clone(),
+                self.shell.clone(),
+                cx,
+            ))
     }
 }
 
@@ -149,10 +163,7 @@ impl CanvasView {
         };
 
         let paint_labels =
-            move |_: Bounds<Pixels>,
-                  labels: Vec<LabelPrim>,
-                  window: &mut Window,
-                  cx: &mut App| {
+            move |_: Bounds<Pixels>, labels: Vec<LabelPrim>, window: &mut Window, cx: &mut App| {
                 for l in labels {
                     const PAD_X: f32 = 6.;
                     const BORDER: f32 = 4.;
@@ -176,7 +187,10 @@ impl CanvasView {
                                 x: px(l.center_x - box_w / 2.),
                                 y: px(l.center_y - BOX_H / 2.),
                             },
-                            size: Size { width: px(box_w), height: px(BOX_H) },
+                            size: Size {
+                                width: px(box_w),
+                                height: px(BOX_H),
+                            },
                         },
                         px(6.),
                         l.bg,
@@ -229,7 +243,12 @@ fn make_label(
     let line = window
         .text_system()
         .shape_line(text.into(), font_size, &runs, None);
-    LabelPrim { line, center_x, center_y, bg }
+    LabelPrim {
+        line,
+        center_x,
+        center_y,
+        bg,
+    }
 }
 
 fn font_size_px() -> gpui::Pixels {
@@ -273,11 +292,8 @@ impl CanvasView {
             let ed = editor.read(cx);
             let t = *crate::theme::active(cx);
             let pending = ed.pending_shape.map(|p| p.bounds());
-            let pending_ruler = ed
-                .pending_ruler
-                .map(|p| p.snapped(ed.shift));
-            let pending_line =
-                ed.pending_line.map(|p| p.snapped(ed.shift));
+            let pending_ruler = ed.pending_ruler.map(|p| p.snapped(ed.shift));
+            let pending_line = ed.pending_line.map(|p| p.snapped(ed.shift));
             let list = paint::build_draw_list(
                 &ed.doc,
                 &ed.camera,
@@ -311,7 +327,10 @@ impl CanvasView {
                         window.paint_quad(fill(
                             Bounds {
                                 origin: Point { x: px(x), y: px(y) },
-                                size: Size { width: px(w), height: px(h) },
+                                size: Size {
+                                    width: px(w),
+                                    height: px(h),
+                                },
                             },
                             color,
                         ));
@@ -328,7 +347,14 @@ impl CanvasView {
                         path.line_to(to_px(points[0]));
                         window.paint_path(path, color);
                     }
-                    paint::Primitive::Line { ax, ay, bx, by, width, color } => {
+                    paint::Primitive::Line {
+                        ax,
+                        ay,
+                        bx,
+                        by,
+                        width,
+                        color,
+                    } => {
                         // Thin filled quad along the segment.
                         let dx = bx - ax;
                         let dy = by - ay;
@@ -342,17 +368,32 @@ impl CanvasView {
                             x: px(ax + nx),
                             y: px(ay + ny),
                         });
-                        path.line_to(Point { x: px(bx + nx), y: px(by + ny) });
-                        path.line_to(Point { x: px(bx - nx), y: px(by - ny) });
-                        path.line_to(Point { x: px(ax - nx), y: px(ay - ny) });
-                        path.line_to(Point { x: px(ax + nx), y: px(ay + ny) });
+                        path.line_to(Point {
+                            x: px(bx + nx),
+                            y: px(by + ny),
+                        });
+                        path.line_to(Point {
+                            x: px(bx - nx),
+                            y: px(by - ny),
+                        });
+                        path.line_to(Point {
+                            x: px(ax - nx),
+                            y: px(ay - ny),
+                        });
+                        path.line_to(Point {
+                            x: px(ax + nx),
+                            y: px(ay + ny),
+                        });
                         window.paint_path(path, color);
                     }
                     paint::Primitive::Outline { x, y, w, h } => {
                         window.paint_quad(gpui::quad(
                             Bounds {
                                 origin: Point { x: px(x), y: px(y) },
-                                size: Size { width: px(w), height: px(h) },
+                                size: Size {
+                                    width: px(w),
+                                    height: px(h),
+                                },
                             },
                             0.,
                             gpui::transparent_black(),
@@ -361,12 +402,22 @@ impl CanvasView {
                             gpui::BorderStyle::Solid,
                         ));
                     }
-                    paint::Primitive::Circle { cx: mcx, cy: mcy, radius } => {
+                    paint::Primitive::Circle {
+                        cx: mcx,
+                        cy: mcy,
+                        radius,
+                    } => {
                         let r = px(radius);
                         window.paint_quad(gpui::quad(
                             Bounds {
-                                origin: Point { x: px(mcx) - r, y: px(mcy) - r },
-                                size: Size { width: r * 2., height: r * 2. },
+                                origin: Point {
+                                    x: px(mcx) - r,
+                                    y: px(mcy) - r,
+                                },
+                                size: Size {
+                                    width: r * 2.,
+                                    height: r * 2.,
+                                },
                             },
                             r,
                             rgb(0xFFFFFF),
@@ -375,11 +426,22 @@ impl CanvasView {
                             gpui::BorderStyle::Solid,
                         ));
                     }
-                    paint::Primitive::Chip { x, y, size, bg, border, icon, kind } => {
+                    paint::Primitive::Chip {
+                        x,
+                        y,
+                        size,
+                        bg,
+                        border,
+                        icon,
+                        kind,
+                    } => {
                         window.paint_quad(gpui::quad(
                             Bounds {
                                 origin: Point { x: px(x), y: px(y) },
-                                size: Size { width: px(size), height: px(size) },
+                                size: Size {
+                                    width: px(size),
+                                    height: px(size),
+                                },
                             },
                             px(6.),
                             bg.unwrap_or(gpui::transparent_black().into()),
@@ -404,10 +466,22 @@ impl CanvasView {
                                 x: px(ax + nx),
                                 y: px(ay + ny),
                             });
-                            path.line_to(Point { x: px(bx + nx), y: px(by + ny) });
-                            path.line_to(Point { x: px(bx - nx), y: px(by - ny) });
-                            path.line_to(Point { x: px(ax - nx), y: px(ay - ny) });
-                            path.line_to(Point { x: px(ax + nx), y: px(ay + ny) });
+                            path.line_to(Point {
+                                x: px(bx + nx),
+                                y: px(by + ny),
+                            });
+                            path.line_to(Point {
+                                x: px(bx - nx),
+                                y: px(by - ny),
+                            });
+                            path.line_to(Point {
+                                x: px(ax - nx),
+                                y: px(ay - ny),
+                            });
+                            path.line_to(Point {
+                                x: px(ax + nx),
+                                y: px(ay + ny),
+                            });
                             window.paint_path(path, icon);
                         };
                         match kind {
@@ -435,8 +509,14 @@ impl CanvasView {
                                     let r = 1.1;
                                     window.paint_quad(gpui::quad(
                                         Bounds {
-                                            origin: Point { x: px(dx - r), y: px(dy - r) },
-                                            size: Size { width: px(r * 2.), height: px(r * 2.) },
+                                            origin: Point {
+                                                x: px(dx - r),
+                                                y: px(dy - r),
+                                            },
+                                            size: Size {
+                                                width: px(r * 2.),
+                                                height: px(r * 2.),
+                                            },
                                         },
                                         px(r),
                                         icon,
@@ -450,7 +530,12 @@ impl CanvasView {
                             }
                         }
                     }
-                    paint::Primitive::RulerLabel { center_x, anchor_y, px_value, in_value } => {
+                    paint::Primitive::RulerLabel {
+                        center_x,
+                        anchor_y,
+                        px_value,
+                        in_value,
+                    } => {
                         // Two-row vector label centered on the inch tick,
                         // sitting entirely BEYOND the tick tips: pixels row
                         // on top (nearest the dashes), inches below it.
@@ -491,16 +576,17 @@ impl CanvasView {
                                     strikethrough: None,
                                 },
                             ];
-                            let line = window.text_system().shape_line(
-                                text.into(),
-                                px(SIZE),
-                                &runs,
-                                None,
-                            );
+                            let line =
+                                window
+                                    .text_system()
+                                    .shape_line(text.into(), px(SIZE), &runs, None);
                             // Center on the tick.
                             let origin_x = center_x - line.width.as_f32() / 2.;
                             let _ = line.paint(
-                                Point { x: px(origin_x), y: px(top_y) },
+                                Point {
+                                    x: px(origin_x),
+                                    y: px(top_y),
+                                },
                                 px(SIZE),
                                 gpui::TextAlign::Left,
                                 None,
@@ -513,20 +599,9 @@ impl CanvasView {
             }
         };
 
-        canvas(prepaint, paint)
-            .absolute()
-            .inset_0()
-            .size_full()
+        canvas(prepaint, paint).absolute().inset_0().size_full()
     }
 }
 
 // Layout offset where the canvas starts below the title bar (for overlays).
 pub const CANVAS_TOP_INSET: Pixels = px(TITLE_BAR_HEIGHT);
-
-
-
-
-
-
-
-

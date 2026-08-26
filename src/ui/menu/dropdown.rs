@@ -39,9 +39,7 @@ impl RenderOnce for AppMenu {
             .children(
                 self.active
                     .and_then(|i| menus.get(i).map(|menu| (i, menu)))
-                    .map(|(i, menu)| {
-                        render_submenu(i, menu, t, opacity, self.shell.clone(), cx)
-                    }),
+                    .map(|(i, menu)| render_submenu(i, menu, t, opacity, self.shell.clone(), cx)),
             )
     }
 }
@@ -116,11 +114,7 @@ impl AppMenu {
                 let fade_target = if *hovered { 1.0 } else { 0.0 };
                 let mut suppressed = false;
                 let _ = shell.update(cx, |shell, cx| {
-                    shell.animate_fade(
-                        &format!("menu-entry-{index}"),
-                        fade_target,
-                        cx,
-                    );
+                    shell.animate_fade(&format!("menu-entry-{index}"), fade_target, cx);
                     shell.record_cursor(cursor);
                     shell.hovered_entry = if *hovered {
                         Some(index)
@@ -292,7 +286,7 @@ fn render_item(
                         .pl(px(24.))
                         .text_xs()
                         .font_family(crate::theme::FONT_UI)
-                        .text_color(rgb(t.empty_text_secondary))
+                        .text_color(rgb(t.empty_text_primary))
                         .child(shortcut)
                 }))
                 .into_any_element()
@@ -381,6 +375,3 @@ fn point_in_triangle(
     const TOL: f32 = 0.04;
     l1 >= -TOL && l2 >= -TOL && l3 >= -TOL
 }
-
-
-

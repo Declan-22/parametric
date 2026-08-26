@@ -193,7 +193,7 @@ impl Editor {
     /// Snaps a free point (shape-tool placement) to the best target.
     fn snap_point(&self, p: Point2) -> (Point2, Vec<SnapGuide>) {
         let (adj, guides) =
-            snapping::best(&self.doc, self.snap_tol_doc(), p, &[], false, false, self.snap_visible());
+            snapping::best(&self.doc, self.snap_tol_doc(), p, &[], &[], false, false, self.snap_visible());
         (Point2::new(p.x + adj.x, p.y + adj.y), guides)
     }
 
@@ -506,19 +506,36 @@ impl Editor {
             return false;
         }
 
-        // Snap exclusion: everything belonging to the dragged system —
-        // dragged points, aux followers, and any point of the selected
-        // objects. Snapping is for OTHER objects only; snapping to the
-        // shape you're resizing is what made corner drags feel jumpy.
-        let mut exclude: Vec<PointId> = drag.points.iter().map(|(id, _)| *id).collect();
+        // Snap exclusion, two flavors:
+        //  - exclude_pts: everything belonging to the dragged system
+        //    (transitively connected) plus points co-located with a drag
+        //    start. Endpoint/midpoint targets from this set are DEAD — you
+        //    never relocate onto your own geometry.
+        //  - exclude_segs: only the actually-dragged segments. Edge-span
+        //    ALIGNMENTS from the rest of the component remain live, so a
+        //    fully-connected drawing still snaps to axis alignments.
+        let mut exclude_pts: Vec<PointId> = drag.points.iter().map(|(id, _)| *id).collect();
+        let mut exclude_segs: Vec<crate::core::ids::SegmentId> = Vec::new();
         for &(pid, _) in &drag.aux {
-            if !exclude.contains(&pid) {
-                exclude.push(pid);
+            if !exclude_pts.contains(&pid) {
+                exclude_pts.push(pid);
             }
         }
-        for pid in self.doc.selection_points(&self.selection) {
-            if !exclude.contains(&pid) {
-                exclude.push(pid);
+        let selected_pt_ids = self.doc.selection_points(&self.selection);
+        for pid in &selected_pt_ids {
+            if !exclude_pts.contains(pid) {
+                exclude_pts.push(*pid);
+            }
+        }
+        // Segments with BOTH ends in the dragged set are the ones being
+        // manipulated; their spans are dead.
+        for (sid, s) in self.doc.all_segments() {
+            if exclude_pts.contains(&s.start)
+                && exclude_pts.contains(&s.end)
+                && (drag.points.iter().chain(drag.aux.iter()).any(|&(id, _)| id == s.start))
+                && (selected_pt_ids.contains(&s.start) || selected_pt_ids.contains(&s.end))
+            {
+                exclude_segs.push(sid);
             }
         }
         // Transitive closure along segments: every point REACHABLE from the
@@ -526,8 +543,8 @@ impl Editor {
         // selected rectangle must never snap back onto its own unselected
         // far corner — NOTHING ever snaps to its own geometry.
         let mut i = 0;
-        while i < exclude.len() {
-            let pid = exclude[i];
+        while i < exclude_pts.len() {
+            let pid = exclude_pts[i];
             for (_, s) in self.doc.all_segments() {
                 let other = if s.start == pid {
                     Some(s.end)
@@ -537,10 +554,10 @@ impl Editor {
                     None
                 };
                 if let Some(o) = other
-                    && !exclude.contains(&o)
+                    && !exclude_pts.contains(&o)
                     && self.doc.point(o).is_some()
                 {
-                    exclude.push(o);
+                    exclude_pts.push(o);
                 }
             }
             i += 1;
@@ -551,10 +568,10 @@ impl Editor {
         let tol = self.snap_tol_doc();
         let starts: Vec<Point2> = drag.points.iter().map(|&(_, s)| s).collect();
         for (pid, p) in self.doc.all_points() {
-            if !exclude.contains(&pid)
+            if !exclude_pts.contains(&pid)
                 && starts.iter().any(|s| pick::distance(*s, p) <= tol)
             {
-                exclude.push(pid);
+                exclude_pts.push(pid);
             }
         }
 
@@ -581,7 +598,8 @@ impl Editor {
                     &self.doc,
                     self.snap_tol_doc(),
                     target,
-                    &exclude,
+                    &exclude_pts,
+                    &exclude_segs,
                     endpoints_only,
                     false,
                     self.snap_visible(),

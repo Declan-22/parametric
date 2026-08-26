@@ -92,8 +92,8 @@ pub fn update(ed: &mut Editor) {
                 .map(|&(_, s)| s)
                 .or_else(|| ed.doc.point(pid))
         };
-        let mut edges: Vec<(Point2, Point2)> = Vec::new();
-        for (_, seg) in ed.doc.all_segments() {
+        let mut edges: Vec<(Point2, Point2, Option<Point2>)> = Vec::new();
+        for (sid, seg) in ed.doc.all_segments() {
             if seg.kind == crate::core::document::SegmentKind::Ruler {
                 continue;
             }
@@ -109,18 +109,20 @@ pub fn update(ed: &mut Editor) {
             // resizes light up dims. Constrained corners that are pinned
             // by their neighbors jitter by tiny amounts under projection.
             if (pick::distance(sa, sb) - pick::distance(ca, cb)).abs() > 0.5 {
-                edges.push((ca, cb));
+                let prefer = edge_outward_normal(ed, sid)
+                    .or_else(|| partner_vote_normal(ed, sid));
+                edges.push((ca, cb, prefer));
             }
         }
-        for (a, b) in dedup_collinear(edges) {
-            push_line_dim(ed, a, b);
+        for (a, b, prefer) in dedup_collinear(edges) {
+            push_line_dim(ed, a, b, prefer);
         }
     }
 
     // Live line preview: slanted length dim while drawing.
     if let Some(p) = &ed.pending_line {
         let (_, b) = p.snapped(ed.shift);
-        push_line_dim(ed, p.start, b);
+        push_line_dim(ed, p.start, b, None);
     }
 
     // Live preview: bounding box W/H while creating or interacting.
@@ -301,23 +303,36 @@ fn selection_is_ruler(ed: &Editor) -> bool {
 }
 
 // Slanted length dim for a line/edge: runs parallel to the edge at full
-// length. Offset side is chosen by DOMINANT AXIS so it never flips on
-// near-90-degree jitter: vertical-ish edges put the dim on the RIGHT,
-// horizontal-ish edges put it BELOW.
-fn push_line_dim(ed: &mut Editor, a: Point2, b: Point2) {
+// length. Side selection, in priority order:
+//  1. `prefer` normal (screen space) — outward of a fill or away from
+//     connected partners;
+//  2. otherwise DOMINANT AXIS so lone lines never flip on near-90-degree
+//     jitter (vertical-ish edges -> RIGHT, horizontal-ish -> BELOW).
+fn push_line_dim(ed: &mut Editor, a: Point2, b: Point2, prefer: Option<Point2>) {
     if pick::distance(a, b) <= 1e-6 {
         return;
     }
-    let vertical_edge = (b.x - a.x).abs() <= (b.y - a.y).abs();
-    // linear_dim offsets along the LEFT normal of (a, b): (-dy, dx)/len.
-    // Pick endpoint order so that normal points +x (vertical edge) or
-    // +y (horizontal edge).
-    let (a, b) = if vertical_edge {
-        // want -dy > 0  =>  order descending y.
-        if a.y < b.y { (b, a) } else { (a, b) }
-    } else {
-        // want dx > 0  =>  order ascending x.
-        if a.x > b.x { (b, a) } else { (a, b) }
+    let left_normal_agrees = |a: Point2, b: Point2| -> bool {
+        let n = prefer.unwrap();
+        // Left normal of screen-space a->b is (-dy, dx).
+        let sa = ed.camera.unit_to_screen(a);
+        let sb = ed.camera.unit_to_screen(b);
+        let dx = sb.x - sa.x;
+        let dy = sb.y - sa.y;
+        -dy * n.x + dx * n.y > 0.
+    };
+    let (a, b) = match prefer {
+        Some(n) => {
+            if left_normal_agrees(a, b) { (a, b) } else { (b, a) }
+        }
+        None => {
+            let vertical_edge = (b.x - a.x).abs() <= (b.y - a.y).abs();
+            if vertical_edge {
+                if a.y < b.y { (b, a) } else { (a, b) }
+            } else {
+                if a.x > b.x { (b, a) } else { (a, b) }
+            }
+        }
     };
     ed.dim_renders.push(linear_dim(
         &ed.doc,
@@ -327,6 +342,98 @@ fn push_line_dim(ed: &mut Editor, a: Point2, b: Point2) {
         PREVIEW_DIM_OFFSET_DOC,
         pick::distance(a, b),
     ));
+}
+
+/// Tier-1 side rule: when the segment is an edge of a fill loop, return
+/// the OUTWARD screen-space normal derived from the loop's winding.
+fn edge_outward_normal(ed: &Editor, sid: crate::core::ids::SegmentId) -> Option<Point2> {
+    let seg = ed.doc.segment(sid)?;
+    let (Some(pa), Some(pb)) = (ed.doc.point(seg.start), ed.doc.point(seg.end)) else {
+        return None;
+    };
+    for (fid, f) in ed.doc.all_fills() {
+        if !f.segments.contains(&sid) {
+            continue;
+        }
+        let Some(pts) = pick::loop_points(&ed.doc, fid) else {
+            continue;
+        };
+        if pts.len() < 3 {
+            continue;
+        }
+        // Winding sign (shoelace, y-down): positive => interior on LEFT of
+        // each traversal edge, so outward = right normal; negative flips.
+        let mut area = 0.;
+        for i in 0..pts.len() {
+            let p = pts[i];
+            let q = pts[(i + 1) % pts.len()];
+            area += p.x * q.y - q.x * p.y;
+        }
+        if area.abs() < 1e-9 {
+            continue;
+        }
+        // Traversal direction across THIS edge (either orientation).
+        let forward = pts.iter().enumerate().any(|(i, p)| {
+            *p == pa && pts[(i + 1) % pts.len()] == pb
+        });
+        let d = if forward {
+            Point2::new(pb.x - pa.x, pb.y - pa.y)
+        } else {
+            Point2::new(pa.x - pb.x, pa.y - pb.y)
+        };
+        let outward = if area > 0. {
+            Point2::new(d.y, -d.x) // right normal
+        } else {
+            Point2::new(-d.y, d.x) // left normal
+        };
+        // Convert to SCREEN space direction (same handedness; just scale by zoom>0, so direction unchanged).
+        let len = (outward.x * outward.x + outward.y * outward.y).sqrt();
+        return Some(Point2::new(outward.x / len, outward.y / len));
+    }
+    None
+}
+
+/// Tier-2 side rule: no fill membership but connected partners — vote from
+/// each partner's far endpoint; the dim goes on the side AWAY from them.
+fn partner_vote_normal(ed: &Editor, sid: crate::core::ids::SegmentId) -> Option<Point2> {
+    let seg = ed.doc.segment(sid)?;
+    let (Some(pa), Some(pb)) = (ed.doc.point(seg.start), ed.doc.point(seg.end)) else {
+        return None;
+    };
+    let mut vote = 0.;
+    for (other_sid, other) in ed.doc.all_segments() {
+        if other_sid == sid || other.kind == crate::core::document::SegmentKind::Ruler {
+            continue;
+        }
+        let Some((oa, ob)) = ed.doc.segment_geom(other_sid) else {
+            continue;
+        };
+        // Shares exactly one endpoint with our edge?
+        let far = if other.start == seg.start || other.end == seg.start {
+            Some((if other.start == seg.start { ob } else { oa }, pa))
+        } else if other.start == seg.end || other.end == seg.end {
+            Some((if other.start == seg.end { ob } else { oa }, pb))
+        } else {
+            None
+        };
+        if let Some((far_pt, joint)) = far {
+            if pick::distance(far_pt, joint) < 1e-9 {
+                continue;
+            }
+            let d = Point2::new(pb.x - pa.x, pb.y - pa.y);
+            let w = Point2::new(far_pt.x - joint.x, far_pt.y - joint.y);
+            // cross(d, w) > 0 => partner lies on LEFT-normal side.
+            vote += d.x * w.y - d.y * w.x;
+        }
+    }
+    if vote.abs() < 1e-9 {
+        return None;
+    }
+    // Away from partners: opposite the majority side.
+    let l = Point2::new(-(pb.y - pa.y), pb.x - pa.x);
+    let len = (l.x * l.x + l.y * l.y).sqrt();
+    let s = if vote > 0. { -1. } else { 1. };
+    Some(Point2::new(l.x / len * s, l.y / len * s))
 }
 
 // Bounds shown by preview dims: the pending rubber band only.
@@ -342,11 +449,11 @@ fn preview_bounds(ed: &Editor) -> Option<Rect> {
 /// same projected span along that direction (rectangle top/bottom, or two
 /// stacked identical lines). Keeps the one closest to bottom-right.
 /// Merely-parallel-but-offset edges each keep their own dim.
-fn dedup_collinear(edges: Vec<(Point2, Point2)>) -> Vec<(Point2, Point2)> {
+fn dedup_collinear(edges: Vec<(Point2, Point2, Option<Point2>)>) -> Vec<(Point2, Point2, Option<Point2>)> {
     // Projected [lo, hi] interval of an edge along the FIRST edge's
     // direction, plus center sum for the bottom-right tiebreak.
-    let mut out: Vec<(Point2, Point2)> = Vec::new();
-    for (a, b) in edges {
+    let mut out: Vec<(Point2, Point2, Option<Point2>)> = Vec::new();
+    for (a, b, pref) in edges {
         let mut merged = false;
         for o in out.iter_mut() {
             let d1 = Point2::new(b.x - a.x, b.y - a.y);
@@ -376,13 +483,13 @@ fn dedup_collinear(edges: Vec<(Point2, Point2)>) -> Vec<(Point2, Point2)> {
             let c_new = (a.x + b.x) / 2. + (a.y + b.y) / 2.;
             let c_old = (o.0.x + o.1.x) / 2. + (o.0.y + o.1.y) / 2.;
             if c_new > c_old {
-                *o = (a, b);
+                *o = (a, b, pref);
             }
             merged = true;
             break;
         }
         if !merged {
-            out.push((a, b));
+            out.push((a, b, pref));
         }
     }
     out
@@ -435,7 +542,12 @@ mod tests {
         let tr = Point2::new(100., 0.);
         let br = Point2::new(100., 80.);
         let bl = Point2::new(0., 80.);
-        let edges = vec![(tl, tr), (tr, br), (br, bl), (bl, tl)];
+        let edges = vec![
+            (tl, tr, None),
+            (tr, br, None),
+            (br, bl, None),
+            (bl, tl, None),
+        ];
         let merged = dedup_collinear(edges);
         assert_eq!(merged.len(), 2, "merged: {merged:?}");
     }
@@ -447,7 +559,7 @@ mod tests {
         // Same span on x but shifted 10 units down: NOT aligned endpoints.
         let c = Point2::new(3., 10.);
         let d = Point2::new(97., 10.);
-        let merged = dedup_collinear(vec![(a, b), (c, d)]);
+        let merged = dedup_collinear(vec![(a, b, None), (c, d, None)]);
         assert_eq!(merged.len(), 2, "merged: {merged:?}");
     }
 }

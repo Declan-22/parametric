@@ -40,14 +40,20 @@ pub struct SnapTarget {
 }
 
 /// All snap locations exposed by the geometry. `endpoints_only` keeps
-/// single-point resize drags fluid — midpoints and edge spans apply to
-/// placement and whole-object moves. `exclude` silences the dragged
-/// object's own geometry (its points AND its segments/midpoints) so
-/// nothing snaps to itself.
-pub fn targets(doc: &Document, exclude: &[PointId], endpoints_only: bool) -> Vec<SnapTarget> {
+/// single-point resize drags fluid. `exclude_pts` silences endpoint AND
+/// midpoint targets (the dragged object's component must never receive
+/// snaps); `exclude_segs` silences edge-span targets (only the actually
+/// dragged segments).
+pub fn targets(
+    doc: &Document,
+    exclude_pts: &[PointId],
+    exclude_segs: &[crate::core::ids::SegmentId],
+    endpoints_only: bool,
+) -> Vec<SnapTarget> {
+    let _ = exclude_segs;
     let mut out = Vec::new();
     for (pid, p) in doc.all_points() {
-        if exclude.contains(&pid) {
+        if exclude_pts.contains(&pid) {
             continue;
         }
         out.push(SnapTarget {
@@ -101,11 +107,12 @@ pub fn targets(doc: &Document, exclude: &[PointId], endpoints_only: bool) -> Vec
             continue;
         }
         let Some((a, b)) = doc.segment_geom(sid) else { continue };
-        // The dragged object's own edges must not snap to themselves.
-        if exclude.contains(&seg.start) || exclude.contains(&seg.end) {
+        let m = mid(a, b);
+        // Midpoints are positional targets: own-component edges never
+        // offer them.
+        if exclude_pts.contains(&seg.start) || exclude_pts.contains(&seg.end) {
             continue;
         }
-        let m = mid(a, b);
         out.push(SnapTarget {
             x: m.x,
             y: m.y,
@@ -169,13 +176,14 @@ pub fn best(
     doc: &Document,
     tol: f64,
     p: Point2,
-    exclude: &[PointId],
+    exclude_pts: &[PointId],
+    exclude_segs: &[crate::core::ids::SegmentId],
     endpoints_only: bool,
     coincident_only: bool,
     visible: Rect,
 ) -> (Point2, Vec<SnapGuide>) {
     let mut best: Option<(f64, f64, f64, bool, bool, SnapTarget)> = None;
-    for tgt in targets(doc, exclude, endpoints_only) {
+    for tgt in targets(doc, exclude_pts, exclude_segs, endpoints_only) {
         if !visible.contains(Point2::new(tgt.x, tgt.y)) {
             continue;
         }

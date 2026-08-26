@@ -59,6 +59,9 @@ pub struct Theme {
     pub button_border_color: u32,
 
     pub accent: u32,
+    // Accent-adjacent border for emphasized accent surfaces (chips):
+    // darker than accent in light mode, brighter in dark mode.
+    pub accent_border: u32,
 }
 
 impl Theme {
@@ -114,6 +117,7 @@ impl Theme {
             button_border_color: LIGHT_BUTTON_BORDER_COLOR,
 
             accent: LIGHT_ACCENT,
+            accent_border: LIGHT_ACCENT_BORDER,
         }
     }
 
@@ -141,6 +145,7 @@ impl Theme {
             button_border_color: DARK_BUTTON_BORDER_COLOR,
 
             accent: DARK_ACCENT,
+            accent_border: DARK_ACCENT_BORDER,
         }
     }
 }

@@ -495,15 +495,17 @@ impl Shell {
             return;
         };
         let removed = ed.update(cx, |ed, _| {
-            // Selected constraint chips die first: deleting one just drops
-            // the constraint, freeing its points.
+            // Selected constraint chips take priority: deleting them never
+            // touches geometry, even if elements are also selected — chips
+            // are tiny and sit on top of geometry, so co-selection is
+            // usually accidental.
             let mut removed_any = false;
             if !ed.selected_constraints.is_empty() {
                 let dead = std::mem::take(&mut ed.selected_constraints);
                 ed.doc.constraints.retain(|c| !dead.contains(c));
                 removed_any = true;
             }
-            if ed.selection.is_empty() {
+            if removed_any || ed.selection.is_empty() {
                 return removed_any;
             }
             let sels = std::mem::take(&mut ed.selection);

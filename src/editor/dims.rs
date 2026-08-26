@@ -23,12 +23,23 @@ pub struct ConstraintMarker {
     // Icon selection: coincident chip, else vertical/horizontal arrow.
     pub vertical: bool,
     pub coincident: bool,
+    // Visibility: only when the owning element is hovered/selected or the
+    // constraint is actively channeling a drag.
+    pub visible: bool,
+    // Filled styling (accent bg + white icon): active-constraining, owning
+    // element selected, or chip clicked.
+    pub emphasized: bool,
+    // Clicked chip: border switches to theme.accent_border.
+    pub clicked: bool,
+    // Dashed guide line (screen px) for distant H/V pairs.
+    pub guide: Option<[f32; 4]>,
+    // Cursor is over this chip (editor-side hit test).
+    pub hovered: bool,
     pub cx_out: f32,
     pub cy_out: f32,
     pub cx_in: f32,
     pub cy_in: f32,
     pub flipped: bool,
-    pub selected: bool,
 }
 
 /// Screen-space render data for one dimension.
@@ -151,40 +162,32 @@ pub fn update(ed: &mut Editor) {
     update_constraint_markers(ed);
 }
 
-// Constraint chips: one per H/V constraint, always visible. Preferred spot
-// sits just off the edge (right of vertical edges, below horizontal ones,
-// matching the dim offset direction); if that would collide with a dim
-// label box or another chip, the chip flips to the opposite side and the
-// layer slides it over.
+// Constraint chips. Positioning is deterministic per structural case:
+//  - pair forms an actual EDGE -> chip centered on the segment midpoint;
+//  - distant H/V pair -> dashed guide line along the shared axis (rendered
+//    by the canvas pass) with the chip at its midpoint;
+//  - POINT constraints (coincident junctions, future anchors) -> chip 18px
+//    above the point, clear of the handle dot.
 fn update_constraint_markers(ed: &mut Editor) {
     ed.constraint_markers.clear();
-    let off_px = (PREVIEW_DIM_OFFSET_DOC * ed.camera.zoom) as f32;
-    const CHIP_HW: f32 = 16.;
-    const CHIP_HH: f32 = 12.;
-    // Approximate dim label half-extents for collision tests.
-    const DIM_HW: f32 = 38.;
-    const DIM_HH: f32 = 13.;
+    const CHIP_ABOVE_PX: f32 = 18.;
+    const HANDLE_R: f32 = 5.;
 
-    let mut placed: Vec<(f32, f32, f32, f32)> = Vec::new();
-    for d in &ed.dim_renders {
-        placed.push((d.label_cx, d.label_cy, DIM_HW, DIM_HH));
-    }
-
-    // Constraints actively channeling the current drag: exactly ONE of
-    // their endpoints is in the dragged set (the constraint is what lets
-    // that point slide while holding the axis). Both endpoints moving
-    // together = satisfied trivially, not constraining.
-    let dragged: Vec<PointId> = ed
+    // Constraints actively channeling the current drag. Two patterns:
+    //  - exactly ONE endpoint is a PRIMARY drag target (the constraint
+    //    holds its axis while the point moves), or
+    //  - NO primary endpoints but exactly one FOLLOWER (constraint chains:
+    //    a bonded partner or slide-neighbor being towed along).
+    let (prim, foll) = ed
         .dragging
         .as_ref()
         .map(|d| {
-            d.points
-                .iter()
-                .chain(d.aux.iter())
-                .map(|&(id, _)| id)
-                .collect()
+            (
+                d.points.iter().map(|&(id, _)| id).collect::<Vec<_>>(),
+                d.aux.iter().map(|&(id, _)| id).collect::<Vec<_>>(),
+            )
         })
-        .unwrap_or_default();
+        .unwrap_or((Vec::new(), Vec::new()));
 
     let constraints = ed.doc.constraints.clone();
     for c in constraints {
@@ -193,43 +196,98 @@ fn update_constraint_markers(ed: &mut Editor) {
         };
         let ma = ed.camera.unit_to_screen(a);
         let mb = ed.camera.unit_to_screen(b);
-        let mx = ((ma.x + mb.x) / 2.) as f32;
-        let my = ((ma.y + mb.y) / 2.) as f32;
-        let vertical_edge = (mb.x - ma.x).abs() <= (mb.y - ma.y).abs();
-        let (cx_out, cy_out, cx_in, cy_in) = if vertical_edge {
-            (mx + off_px, my, mx - off_px, my)
+        let coincident_pt = c.kind == crate::core::constraints::ConstraintKind::Coincident;
+
+        // -- position: deterministic per structural case --
+        let mut guide: Option<[f32; 4]> = None;
+        let is_edge_pair = |s: crate::core::document::Segment| {
+            (s.start == c.a && s.end == c.b) || (s.start == c.b && s.end == c.a)
+        };
+        let has_own_edge = ed.doc.all_segments().any(|(_, s)| is_edge_pair(s));
+        let mid = (((ma.x + mb.x) / 2.) as f32, ((ma.y + mb.y) / 2.) as f32);
+        let (cx, cy) = if coincident_pt {
+            // Point constraint: hover above the junction, clear of the dot.
+            (mid.0, mid.1 - HANDLE_R - 2. - CHIP_ABOVE_PX)
+        } else if has_own_edge {
+            // The pair IS an edge: chip directly on it.
+            mid
         } else {
-            (mx, my + off_px, mx, my - off_px)
+            // Distant pair: dashed guide along the shared axis, chip at
+            // its midpoint.
+            let g = match c.kind {
+                crate::core::constraints::ConstraintKind::Horizontal => {
+                    [ma.x.min(mb.x), ma.y, ma.x.max(mb.x), ma.y]
+                }
+                _ => [ma.x, ma.y.min(mb.y), ma.x, ma.y.max(mb.y)],
+            };
+            guide = Some([g[0] as f32, g[1] as f32, g[2] as f32, g[3] as f32]);
+            (((g[0] + g[2]) / 2.) as f32, ((g[1] + g[3]) / 2.) as f32)
         };
 
-        let hits = |x: f32, y: f32| {
-            placed.iter().any(|&(px, py, hw, hh)| {
-                (px - x).abs() < hw + CHIP_HW && (py - y).abs() < hh + CHIP_HH
-            })
+        let in_prim = |p: PointId| prim.contains(&p);
+        let in_foll = |p: PointId| foll.contains(&p);
+        let (pa, pb) = (in_prim(c.a), in_prim(c.b));
+        let active = match ((pa as u8) + (pb as u8)) {
+            1 => true,
+            0 => in_foll(c.a) != in_foll(c.b),
+            _ => false,
         };
-        let flipped = hits(cx_out, cy_out);
-        let (fx, fy) = if flipped { (cx_in, cy_in) } else { (cx_out, cy_out) };
-        placed.push((fx, fy, CHIP_HW, CHIP_HH));
+        let clicked = ed.selected_constraints.contains(&c);
 
+        // A constraint belongs to everything TOUCHING either of its
+        // endpoints: the endpoints themselves, segments ending there, and
+        // fills whose loop passes through. Hovering or selecting ANY of
+        // those surfaces the chip; selecting does so emphasized.
+        let touches = |el: crate::core::constraints::ElementRef| -> bool {
+            match el {
+                crate::core::constraints::ElementRef::Point(p) => p == c.a || p == c.b,
+                crate::core::constraints::ElementRef::Segment(sid) => ed
+                    .doc
+                    .segment(sid)
+                    .is_some_and(|s| s.start == c.a || s.start == c.b || s.end == c.a || s.end == c.b),
+                crate::core::constraints::ElementRef::Fill(fid) => ed
+                    .doc
+                    .element_points(crate::core::constraints::ElementRef::Fill(fid))
+                    .iter()
+                    .any(|&p| p == c.a || p == c.b),
+            }
+        };
+        let hovered = ed.hover.map_or(false, |h| touches(h));
+        let sel_touched = ed.selection.iter().any(|&e| touches(e));
+        let visible = if ed.dragging.is_some() {
+            // Mid-drag: only constraints actively channeling THIS gesture
+            // (or an explicitly clicked chip) surface — static selection
+            // visibility would just clutter the resize.
+            active || clicked
+        } else {
+            active || clicked || hovered || sel_touched
+        };
+        let emphasized = visible && (active || clicked || sel_touched);
+
+        let key = format!(
+            "cmark-{}-{}-{}-{}-{}",
+            c.kind.as_str(),
+            c.a.idx,
+            c.a.generation,
+            c.b.idx,
+            c.b.generation
+        );
+        let is_hovered = ed.hovered_constraint.as_deref() == Some(key.as_str());
         ed.constraint_markers.push(ConstraintMarker {
-            key: format!(
-                "cmark-{}-{}-{}-{}-{}",
-                c.kind.as_str(),
-                c.a.idx,
-                c.a.generation,
-                c.b.idx,
-                c.b.generation
-            ),
+            key,
             constraint: c,
             vertical: c.kind != crate::core::constraints::ConstraintKind::Vertical,
-            coincident: c.kind == crate::core::constraints::ConstraintKind::Coincident,
-            cx_out,
-            cy_out,
-            cx_in,
-            cy_in,
-            flipped,
-            selected: ed.selected_constraints.contains(&c)
-                || (dragged.contains(&c.a) != dragged.contains(&c.b)),
+            coincident: coincident_pt,
+            cx_out: cx,
+            cy_out: cy,
+            cx_in: cx,
+            cy_in: cy,
+            flipped: false,
+            visible,
+            emphasized,
+            clicked,
+            guide,
+            hovered: is_hovered,
         });
     }
 }

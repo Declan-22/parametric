@@ -70,6 +70,8 @@ pub struct Editor {
     pub dim_renders: Vec<dims::DimRender>,
     // Per-frame constraint chip render data.
     pub constraint_markers: Vec<dims::ConstraintMarker>,
+    // Chip currently under the cursor (hit-tested in screen px).
+    pub hovered_constraint: Option<String>,
     // Last known cursor + modifier state so changes can re-derive drags.
     pub last_cursor: Option<gpui::Point<gpui::Pixels>>,
     // Last known canvas size in px, for viewport-culled snapping.
@@ -118,6 +120,7 @@ impl Editor {
             snap_guides: Vec::new(),
             dim_renders: Vec::new(),
             constraint_markers: Vec::new(),
+            hovered_constraint: None,
             last_cursor: None,
             viewport_size: (0., 0.),
             shift: false,
@@ -199,7 +202,21 @@ impl Editor {
                 self.begin_pan(cursor);
                 true
             }
-            gpui::MouseButton::Left => match self.tool {
+            gpui::MouseButton::Left => {
+                // Constraint chips sit ON TOP of geometry — clicking one
+                // toggles the chip selection and never touches geometry.
+                if self.tool == Tool::Move
+                    && let Some(c) = self.constraint_chip_at(cursor)
+                {
+                    if self.selected_constraints.contains(&c) {
+                        self.selected_constraints.retain(|&x| x != c);
+                    } else {
+                        self.selected_constraints.clear();
+                        self.selected_constraints.push(c);
+                    }
+                    return true;
+                }
+                match self.tool {
                 Tool::Pan => {
                     self.begin_pan(cursor);
                     true
@@ -269,7 +286,8 @@ impl Editor {
                     true
                 }
                 Tool::Move => self.move_tool_down(cursor, shift, click_count),
-            },
+            }
+            }
             _ => false,
         }
     }
@@ -608,6 +626,10 @@ impl Editor {
         if self.tool != Tool::Move || self.dragging.is_some() || self.pan_start.is_some() {
             return false;
         }
+        // Chips never block geometry hover (a chip hovering used to make
+        // the line's hover highlight flash like crazy). The cursor chip is
+        // tracked ONLY for the chip's own hover styling.
+        let changed = self.update_chip_hover(cursor);
         let p = self.cursor_doc(cursor);
         let picker = pick::Picker::new(&self.doc, &self.camera, HANDLE_TOL_PX);
         let info = picker.element(p);
@@ -615,7 +637,34 @@ impl Editor {
             self.hover = info;
             return true;
         }
-        false
+        changed
+    }
+
+    /// Tracks which chip (if any) is under the cursor for its own hover
+    /// styling. Returns true if that changed.
+    fn update_chip_hover(&mut self, cursor: gpui::Point<gpui::Pixels>) -> bool {
+        let key = self
+            .constraint_chip_at(cursor)
+            .map(|c| format!("{c:?}"));
+        if self.hovered_constraint == key {
+            return false;
+        }
+        self.hovered_constraint = key;
+        true
+    }
+
+    /// The visible constraint chip under a screen-space cursor, if any.
+    pub fn constraint_chip_at(
+        &self,
+        cursor: gpui::Point<gpui::Pixels>,
+    ) -> Option<crate::core::constraints::Constraint> {
+        let (x, y) = (f64::from(cursor.x) as f32, f64::from(cursor.y) as f32);
+        const HALF: f32 = crate::ui::canvas::CHIP_SIZE / 2.;
+        self.constraint_markers
+            .iter()
+            .filter(|m| m.visible)
+            .find(|m| (m.cx_out - x).abs() <= HALF && (m.cy_out - y).abs() <= HALF)
+            .map(|m| m.constraint)
     }
 
     pub fn cursor_style(&self) -> gpui::CursorStyle {

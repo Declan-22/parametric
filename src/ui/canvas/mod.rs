@@ -1,7 +1,7 @@
 use gpui::{
-    svg, App, Bounds, HitboxBehavior, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
+    App, Bounds, HitboxBehavior, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Pixels, Point, RenderOnce, ScrollDelta, ScrollWheelEvent, Size, Window, canvas,
-    div, fill, prelude::*, px, rgb, rgba,
+    div, fill, prelude::*, px, rgb,
 };
 
 use crate::editor::Editor;
@@ -115,147 +115,10 @@ impl RenderOnce for CanvasView {
             })
             .child(self.paint_layer())
             .child(self.dimension_layer())
-            .child(self.constraint_layer(cx))
     }
 }
 
-// Constraint chip icons (vertical / horizontal), stroke = currentColor.
-const ICON_CONSTRAINT_V: &[u8] =
-    br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
-	<path d="M0 0h24v24H0z" fill="none" />
-	<path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 5c.59-.607 2.16-3 3-3s2.41 2.393 3 3M9 19c.59.607 2.16 3 3 3s2.41-2.393 3-3M12 2.231V21.77" />
-</svg>"#;
-
-const ICON_CONSTRAINT_H: &[u8] =
-    br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
-	<path d="M0 0h24v24H0z" fill="none" />
-	<path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M5 9c-.607.59-3 2.16-3 3s2.393 2.41 3 3m14-6c.607.59 3 2.16 3 3s-2.393 2.41-3 3M2.423 11.98h19.445" />
-</svg>"#;
-
-const ICON_CONSTRAINT_C: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
-  <circle cx="12" cy="4.5" r="1.25" fill="currentColor"/>
-  <path d="M12 7.25V12.25M9.9 10.2L12 12.3L14.1 10.2" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M6 17.5H18" stroke="currentColor" stroke-width="1" stroke-linecap="round"/>
-  <circle cx="6" cy="17.5" r="1.25" fill="currentColor"/>
-</svg>"#;
-
-const CHIP_SIZE: f32 = 18.;
-const CHIP_ICON: f32 = 10.;
-
-impl CanvasView {
-    // Constraint chips: DOM overlay so each chip is hoverable/clickable.
-    // The flip-slide tweens between the outer and flipped spots via the
-    // shell fade system, keyed per constraint.
-    fn constraint_layer(&self, cx: &mut App) -> impl IntoElement {
-        let t = *crate::theme::active(cx);
-        let mut layer = div().absolute().inset_0();
-
-        let Some(editor) = self.editor.upgrade() else {
-            return layer;
-        };
-        let markers = editor.read(cx).constraint_markers.clone();
-        let shell = self.shell.upgrade();
-
-        for m in markers {
-            let slide_key = format!("{}-slide", m.key);
-            let hover_key = format!("{}-hover", m.key);
-            let target_slide = if m.flipped { 1.0 } else { 0.0 };
-            let (k_slide, k_hover) = if let Some(sh) = &shell {
-                // Kick the tween if the flip state changed.
-                let cur = sh.read(cx).fade(&slide_key);
-                if (cur - target_slide).abs() > 0.001 {
-                    sh.update(cx, |sh, cx| sh.animate_fade(&slide_key, target_slide, cx));
-                }
-                let cur2 = sh.read(cx);
-                (cur2.fade(&slide_key), cur2.fade(&hover_key))
-            } else {
-                (target_slide, 0.0)
-            };
-
-            let cxp = m.cx_out + (m.cx_in - m.cx_out) * k_slide;
-            let cyp = m.cy_out + (m.cy_in - m.cy_out) * k_slide;
-
-            // Always accent; hover LOWERS opacity (same treatment as the
-            // home page's + New Design button). Selected: solid accent
-            // container, white icon, visible border.
-            let color = if m.selected {
-                rgba((t.accent << 8) | 0xFF)
-            } else {
-                let alpha = (0xFF as f32 - 0xFF as f32 * 0.55 * k_hover) as u32;
-                rgba((t.accent << 8) | alpha)
-            };
-            let bg_color = if m.selected {
-                Some(rgb(t.accent))
-            } else {
-                None
-            };
-
-            let editor_click = self.editor.clone();
-            let was_selected = m.selected;
-            let constraint = m.constraint;
-            let key_for_hover = hover_key;
-            let shell_hover = self.shell.clone();
-            let icon = if m.coincident {
-                ICON_CONSTRAINT_C
-            } else if m.vertical {
-                ICON_CONSTRAINT_V
-            } else {
-                ICON_CONSTRAINT_H
-            };
-
-            layer = layer.child(
-                div()
-                    .id(m.key)
-                    .absolute()
-                    .left(px(cxp - CHIP_SIZE / 2.))
-                    .top(px(cyp - CHIP_SIZE / 2.))
-                    .size(px(CHIP_SIZE))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .border_2()
-                    .border_color(color)
-                    .rounded(px(6.))
-                    .when_some(bg_color, |d, bg| d.bg(bg))
-                    .on_hover(move |hovered, _, cx| {
-                        if let Some(sh) = shell_hover.upgrade() {
-                            let _ = sh.update(cx, |sh, cx| {
-                                sh.animate_fade(
-                                    &key_for_hover,
-                                    if *hovered { 1.0 } else { 0.0 },
-                                    cx,
-                                )
-                            });
-                        }
-                    })
-                    .on_mouse_down(MouseButton::Left, move |_: &gpui::MouseDownEvent, _, cx| {
-                        cx.stop_propagation();
-                        let _ = editor_click.update(cx, |ed, _| {
-                            if was_selected {
-                                ed.selected_constraints.retain(|&c| c != constraint);
-                            } else {
-                                ed.selected_constraints.clear();
-                                ed.selected_constraints.push(constraint);
-                            }
-                        });
-                    })
-                    .child(
-                        svg()
-                            .data(icon)
-                            .w(px(CHIP_ICON))
-                            .h(px(CHIP_ICON))
-                            .text_color(if m.selected {
-                                rgb(0xFFFFFF)
-                            } else {
-                                color
-                            }),
-                    ),
-            );
-        }
-        layer
-    }
-}
+pub(crate) const CHIP_SIZE: f32 = 18.;
 
 impl CanvasView {
     // Dimension labels painted directly into the canvas pass — same
@@ -428,6 +291,7 @@ impl CanvasView {
                 ed.marquee,
                 pending_ruler,
                 pending_line,
+                &ed.constraint_markers,
             );
             (list, hitbox)
         };
@@ -510,6 +374,81 @@ impl CanvasView {
                             rgb(crate::theme::active(cx).accent),
                             gpui::BorderStyle::Solid,
                         ));
+                    }
+                    paint::Primitive::Chip { x, y, size, bg, border, icon, kind } => {
+                        window.paint_quad(gpui::quad(
+                            Bounds {
+                                origin: Point { x: px(x), y: px(y) },
+                                size: Size { width: px(size), height: px(size) },
+                            },
+                            px(6.),
+                            bg.unwrap_or(gpui::transparent_black().into()),
+                            gpui::Edges::all(px(2.)),
+                            border,
+                            gpui::BorderStyle::Solid,
+                        ));
+                        // Tiny vector icon strokes inside the chip.
+                        let cx0 = x + size / 2.;
+                        let cy0 = y + size / 2.;
+                        let mut stroke = |ax: f32, ay: f32, bx: f32, by: f32| {
+                            let dx = bx - ax;
+                            let dy = by - ay;
+                            let len = (dx * dx + dy * dy).sqrt();
+                            if len < 1e-3 {
+                                return;
+                            }
+                            let w = 1.2;
+                            let nx = -dy / len * w / 2.;
+                            let ny = dx / len * w / 2.;
+                            let mut path = gpui::Path::new(Point {
+                                x: px(ax + nx),
+                                y: px(ay + ny),
+                            });
+                            path.line_to(Point { x: px(bx + nx), y: px(by + ny) });
+                            path.line_to(Point { x: px(bx - nx), y: px(by - ny) });
+                            path.line_to(Point { x: px(ax - nx), y: px(ay - ny) });
+                            path.line_to(Point { x: px(ax + nx), y: px(ay + ny) });
+                            window.paint_path(path, icon);
+                        };
+                        match kind {
+                            0 => {
+                                // Vertical double arrow.
+                                stroke(cx0, cy0 - 5., cx0, cy0 + 5.);
+                                stroke(cx0 - 2., cy0 - 3.2, cx0, cy0 - 5.);
+                                stroke(cx0 + 2., cy0 - 3.2, cx0, cy0 - 5.);
+                                stroke(cx0 - 2., cy0 + 3.2, cx0, cy0 + 5.);
+                                stroke(cx0 + 2., cy0 + 3.2, cx0, cy0 + 5.);
+                            }
+                            1 => {
+                                // Horizontal double arrow.
+                                stroke(cx0 - 5., cy0, cx0 + 5., cy0);
+                                stroke(cx0 - 3.2, cy0 - 2., cx0 - 5., cy0);
+                                stroke(cx0 - 3.2, cy0 + 2., cx0 - 5., cy0);
+                                stroke(cx0 + 3.2, cy0 - 2., cx0 + 5., cy0);
+                                stroke(cx0 + 3.2, cy0 + 2., cx0 + 5., cy0);
+                            }
+                            _ => {
+                                // Coincident: dot, elbow down-left, dot.
+                                stroke(cx0, cy0 - 4.5, cx0, cy0);
+                                stroke(cx0, cy0, cx0 - 3.5, cy0);
+                                let mut dot = |dx: f32, dy: f32| {
+                                    let r = 1.1;
+                                    window.paint_quad(gpui::quad(
+                                        Bounds {
+                                            origin: Point { x: px(dx - r), y: px(dy - r) },
+                                            size: Size { width: px(r * 2.), height: px(r * 2.) },
+                                        },
+                                        px(r),
+                                        icon,
+                                        gpui::Edges::all(px(0.)),
+                                        icon,
+                                        gpui::BorderStyle::Solid,
+                                    ));
+                                };
+                                dot(cx0, cy0 - 5.5);
+                                dot(cx0 - 4.5, cy0);
+                            }
+                        }
                     }
                     paint::Primitive::RulerLabel { center_x, anchor_y, px_value, in_value } => {
                         // Two-row vector label centered on the inch tick,

@@ -25,6 +25,8 @@ pub const DARK_BUTTON_TEXT: u32 = 0x1F1E1C;
 pub const DARK_BUTTON_BORDER_COLOR: u32 = 0xCBCBCB;
 
 pub const DARK_ACCENT: u32 = 0x5B96E8;
+// Slightly BRIGHTER than accent — border for emphasized accent surfaces.
+pub const DARK_ACCENT_BORDER: u32 = 0x9CC4F6;
 
 // ========================================
 // LIGHT THEME
@@ -53,3 +55,5 @@ pub const LIGHT_BUTTON_TEXT: u32 = 0xF2F2F2;
 pub const LIGHT_BUTTON_BORDER_COLOR: u32 = 0x55534E;
 
 pub const LIGHT_ACCENT: u32 = 0x5586CC;
+// Slightly DARKER than accent — border for emphasized accent surfaces.
+pub const LIGHT_ACCENT_BORDER: u32 = 0x3F6BA8;

@@ -114,6 +114,7 @@ impl RenderOnce for DesignCard {
                         None,   // marquee
                         None,   // pending ruler
                         None,   // pending line
+                        &[],    // constraint markers
                     ),
                     None => Vec::new(),
                 }
@@ -138,6 +139,7 @@ impl RenderOnce for DesignCard {
                     paint::Primitive::Line { .. } => {}
                     paint::Primitive::Outline { .. } => {}
                     paint::Primitive::Circle { .. } => {}
+                    paint::Primitive::Chip { .. } => {}
                     paint::Primitive::RulerLabel { .. } => {}
                 }
             }

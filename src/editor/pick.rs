@@ -114,8 +114,54 @@ impl<'a> Picker<'a> {
                         if in_fill(sid) {
                             continue;
                         }
-                        if self.segment_in_or_crossing(sid, band) {
+                        // Must actually TOUCH the band first (crossing or
+                        // containing geometry) — parallel_coverage alone
+                        // ignores lateral distance and would grab distant
+                        // aligned lines.
+                        if !self.segment_in_or_crossing(sid, band) {
+                            continue;
+                        }
+                        // Partial pickup by ACTUAL covered length (param
+                        // clip of the segment against the band): past half
+                        // -> whole line; otherwise just endpoint(s) inside
+                        // the band.
+                        let ends = self
+                            .doc
+                            .segment(sid)
+                            .map(|s| (s.start, s.end));
+                        let frac = ends.map_or(0., |(sa, sb)| {
+                            self.doc
+                                .point(sa)
+                                .zip(self.doc.point(sb))
+                                .map_or(0., |(pa, pb)| {
+                                    let len = distance(pa, pb);
+                                    if len < 1e-9 {
+                                        return 0.;
+                                    }
+                                    (clipped_len(pa, pb, band) / len).min(1.)
+                                })
+                        });
+                        let both_inside = ends.map_or(false, |(sa, sb)| {
+                            self.doc.point(sa).map_or(false, |p| band.contains(p))
+                                && self.doc.point(sb).map_or(false, |p| band.contains(p))
+                        });
+                        if frac > 0.5 || both_inside {
                             out.push(el);
+                        } else if let Some((sa, sb)) = ends {
+                            if self
+                                .doc
+                                .point(sa)
+                                .map_or(false, |p| band.contains(p))
+                            {
+                                out.push(ElementRef::Point(sa));
+                            }
+                            if self
+                                .doc
+                                .point(sb)
+                                .map_or(false, |p| band.contains(p))
+                            {
+                                out.push(ElementRef::Point(sb));
+                            }
                         }
                     }
                     ElementRef::Fill(fid) => {
@@ -285,6 +331,38 @@ pub fn point_segment_distance(p: Point2, a: Point2, b: Point2) -> f64 {
 
 pub fn midpoint(a: Point2, b: Point2) -> Point2 {
     Point2::new((a.x + b.x) / 2., (a.y + b.y) / 2.)
+}
+
+/// Length of the ab segment actually INSIDE rect r (parametric clip).
+fn clipped_len(a: Point2, b: Point2, r: Rect) -> f64 {
+    let (xlo, xhi) = (
+        r.origin.x.min(r.origin.x + r.size.w),
+        r.origin.x.max(r.origin.x + r.size.w),
+    );
+    let (ylo, yhi) = (
+        r.origin.y.min(r.origin.y + r.size.h),
+        r.origin.y.max(r.origin.y + r.size.h),
+    );
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    let mut t0: f64 = 0.;
+    let mut t1: f64 = 1.;
+    for (p, d, lo, hi) in [(a.x, dx, xlo, xhi), (a.y, dy, ylo, yhi)] {
+        if d.abs() < 1e-12 {
+            if p < lo || p > hi {
+                return 0.;
+            }
+        } else {
+            let (ta, tb) = ((lo - p) / d, (hi - p) / d);
+            let (ta, tb) = (ta.min(tb), ta.max(tb));
+            t0 = t0.max(ta);
+            t1 = t1.min(tb);
+        }
+    }
+    if t1 <= t0 {
+        return 0.;
+    }
+    (t1 - t0) * distance(a, b)
 }
 
 

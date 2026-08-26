@@ -2,6 +2,8 @@ use crate::core::document::{Document, SegmentKind};
 use crate::core::geometry::{Point2, Rect};
 use crate::core::ids::PointId;
 
+use super::pick::distance;
+
 // Snapping: candidate locations exposed by geometry, best-match search,
 // and visual guide descriptors. Pure functions over document + camera.
 
@@ -236,4 +238,132 @@ pub fn best(
 
 pub fn mid(a: Point2, b: Point2) -> Point2 {
     Point2::new((a.x + b.x) / 2., (a.y + b.y) / 2.)
+}
+
+/// Creation-tool cursor snapping. Priority:
+///  1. nearest ENDPOINT within tol -> cursor locks exactly onto it;
+///  2. nearest MIDPOINT within tol;
+///  3. nearest point ON an edge body within tol (perpendicular lock);
+///  4. otherwise free.
+/// Returns the snapped position plus an optional visual guide.
+pub fn cursor_snap(
+    doc: &Document,
+    tol: f64,
+    p: Point2,
+    visible: Rect,
+) -> (Point2, Option<SnapGuide>) {
+    let guide = |to: Point2, kind: SnapKind| {
+        Some(SnapGuide {
+            vertical: false,
+            from: p,
+            to,
+            kind,
+            span_is_x: false,
+            span_lo: 0.,
+            span_hi: 0.,
+        })
+    };
+
+    // 1) Endpoints.
+    let mut best_pt: Option<(f64, Point2)> = None;
+    for (_, q) in doc.all_points() {
+        if !visible.contains(q) {
+            continue;
+        }
+        let d = distance(p, q);
+        if d <= tol && best_pt.map_or(true, |(bd, _)| d < bd) {
+            best_pt = Some((d, q));
+        }
+    }
+    if let Some((_, q)) = best_pt {
+        return (q, guide(q, SnapKind::Endpoint));
+    }
+
+    // 2) Midpoints.
+    let mut best_mid: Option<(f64, Point2)> = None;
+    for (sid, seg) in doc.all_segments() {
+        if seg.kind == SegmentKind::Ruler {
+            continue;
+        }
+        let Some((a, b)) = doc.segment_geom(sid) else {
+            continue;
+        };
+        let m = mid(a, b);
+        if !visible.contains(m) {
+            continue;
+        }
+        let d = distance(p, m);
+        if d <= tol && best_mid.map_or(true, |(bd, _)| d < bd) {
+            best_mid = Some((d, m));
+        }
+    }
+    if let Some((_, m)) = best_mid {
+        return (m, guide(m, SnapKind::Midpoint));
+    }
+
+    // 3) Edge bodies (interior only; endpoints handled above).
+    let mut best_edge: Option<(f64, Point2)> = None;
+    for (sid, seg) in doc.all_segments() {
+        if seg.kind == SegmentKind::Ruler {
+            continue;
+        }
+        let Some((a, b)) = doc.segment_geom(sid) else {
+            continue;
+        };
+        if !visible.contains(a) && !visible.contains(b) {
+            continue;
+        }
+        let proj = closest_point_on_segment(p, a, b);
+        if distance(proj, a) < 1e-9 || distance(proj, b) < 1e-9 {
+            continue;
+        }
+        let d = distance(p, proj);
+        if d <= tol && best_edge.map_or(true, |(bd, _)| d < bd) {
+            best_edge = Some((d, proj));
+        }
+    }
+    if let Some((_, proj)) = best_edge {
+        return (proj, guide(proj, SnapKind::Edge));
+    }
+
+    (p, None)
+}
+
+fn closest_point_on_segment(p: Point2, a: Point2, b: Point2) -> Point2 {
+    let abx = b.x - a.x;
+    let aby = b.y - a.y;
+    let len_sq = abx * abx + aby * aby;
+    if len_sq == 0. {
+        return a;
+    }
+    let t = (((p.x - a.x) * abx + (p.y - a.y) * aby) / len_sq).clamp(0., 1.);
+    Point2::new(a.x + t * abx, a.y + t * aby)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cursor_snap_locks_endpoint() {
+        let mut doc = Document::new();
+        let pid = doc.add_point(Point2::new(100., 100.));
+        let _ = pid;
+        let vis = Rect::from_points(Point2::new(0., 0.), Point2::new(500., 500.));
+        let (p, g) = cursor_snap(&doc, 10., Point2::new(106., 97.), vis);
+        assert_eq!(p, Point2::new(100., 100.));
+        assert!(g.is_some());
+    }
+
+    #[test]
+    fn cursor_snap_edge_body() {
+        let mut doc = Document::new();
+        let a = doc.add_point(Point2::new(0., 0.));
+        let b = doc.add_point(Point2::new(200., 0.));
+        doc.add_segment(a, b);
+        let vis = Rect::from_points(Point2::new(-50., -50.), Point2::new(500., 500.));
+        // 5 units above the edge body.
+        let (p, g) = cursor_snap(&doc, 10., Point2::new(80., -5.), vis);
+        assert_eq!(p, Point2::new(80., 0.));
+        assert!(g.is_some());
+    }
 }

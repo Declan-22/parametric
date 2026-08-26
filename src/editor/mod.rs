@@ -173,9 +173,16 @@ impl Editor {
     }
 
     /// Visible doc region expanded by a margin — the snap search space.
-    /// Snapping only considers nearby, on-screen geometry.
+    /// Snapping only considers nearby, on-screen geometry. Falls back to
+    /// unbounded when the viewport size isn't known yet.
     fn snap_visible(&self) -> Rect {
         const MARGIN_PX: f64 = 80.;
+        if self.viewport_size.0 <= 0. || self.viewport_size.1 <= 0. {
+            return Rect::from_points(
+                Point2::new(-1e9, -1e9),
+                Point2::new(1e9, 1e9),
+            );
+        }
         let mut v = self.visible_bounds(Size {
             w: self.viewport_size.0,
             h: self.viewport_size.1,
@@ -195,6 +202,19 @@ impl Editor {
         let (adj, guides) =
             snapping::best(&self.doc, self.snap_tol_doc(), p, &[], &[], false, false, self.snap_visible());
         (Point2::new(p.x + adj.x, p.y + adj.y), guides)
+    }
+
+    /// Creation-tool cursor snapping: the cursor itself locks onto nearby
+    /// points, midpoints, and edge bodies so new geometry lands perfectly
+    /// joined.
+    fn snap_creation_point(&self, p: Point2) -> (Point2, Vec<SnapGuide>) {
+        let (pos, guide) = snapping::cursor_snap(
+            &self.doc,
+            self.snap_tol_doc(),
+            p,
+            self.snap_visible(),
+        );
+        (pos, guide.into_iter().collect())
     }
 
     // Mouse down on the canvas. Returns true if a repaint is needed.
@@ -250,7 +270,7 @@ impl Editor {
                         }
                         return true;
                     }
-                    let (at, guides) = self.snap_point(self.cursor_doc(cursor));
+                    let (at, guides) = self.snap_creation_point(self.cursor_doc(cursor));
                     self.snap_guides = guides;
                     self.pending_shape =
                         Some(PendingShape { start: at, cursor: at, proportional: false });
@@ -271,7 +291,7 @@ impl Editor {
                         }
                         return true;
                     }
-                    let (at, guides) = self.snap_point(self.cursor_doc(cursor));
+                    let (at, guides) = self.snap_creation_point(self.cursor_doc(cursor));
                     self.snap_guides = guides;
                     self.pending_ruler = Some(PendingRuler { start: at, cursor: at });
                     self.pending_via_click = true;
@@ -291,7 +311,7 @@ impl Editor {
                         }
                         return true;
                     }
-                    let (at, guides) = self.snap_point(self.cursor_doc(cursor));
+                    let (at, guides) = self.snap_creation_point(self.cursor_doc(cursor));
                     self.snap_guides = guides;
                     self.pending_line = Some(PendingLine { start: at, cursor: at });
                     self.pending_via_click = true;
@@ -448,7 +468,7 @@ impl Editor {
         // Rectangle rubber band.
         if self.pending_shape.is_some() {
             let at = self.cursor_doc(cursor);
-            let (at, guides) = self.snap_point(at);
+            let (at, guides) = self.snap_creation_point(at);
             self.snap_guides = guides;
             if let Some(pending) = self.pending_shape.as_mut() {
                 pending.cursor = at;
@@ -460,7 +480,7 @@ impl Editor {
         // Ruler rubber band.
         if self.pending_ruler.is_some() {
             let at = self.cursor_doc(cursor);
-            let (at, guides) = self.snap_point(at);
+            let (at, guides) = self.snap_creation_point(at);
             self.snap_guides = guides;
             if let Some(pending) = self.pending_ruler.as_mut() {
                 pending.cursor = at;
@@ -471,7 +491,7 @@ impl Editor {
         // Line rubber band.
         if self.pending_line.is_some() {
             let at = self.cursor_doc(cursor);
-            let (at, guides) = self.snap_point(at);
+            let (at, guides) = self.snap_creation_point(at);
             self.snap_guides = guides;
             if let Some(pending) = self.pending_line.as_mut() {
                 pending.cursor = at;
@@ -486,7 +506,11 @@ impl Editor {
                 self.marquee = Some((start, cur));
                 return true;
             }
-            self.snap_guides.clear();
+            // Creation tools keep their hover snap-lock guides here —
+            // clearing them wiped the crosshair highlight every move.
+            if !matches!(self.tool, Tool::Line | Tool::Rectangle | Tool::Ruler) {
+                self.snap_guides.clear();
+            }
             return false;
         }
 
@@ -665,6 +689,26 @@ impl Editor {
     // -- hover --
 
     pub fn canvas_hover(&mut self, cursor: gpui::Point<gpui::Pixels>) -> bool {
+        // Creation tools: the crosshair itself snap-locks and highlights
+        // targets BEFORE any button press.
+        match self.tool {
+            Tool::Line | Tool::Rectangle | Tool::Ruler
+                if self.pending_shape.is_none()
+                    && self.pending_line.is_none()
+                    && self.pending_ruler.is_none() =>
+            {
+                let (at, guides) = self.snap_creation_point(self.cursor_doc(cursor));
+                let changed = match (&self.snap_guides, &guides) {
+                    (a, b) if a.len() == b.len() => a.iter().zip(b.iter()).any(|(x, y)| {
+                        x.kind != y.kind || pick::distance(x.to, y.to) > 1e-9
+                    }),
+                    _ => true,
+                };
+                self.snap_guides = guides;
+                return changed;
+            }
+            _ => {}
+        }
         if self.tool != Tool::Move || self.dragging.is_some() || self.pan_start.is_some() {
             return false;
         }

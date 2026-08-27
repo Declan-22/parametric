@@ -930,6 +930,10 @@ impl Render for Shell {
                             editor: editor.downgrade(),
                             shell: cx.entity().downgrade(),
                         })
+                        .child(crate::ui::inspector::Inspector {
+                            editor: editor.downgrade(),
+                            shell: cx.entity().downgrade(),
+                        })
                         .into_any_element()
                 }
             })

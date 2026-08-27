@@ -1,0 +1,1 @@
+Parametric is a 2D parametric vector design tool built with Rust and GPUI. It combines vector design with a constraint solver, allowing geometry to be defined through relationships and dimensions rather than manually positioned. The goal is to create a fast, precise, and highly flexible design environment where everything remains editable and connected.

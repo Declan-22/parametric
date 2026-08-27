@@ -473,39 +473,6 @@ impl Document {
         self.dimensions.push(dim);
     }
 
-    /// Recomputes every arc's center point from its current 3 defining
-    /// points. Called after any point move.
-    pub fn sync_arc_centers(&mut self) {
-        let mut updates: Vec<(PointId, Point2)> = Vec::new();
-        for (_, seg) in self.all_segments() {
-            if seg.kind != SegmentKind::Arc {
-                continue;
-            }
-            let Some(center_id) = seg.center else { continue };
-            let Some(ctrl_id) = seg.ctrl else { continue };
-            let (Some(a), Some(b), Some(c)) = (
-                self.point(seg.start),
-                self.point(seg.end),
-                self.point(ctrl_id),
-            ) else {
-                continue;
-            };
-            let d = 2. * (a.x * (b.y - c.y) + b.x * (c.y - a.y) + c.x * (a.y - b.y));
-            if d.abs() < 1e-9 {
-                continue;
-            }
-            let a2 = a.x * a.x + a.y * a.y;
-            let b2 = b.x * b.x + b.y * b.y;
-            let c2 = c.x * c.x + c.y * c.y;
-            let ux = (a2 * (b.y - c.y) + b2 * (c.y - a.y) + c2 * (a.y - b.y)) / d;
-            let uy = (a2 * (c.x - b.x) + b2 * (a.x - c.x) + c2 * (b.x - a.x)) / d;
-            updates.push((center_id, Point2::new(ux, uy)));
-        }
-        for (pid, pos) in updates {
-            self.move_point(pid, pos);
-        }
-    }
-
     // -- raw inserts (persistence round-trips ids exactly) --
 
     pub fn insert_point_with_id(&mut self, id: PointId, pos: Point2) {

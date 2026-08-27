@@ -168,10 +168,20 @@ pub fn build_draw_list(
                         });
                     }
                     // Arc segments: sampled polyline of the arc through
-                    // start -> ctrl -> end. Incomplete arcs also show their
+                    // start -> ctrl -> end (adaptive so the curve stays
+                    // smooth at any zoom). Incomplete arcs also show their
                     // dashed complementary portion.
                     if seg.kind == SegmentKind::Arc {
-                        let Some(samples) = crate::editor::arc::segment_samples(doc, sid, 64)
+                        let Some(sc) = seg.ctrl else { continue };
+                        let (Some(sa), Some(sb), Some(scp)) = (
+                            doc.point(seg.start),
+                            doc.point(seg.end),
+                            doc.point(sc),
+                        ) else {
+                            continue;
+                        };
+                        let n = crate::editor::arc::adaptive_samples(sa, sb, scp, camera.zoom);
+                        let Some(samples) = crate::editor::arc::segment_samples(doc, sid, n)
                         else {
                             continue;
                         };
@@ -192,12 +202,11 @@ pub fn build_draw_list(
                             || seg.center.is_some_and(|c| selection.contains(&ElementRef::Point(c)));
                         if !complete
                             && arc_selected
-                            && let Some(ctrl_id) = seg.ctrl
-                            && let (Some(sa), Some(sb)) =
-                                (doc.point(seg.start), doc.point(seg.end))
-                            && let Some(cpos) = doc.point(ctrl_id)
+                            && seg.ctrl.is_some_and(|c| selection.contains(&ElementRef::Point(c))
+                                || selection.contains(&ElementRef::Point(seg.start))
+                                || selection.contains(&ElementRef::Point(seg.end)))
                         {
-                            let comp = crate::editor::arc::complement_samples(sa, sb, cpos, 48);
+                            let comp = crate::editor::arc::complement_samples(sa, sb, scp, n.max(32));
                             let pts: Vec<(f32, f32)> = comp.iter().map(|p| scr(*p)).collect();
                             dashed_polyline(&mut list, &pts, accent);
                         }
@@ -245,13 +254,13 @@ pub fn build_draw_list(
     if let Some(h) = hover
         && !selection.contains(&h)
     {
-        element_outline(doc, h, &scr, accent, &mut list);
+        element_outline(doc, h, &scr, accent, &mut list, camera.zoom);
     }
 
     // 5) Selection highlights + point handles drawn after everything —
     // points are the topmost affordance in the entire stack.
     for &sel in selection {
-        element_outline(doc, sel, &scr, accent, &mut list);
+        element_outline(doc, sel, &scr, accent, &mut list, camera.zoom);
     }
     for &sel in selection {
         for pid in doc.element_points(sel) {
@@ -318,10 +327,13 @@ pub fn build_draw_list(
         } else {
             rgba((t.accent << 8) | faded_alpha).into()
         };
-        let bg = m
-            .emphasized
-            .then_some(rgb(t.accent))
-            .map(gpui::Hsla::from);
+        // Emphasized: solid accent bg. Otherwise: bg_primary so the chip
+        // reads as a real container over any geometry underneath.
+        let bg: Option<gpui::Hsla> = Some(if m.emphasized {
+            rgb(t.accent).into()
+        } else {
+            rgb(t.bg_primary).into()
+        });
         let kind = if m.coincident {
             2
         } else if m.vertical {
@@ -406,10 +418,11 @@ pub fn build_draw_list(
             }
             _ => {
                 if let (Some(a), Some(b)) = (pc.a, pc.b) {
-                    let arc = crate::editor::arc::samples_through(a, b, pc.cursor, 64);
+                    let n = crate::editor::arc::adaptive_samples(a, b, pc.cursor, camera.zoom);
+                    let arc = crate::editor::arc::samples_through(a, b, pc.cursor, n);
                     let pts: Vec<(f32, f32)> = arc.iter().map(|p| scr(*p)).collect();
                     push_polyline(&mut list, &pts, 1.5, color);
-                    let comp = crate::editor::arc::complement_samples(a, b, pc.cursor, 48);
+                    let comp = crate::editor::arc::complement_samples(a, b, pc.cursor, n.max(32));
                     dashed_polyline(&mut list, &comp.iter().map(|p| scr(*p)).collect::<Vec<_>>(), accent);
                     // Radius guide: true center -> cursor (visible handle).
                     if let Some((center, _)) = crate::editor::arc::circumcircle(a, b, pc.cursor) {
@@ -504,6 +517,7 @@ fn element_outline(
     scr: &impl Fn(Point2) -> (f32, f32),
     accent: gpui::Background,
     list: &mut Vec<Primitive>,
+    zoom: f64,
 ) {
     match el {
         // Points use the SAME styling everywhere: one clean small dot.
@@ -516,7 +530,14 @@ fn element_outline(
         ElementRef::Segment(sid) => {
             if let Some(seg) = doc.segment(sid)
                 && seg.kind == SegmentKind::Arc
-                && let Some(samples) = crate::editor::arc::segment_samples(doc, sid, 48)
+                && let Some(sc) = seg.ctrl
+                && let (Some(a), Some(b), Some(c)) =
+                    (doc.point(seg.start), doc.point(seg.end), doc.point(sc))
+                && let Some(samples) = crate::editor::arc::segment_samples(
+                    doc,
+                    sid,
+                    crate::editor::arc::adaptive_samples(a, b, c, zoom),
+                )
             {
                 let pts: Vec<(f32, f32)> = samples.iter().map(|p| scr(*p)).collect();
                 push_polyline(list, &pts, 2.5, accent);

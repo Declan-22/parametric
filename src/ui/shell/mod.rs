@@ -495,20 +495,7 @@ impl Shell {
 
     fn clipboard_data(&self, cx: &Context<Self>) -> Option<String> {
         let ed = self.editor.as_ref()?;
-        let e = ed.read(cx);
-        if e.selection.len() != 1 {
-            return None;
-        }
-        let sel = e.selection[0];
-        let pts = e.doc.element_points(sel);
-        let b = e.doc.bounds_of_points(&pts)?;
-        Some(format!(
-            "parametric/bounds:{},{},{},{}",
-            b.origin.x,
-            b.origin.y,
-            b.size.w,
-            b.size.h
-        ))
+        ed.read(cx).serialize_selection()
     }
 
     pub(crate) fn copy_selection(&mut self, cx: &mut Context<Self>) {
@@ -526,27 +513,21 @@ impl Shell {
         let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) else {
             return;
         };
-        let Some(rest) = text.strip_prefix("parametric/bounds:") else {
-            return;
-        };
-        let nums: Vec<f64> = rest.split(',').filter_map(|s| s.parse().ok()).collect();
-        if nums.len() != 4 {
-            return;
-        }
         let Some(ed) = self.editor.as_ref() else {
             return;
         };
-        ed.update(cx, |ed, cx| {
-            // Paste slightly offset so it doesn't land exactly on the copy.
-            const OFFSET: f64 = 12.;
-            let a = Point2::new(nums[0] + OFFSET, nums[1] + OFFSET);
-            let b = Point2::new(nums[0] + OFFSET + nums[2], nums[1] + OFFSET + nums[3]);
-            let layer_id = ed.doc.layers[0].id;
-            let fill = ed.create_rectangle(layer_id, a, b);
-            ed.selection = vec![ElementRef::Fill(fill)];
-            ed.update_dim_geom();
-            cx.notify();
+        let pasted = ed.update(cx, |ed, _| {
+            ed.history_begin();
+            let ok = ed.paste_serialized(&text);
+            if !ok {
+                // Drop the useless snapshot.
+                ed.gesture_snapshot = None;
+            }
+            ok
         });
+        if pasted {
+            cx.notify();
+        }
     }
 
     pub(crate) fn delete_selection(&mut self, cx: &mut Context<Self>) {

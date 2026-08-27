@@ -1,4 +1,5 @@
 pub mod arc;
+mod clipboard;
 mod camera;
 pub mod dims;
 pub mod pick;
@@ -392,13 +393,6 @@ impl Editor {
         let p = self.cursor_doc(cursor);
         // Pressing the canvas dismisses constraint-chip selection.
         self.selected_constraints.clear();
-        // Arc center handles (derived, not document points): grabbing one
-        // translates the whole arc. Check before the picker so the center
-        // wins over nearby geometry.
-        if let Some(center_drag) = self.arc_center_drag(p) {
-            self.dragging = Some(center_drag);
-            return true;
-        }
         let picker = pick::Picker::new(&self.doc, &self.camera, HANDLE_TOL_PX);
         // Shift extends the selection instead of replacing it.
         self.marquee_add = shift;
@@ -454,9 +448,6 @@ impl Editor {
                     ElementRef::Point(pid) if self.selection.len() == 1 => Some(pid),
                     _ => None,
                 };
-                // ARC center handle translates whole arc — handled as a derived
-                // point in canvas_down hit-testing (see below), not here.
-                let arc_ctrl_pts: Option<Vec<PointId>> = None;
                 let ring_of = |pids: &[PointId]| -> Vec<(PointId, Point2)> {
                     let mut aux: Vec<(PointId, Point2)> = Vec::new();
                     for &pid in pids {
@@ -480,13 +471,7 @@ impl Editor {
                     }
                     aux
                 };
-                let (drag_pts, aux_pts) = if let Some(pts) = arc_ctrl_pts {
-                    let drag = pts
-                        .iter()
-                        .filter_map(|&pid| self.doc.point(pid).map(|pos| (pid, pos)))
-                        .collect();
-                    (drag, Vec::new())
-                } else if let Some(pid) = solo_point {
+                let (drag_pts, aux_pts) = if let Some(pid) = solo_point {
                     let start = self.doc.point(pid).unwrap();
                     let aux = ring_of(&[pid]);
                     (vec![(pid, start)], aux)
@@ -748,11 +733,104 @@ impl Editor {
 
         let solver = crate::core::solver::Solver::build(&self.doc, &targets, &drag.aux);
         let solution = solver.solve();
+        let mut moved: std::collections::HashSet<PointId> = std::collections::HashSet::new();
         for (id, pos) in solution.positions {
+            moved.insert(id);
             self.doc.move_point(id, pos);
         }
-        self.doc.sync_arc_centers();
+        self.resolve_arcs_after_drag(&moved);
         true
+    }
+
+    /// Keeps every arc consistent after a drag. Two regimes:
+    ///  - center MOVED by the solver (dragged directly or towed via a
+    ///    coincident constraint): the arc translates rigidly so its
+    ///    circumcenter lands on the center's new position — constraints on
+    ///    the center are honored.
+    ///  - center UNMOVED: it follows the geometry (recomputed circumcenter),
+    ///    EXCEPT when the center itself is coincident-constrained — then the
+    ///    defining points are projected back onto the circle around the
+    ///    pinned center instead.
+    fn resolve_arcs_after_drag(&mut self, moved: &std::collections::HashSet<PointId>) {
+        let arcs: Vec<crate::core::document::Segment> = self
+            .doc
+            .all_segments()
+            .filter(|(_, s)| s.kind == crate::core::document::SegmentKind::Arc)
+            .map(|(_, s)| s)
+            .collect();
+        for seg in arcs {
+            let (Some(center_id), Some(ctrl_id)) = (seg.center, seg.ctrl) else {
+                continue;
+            };
+            let (Some(mut a), Some(mut b), Some(mut c)) = (
+                self.doc.point(seg.start),
+                self.doc.point(seg.end),
+                self.doc.point(ctrl_id),
+            ) else {
+                continue;
+            };
+            let Some(old_o) = crate::editor::arc::circumcircle(a, b, c).map(|(o, _)| o) else {
+                continue;
+            };
+            let Some(center_now) = self.doc.point(center_id) else {
+                continue;
+            };
+            let center_constrained = self.doc.constraints.iter().any(|c| {
+                c.kind == ConstraintKind::Coincident
+                    && (c.a == center_id || c.b == center_id)
+            });
+            if moved.contains(&center_id) {
+                // Center is authoritative: rigid-translate the defining
+                // points that the solver did NOT position.
+                let d = Point2::new(center_now.x - old_o.x, center_now.y - old_o.y);
+                for (pid, pos) in [
+                    (seg.start, a),
+                    (seg.end, b),
+                    (ctrl_id, c),
+                ] {
+                    if !moved.contains(&pid) {
+                        self.doc
+                            .move_point(pid, Point2::new(pos.x + d.x, pos.y + d.y));
+                    }
+                }
+                continue;
+            }
+            if center_constrained {
+                // Center pinned by a constraint: keep all defining points on
+                // the circle around it. Radius anchors to whichever defining
+                // point the user did NOT move.
+                let radius = if !moved.contains(&seg.start) {
+                    pick::distance(center_now, a)
+                } else if !moved.contains(&seg.end) {
+                    pick::distance(center_now, b)
+                } else if !moved.contains(&ctrl_id) {
+                    pick::distance(center_now, c)
+                } else {
+                    pick::distance(center_now, a)
+                };
+                if radius < 1e-6 {
+                    continue;
+                }
+                for (pid, pos) in [(seg.start, a), (seg.end, b), (ctrl_id, c)] {
+                    let dx = pos.x - center_now.x;
+                    let dy = pos.y - center_now.y;
+                    let d = (dx * dx + dy * dy).sqrt();
+                    if d < 1e-9 {
+                        continue;
+                    }
+                    self.doc.move_point(
+                        pid,
+                        Point2::new(
+                            center_now.x + dx / d * radius,
+                            center_now.y + dy / d * radius,
+                        ),
+                    );
+                }
+                continue;
+            }
+            // Free center: follow the geometry.
+            self.doc.move_point(center_id, old_o);
+        }
     }
 
     /// True when pid is an endpoint of a standalone stroked line (line
@@ -768,42 +846,6 @@ impl Editor {
 
     /// If `p` is near a selected arc's circumcenter, return a drag that
     /// moves the whole arc (all points including center).
-    fn arc_center_drag(&self, p: Point2) -> Option<DragState> {
-        let tol = HANDLE_TOL_PX / self.camera.zoom;
-        for (sid, seg) in self.doc.all_segments() {
-            if seg.kind != crate::core::document::SegmentKind::Arc {
-                continue;
-            }
-            let Some(sc) = seg.ctrl else { continue };
-            let (Some(a), Some(b), Some(c)) =
-                (self.doc.point(seg.start), self.doc.point(seg.end), self.doc.point(sc))
-            else {
-                continue;
-            };
-            let center_pos = seg
-                .center
-                .and_then(|id| self.doc.point(id))
-                .or_else(|| crate::editor::arc::circumcircle(a, b, c).map(|(o, _)| o));
-            let Some(center) = center_pos else {
-                continue;
-            };
-            if crate::editor::pick::distance(p, center) <= tol {
-                let mut ids = vec![seg.start, seg.end, sc];
-                if let Some(cid) = seg.center {
-                    ids.push(cid);
-                }
-                let pts: Vec<(PointId, Point2)> = ids
-                    .into_iter()
-                    .filter_map(|pid| self.doc.point(pid).map(|pos| (pid, pos)))
-                    .collect();
-                if pts.len() >= 3 {
-                    return Some(DragState { points: pts, aux: Vec::new(), start_cursor: p });
-                }
-            }
-        }
-        None
-    }
-
     // -- dimensions (delegates to the dims subsystem) --
 
     pub fn update_dim_geom(&mut self) {
@@ -1154,7 +1196,23 @@ impl Editor {
                 }
             }
             ElementRef::Fill(f) => {
+                // Deleting a fill takes its edges and corners with it —
+                // otherwise the skeleton lingers after the body is gone.
+                let seg_ids: Vec<crate::core::ids::SegmentId> = self
+                    .doc
+                    .fill(f)
+                    .map(|fl| fl.segments.clone())
+                    .unwrap_or_default();
+                let pts = self.doc.element_points(ElementRef::Fill(f));
                 self.doc.remove_fill(f);
+                // Drop constraints internal to the fill (H/V rectangle
+                // edges etc.) so corners aren't held alive by them.
+                self.doc
+                    .constraints
+                    .retain(|c| !(pts.contains(&c.a) && pts.contains(&c.b)));
+                for s in seg_ids {
+                    self.delete_element(ElementRef::Segment(s));
+                }
             }
         }
         self.selection.retain(|&e| e != el);

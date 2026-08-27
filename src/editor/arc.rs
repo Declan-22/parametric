@@ -129,6 +129,36 @@ pub fn is_complete(doc: &Document, sid: SegmentId) -> bool {
     })
 }
 
+/// Sample count so the polyline approximation's chord error stays under
+/// ~0.5 screen px regardless of zoom. `zoom` = camera zoom.
+pub fn adaptive_samples(a: Point2, b: Point2, c: Point2, zoom: f64) -> usize {
+    let Some((o, r)) = circumcircle(a, b, c) else {
+        return 8;
+    };
+    let ang = |p: Point2| (p.y - o.y).atan2(p.x - o.x);
+    let a0 = ang(a);
+    let b0 = ang(b);
+    let c0 = ang(c);
+    const TAU: f64 = std::f64::consts::TAU;
+    let norm = |mut t: f64| {
+        while t < 0. {
+            t += TAU;
+        }
+        while t >= TAU {
+            t -= TAU;
+        }
+        t
+    };
+    let s_pos = norm(b0 - a0);
+    let s_neg = s_pos - TAU;
+    let sweep = if norm(c0 - a0) <= s_pos + 1e-9 { s_pos } else { s_neg };
+    let rs = r * zoom; // screen-space radius
+    // Sagitta per segment ≈ R·(θ/2)²/2; keeping it < 0.5px gives
+    // N > |sweep|·sqrt(R)/2.
+    let n = ((sweep.abs() * rs.sqrt()) / 2.0).ceil() as usize;
+    n.clamp(16, 4096)
+}
+
 /// Sampled polyline of an arc segment for rendering/hit-testing.
 pub fn segment_samples(doc: &Document, sid: SegmentId, n: usize) -> Option<Vec<Point2>> {
     let seg = doc.segment(sid)?;

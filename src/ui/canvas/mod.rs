@@ -446,7 +446,7 @@ impl CanvasView {
                             },
                             px(6.),
                             bg.unwrap_or(gpui::transparent_black().into()),
-                            gpui::Edges::all(px(2.)),
+                            gpui::Edges::all(px(1.)),
                             border,
                             gpui::BorderStyle::Solid,
                         ));

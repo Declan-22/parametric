@@ -23,6 +23,13 @@ actions!(
         BondCoincident,
         BondCombinePoints,
         BondDismiss,
+        // Tools
+        ToolMove,
+        ToolPan,
+        ToolRuler,
+        ToolLine,
+        ToolRectangle,
+        ToolCircle,
         // View
         ZoomIn,
         ZoomOut,

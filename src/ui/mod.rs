@@ -1,5 +1,6 @@
 pub mod actions;
 pub mod canvas;
+pub mod components;
 pub mod home;
 pub mod menu;
 pub mod shell;

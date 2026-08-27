@@ -164,7 +164,7 @@ impl Toolbar {
         );
 
         let shell_hover = self.shell.clone();
-        div()
+        let button = div()
             .id(tool_debug_name(tool))
             .w(px(34.))
             .h(px(34.))
@@ -178,10 +178,14 @@ impl Toolbar {
             .border_color(rgba(border))
             .bg(rgb(bg))
             .shadow(vec![shadow])
-            .on_hover(move |hovered, _, cx| {
-                let _ = shell_hover.update(cx, |shell, cx| {
-                    shell.animate_fade(&key, if *hovered { 1.0 } else { 0.0 }, cx);
-                });
+            .on_hover({
+                let shell_hover = shell_hover.clone();
+                let key = key.clone();
+                move |hovered, _, cx| {
+                    let _ = shell_hover.update(cx, |shell, cx| {
+                        shell.animate_fade(&key, if *hovered { 1.0 } else { 0.0 }, cx);
+                    });
+                }
             })
             .on_mouse_down(MouseButton::Left, move |_: &gpui::MouseDownEvent, _, cx| {
                 // Don't let tool clicks leak into the canvas beneath the
@@ -199,7 +203,33 @@ impl Toolbar {
                     .w(px(21.))
                     .h(px(21.))
                     .text_color(rgb(icon_color)),
-            )
+            );
+
+        // Tooltip: 8px to the right, vertically centered, with shortcut.
+        let (label, shortcut) = tool_tooltip(tool);
+        let tip_key = format!("tooltip-{}", tool_debug_name(tool));
+        let k_tip = self
+            .shell
+            .upgrade()
+            .map(|s| s.read(cx).fade(&tip_key))
+            .unwrap_or(0.0);
+        let shell_tip = self.shell.clone();
+        div()
+            .id(gpui::SharedString::from(format!(
+                "tooltip-wrap-{}",
+                tool_debug_name(tool)
+            )))
+            .relative()
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_hover(move |hovered, _, cx| {
+                let _ = shell_tip.update(cx, |shell, cx| {
+                    shell.animate_fade(&tip_key, if *hovered { 1.0 } else { 0.0 }, cx);
+                });
+            })
+            .child(button)
+            .child(crate::ui::components::tooltip::tooltip(t, label, shortcut, k_tip))
     }
 }
 
@@ -220,5 +250,16 @@ fn tool_debug_name(tool: Tool) -> &'static str {
         Tool::Rectangle => "tool-rectangle",
         Tool::Circle => "tool-circle",
         Tool::Ruler => "tool-ruler",
+    }
+}
+
+fn tool_tooltip(tool: Tool) -> (&'static str, &'static str) {
+    match tool {
+        Tool::Move => ("Move", "V"),
+        Tool::Pan => ("Pan", "Space"),
+        Tool::Ruler => ("Ruler", "M"),
+        Tool::Line => ("Line", "L"),
+        Tool::Rectangle => ("Rectangle", "R"),
+        Tool::Circle => ("Arc", "A"),
     }
 }

@@ -762,6 +762,78 @@ impl Render for Shell {
                     cx.notify();
                 }
             }))
+            .on_action(cx.listener(|shell, _: &crate::ui::actions::ToolMove, _, cx| {
+                if shell.renaming.is_some() {
+                    return;
+                }
+                if let Some(ed) = shell.editor.as_ref() {
+                    ed.update(cx, |ed, cx| {
+                        if ed.set_tool(crate::editor::Tool::Move) {
+                            cx.notify();
+                        }
+                    });
+                }
+            }))
+            .on_action(cx.listener(|shell, _: &crate::ui::actions::ToolPan, _, cx| {
+                if shell.renaming.is_some() {
+                    return;
+                }
+                if let Some(ed) = shell.editor.as_ref() {
+                    ed.update(cx, |ed, cx| {
+                        if ed.set_tool(crate::editor::Tool::Pan) {
+                            cx.notify();
+                        }
+                    });
+                }
+            }))
+            .on_action(cx.listener(|shell, _: &crate::ui::actions::ToolRuler, _, cx| {
+                if shell.renaming.is_some() {
+                    return;
+                }
+                if let Some(ed) = shell.editor.as_ref() {
+                    ed.update(cx, |ed, cx| {
+                        if ed.set_tool(crate::editor::Tool::Ruler) {
+                            cx.notify();
+                        }
+                    });
+                }
+            }))
+            .on_action(cx.listener(|shell, _: &crate::ui::actions::ToolLine, _, cx| {
+                if shell.renaming.is_some() {
+                    return;
+                }
+                if let Some(ed) = shell.editor.as_ref() {
+                    ed.update(cx, |ed, cx| {
+                        if ed.set_tool(crate::editor::Tool::Line) {
+                            cx.notify();
+                        }
+                    });
+                }
+            }))
+            .on_action(cx.listener(|shell, _: &crate::ui::actions::ToolRectangle, _, cx| {
+                if shell.renaming.is_some() {
+                    return;
+                }
+                if let Some(ed) = shell.editor.as_ref() {
+                    ed.update(cx, |ed, cx| {
+                        if ed.set_tool(crate::editor::Tool::Rectangle) {
+                            cx.notify();
+                        }
+                    });
+                }
+            }))
+            .on_action(cx.listener(|shell, _: &crate::ui::actions::ToolCircle, _, cx| {
+                if shell.renaming.is_some() {
+                    return;
+                }
+                if let Some(ed) = shell.editor.as_ref() {
+                    ed.update(cx, |ed, cx| {
+                        if ed.set_tool(crate::editor::Tool::Circle) {
+                            cx.notify();
+                        }
+                    });
+                }
+            }))
             .on_key_down(move |e: &gpui::KeyDownEvent, _, cx| {
                 // Only capture keys while the inline rename input is active.
                 if shell_keys.upgrade().and_then(|s| Some(s.read(cx).renaming.is_some())) != Some(true) {

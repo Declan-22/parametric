@@ -66,6 +66,13 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("1", BondCoincident, None),
         KeyBinding::new("2", BondCombinePoints, None),
         KeyBinding::new("escape", BondDismiss, None),
+        // Tool selection (canvas focused; also works globally when not renaming)
+        KeyBinding::new("v", ToolMove, None),
+        KeyBinding::new("space", ToolPan, None),
+        KeyBinding::new("m", ToolRuler, None),
+        KeyBinding::new("l", ToolLine, None),
+        KeyBinding::new("r", ToolRectangle, None),
+        KeyBinding::new("a", ToolCircle, None),
     ]);
 }
 

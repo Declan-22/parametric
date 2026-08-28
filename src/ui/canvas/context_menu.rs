@@ -63,7 +63,8 @@ impl ContextMenu {
 
 // -- icons --
 
-pub const ICON_COINCIDENT: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+pub const ICON_COINCIDENT: &[u8] =
+    br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
   <circle cx="12" cy="5" r="2" fill="currentColor"/>
   <circle cx="12" cy="19" r="2" fill="currentColor"/>
   <path d="M12 7v10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
@@ -111,13 +112,15 @@ pub fn draw(
         .gap_y(px(ITEM_GAP))
         .bg(rgb(t.bg_darker))
         .border_1()
-        .border_color(rgb(t.component_border_color))
+        .border_color(rgb(t.menu_border_color))
         .rounded(px(8.))
         .shadow(vec![t.shadow_sm()])
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
 
     for (i, entry) in entries.into_iter().enumerate() {
-        let k = editor_up.read(cx).context_menu_fade(&format!("ctx-entry-{i}"));
+        let k = editor_up
+            .read(cx)
+            .context_menu_fade(&format!("ctx-entry-{i}"));
         let bg = lerp_rgb(t.bg_darker, t.bg_tertiary, k);
         let border = fade_in((t.border_color << 8) | 0xFF, k);
         let ed_click = editor.clone();

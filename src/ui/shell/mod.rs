@@ -165,6 +165,13 @@ impl Shell {
         }
         self.design_name = meta.name.clone();
         self.view = View::Design(id);
+        // Leaving home: drop card hover fades so the gallery doesn't
+        // render a stale accent border when we come back.
+        self.fades
+            .retain(|k, _| !k.starts_with("card-"));
+        self.fade_pending.retain(|k, _| !k.starts_with("card-"));
+        self.fade_tween_active
+            .retain(|k| !k.starts_with("card-"));
         self.editor = Some(cx.new(|_| Editor::from_document(doc)));
         cx.notify();
     }

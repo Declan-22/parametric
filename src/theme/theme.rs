@@ -1,4 +1,5 @@
-use super::colors::*;use gpui::{BoxShadow, Point, px, rgba};
+use super::colors::*;
+use gpui::{BoxShadow, Point, px, rgba};
 
 pub const FONT_UI: &str = "Geist";
 pub const FONT_MONO: &str = "Departure Mono";
@@ -43,6 +44,7 @@ pub struct Theme {
     pub bg_darker: u32,
 
     pub border_color: u32,
+    pub menu_border_color: u32,
     pub component_border_color: u32,
 
     pub text_primary: u32,
@@ -101,6 +103,7 @@ impl Theme {
             bg_darker: LIGHT_BG_DARKER,
 
             border_color: LIGHT_BORDER_COLOR,
+            menu_border_color: LIGHT_MENU_BORDER_COLOR,
             component_border_color: LIGHT_COMPONENT_BORDER_COLOR,
 
             text_primary: LIGHT_TEXT_PRIMARY,
@@ -129,6 +132,7 @@ impl Theme {
             bg_darker: DARK_BG_DARKER,
 
             border_color: DARK_BORDER_COLOR,
+            menu_border_color: DARK_MENU_BORDER_COLOR,
             component_border_color: DARK_COMPONENT_BORDER_COLOR,
 
             text_primary: DARK_TEXT_PRIMARY,

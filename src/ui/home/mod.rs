@@ -1,8 +1,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    App, Bounds, IntoElement, MouseButton, Pixels, Point, RenderOnce, Size, WeakEntity, Window, canvas, div,
-    fill, prelude::*, px, rgb, rgba, svg,
+    App, Bounds, IntoElement, MouseButton, Pixels, Point, RenderOnce, Size, WeakEntity, Window,
+    canvas, div, fill, prelude::*, px, rgb, rgba, svg,
 };
 
 use crate::persistence::registry::DesignMeta;
@@ -25,9 +25,18 @@ pub struct HomeView {
 }
 
 impl RenderOnce for HomeView {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let t = *crate::theme::active(cx);
         let designs = self.designs;
+
+        // Uniform grid: fit as many preferred-width cards as possible per
+        // row, then stretch them all to the same width. Full rows and the
+        // last row share identical card dimensions.
+        const GAP: f32 = 16.;
+        const PAD: f32 = 16.;
+        let content_w = (window.viewport_size().width.as_f32() - PAD * 2.).max(CARD_WIDTH);
+        let per_row = (((content_w + GAP) / (CARD_WIDTH + GAP)).floor() as i32).max(1) as f32;
+        let card_w = (content_w - GAP * (per_row - 1.)) / per_row;
 
         let shell = self.shell.clone();
         let shell_hover = self.shell.clone();
@@ -73,27 +82,36 @@ impl RenderOnce for HomeView {
             .size_full()
             .overflow_y_scroll()
             .child(div().flex().justify_end().p(px(16.)).child(new_btn))
-            .child(div().flex().flex_wrap().gap(px(16.)).px(px(16.)).children(
-                designs.into_iter().map(|meta| {
-                    let is_renaming = self.renaming.as_ref().map(|r| r.id) == Some(meta.id);
-                    let rename_value = if is_renaming {
-                        self.renaming
-                            .as_ref()
-                            .filter(|r| r.id == meta.id)
-                            .map(|r| r.value.clone())
-                            .unwrap_or_default()
-                    } else {
-                        String::new()
-                    };
-                    DesignCard {
-                        meta,
-                        shell: self.shell.clone(),
-                        is_renaming,
-                        caret_visible: self.caret_visible,
-                        rename_value,
-                    }
-                }),
-            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(16.))
+                    .px(px(16.))
+                    .children(
+                        designs.into_iter().map(|meta| {
+                            let is_renaming =
+                                self.renaming.as_ref().map(|r| r.id) == Some(meta.id);
+                            let rename_value = if is_renaming {
+                                self.renaming
+                                    .as_ref()
+                                    .filter(|r| r.id == meta.id)
+                                    .map(|r| r.value.clone())
+                                    .unwrap_or_default()
+                            } else {
+                                String::new()
+                            };
+                            DesignCard {
+                                meta,
+                                shell: self.shell.clone(),
+                                is_renaming,
+                                caret_visible: self.caret_visible,
+                                rename_value,
+                                card_w,
+                            }
+                        }),
+                    ),
+            )
     }
 }
 
@@ -104,6 +122,7 @@ struct DesignCard {
     is_renaming: bool,
     caret_visible: bool,
     rename_value: String,
+    card_w: f32,
 }
 
 impl RenderOnce for DesignCard {
@@ -179,19 +198,45 @@ impl RenderOnce for DesignCard {
         let shell_caret_visible = self.caret_visible;
         let rename_value = self.rename_value.clone();
 
+        // 2px accent border fades in on hover; transparent at rest so the
+        // layout never shifts. Alpha-only fade (no dark flash mid-tween).
+        // The right-clicked card keeps its border while its menu is open.
+        let k = self
+            .shell
+            .upgrade()
+            .map(|s| {
+                let s = s.read(cx);
+                let menued = s.context_menu.as_ref().map(|m| m.id) == Some(meta_id);
+                s.fade(&format!("card-{meta_id}"))
+                    .max(if menued { 1.0 } else { 0.0 })
+            })
+            .unwrap_or(0.0);
+        let card_border = crate::theme::fade_in((t.accent << 8) | 0xFF, k);
+
         div()
             .id(gpui::ElementId::NamedInteger(
                 "design-card".into(),
                 meta_id as u64,
             ))
-            .w(px(CARD_WIDTH))
+            .w(px(self.card_w))
             .cursor_pointer()
             .p(px(5.))
             .rounded(px(10.))
             .bg(rgb(t.bg_secondary))
-            .border_1()
-            .border_color(rgb(t.component_border_color))
-            // Constant border; no hover restyle, just the pointer cursor.
+            .border_2()
+            .border_color(rgba(card_border))
+            .on_hover({
+                let shell_hover = self.shell.clone();
+                move |hovered, _, cx| {
+                    let _ = shell_hover.update(cx, |shell, cx| {
+                        shell.animate_fade(
+                            &format!("card-{meta_id}"),
+                            if *hovered { 1.0 } else { 0.0 },
+                            cx,
+                        );
+                    });
+                }
+            })
             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                 let id = meta_id;
                 let _ = shell_click.update(cx, |shell, cx| shell.open_design(id, cx));
@@ -289,8 +334,15 @@ fn edited_ago(updated_at: i64) -> String {
     }
 }
 
+const ICON_OPEN: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24"><path d="M0 0h24v24H0z" fill="none" /><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 16.158V7.84c0-1.847 0-2.77.518-3.444c.517-.674 1.41-.912 3.194-1.387l3.508-.936A2.21 2.21 0 0 1 14 4.21v15.58a2.21 2.21 0 0 1-2.78 2.136l-3.508-.936c-1.785-.476-2.677-.714-3.194-1.387C4 18.928 4 18.005 4 16.158M11 11v2m6.5 7c.465 0 .697 0 .89-.04a2 2 0 0 0 1.572-1.57c.038-.194.038-.426.038-.89v-11c0-.465 0-.698-.038-.89a2 2 0 0 0-1.572-1.572c-.193-.039-.425-.039-.89-.039" /></svg>"#;
+const ICON_RENAME: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 16 16">
+	<path d="M0 0h16v16H0z" fill="none" />
+	<path fill="currentColor" d="M6.5 2a.5.5 0 0 0 0 1h1v10h-1a.5.5 0 0 0 0 1h3a.5.5 0 0 0 0-1h-1V3h1a.5.5 0 0 0 0-1zM4 4h2.5v1H4a1 1 0 0 0-1 1v3.997a1 1 0 0 0 1 1h2.5v1H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2m8 6.997H9.5v1H12a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2H9.5v1H12a1 1 0 0 1 1 1v3.997a1 1 0 0 1-1 1" />
+</svg>"#;
+const ICON_DELETE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24"><path d="M0 0h24v24H0z" fill="none" /><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.5" d="m19.5 5.5l-.62 10.025c-.158 2.561-.237 3.842-.88 4.763a4 4 0 0 1-1.2 1.128c-.957.584-2.24.584-4.806.584c-2.57 0-3.855 0-4.814-.585a4 4 0 0 1-1.2-1.13c-.642-.922-.72-2.205-.874-4.77L4.5 5.5M3 5.5h18m-4.944 0l-.683-1.408c-.453-.936-.68-1.403-1.071-1.695a2 2 0 0 0-.275-.172C13.594 2 13.074 2 12.035 2c-1.066 0-1.599 0-2.04.234a2 2 0 0 0-.278.18c-.395.303-.616.788-1.058 1.757L8.053 5.5m1.447 11v-6m5 6v-6" /></svg>"#;
+
 // Right-click context menu for a gallery card. Styling mirrors the app
-// dropdown menu (bg_darker panel, bordered hover entries).
+// dropdown menu (bg_darker panel, entries highlight on hover).
 pub fn render_context_menu(
     menu: &crate::ui::shell::DesignContextMenu,
     shell_entity: WeakEntity<Shell>,
@@ -298,7 +350,7 @@ pub fn render_context_menu(
     t: Theme,
     _cx: &App,
 ) -> impl IntoElement {
-    use crate::theme::{fade_in, lerp_rgb, lerp_rgba};
+    use crate::theme::{fade_in, lerp_rgb};
     use gpui::{MouseDownEvent, SharedString, rgba};
 
     let menu_id = menu.id;
@@ -307,31 +359,35 @@ pub fn render_context_menu(
 
     let fade_of = |index: usize| -> f32 { shell.fade(&format!("ctx-{index}")) };
 
-    let entry = |label: &'static str, index: usize, destructive: bool| -> gpui::AnyElement {
+    let entry = |label: &'static str,
+                 icon: &'static [u8],
+                 index: usize,
+                 destructive: bool|
+     -> gpui::AnyElement {
         let shell_weak = shell_entity.clone();
         let k = fade_of(index);
         let bg = lerp_rgb(t.bg_darker, t.bg_tertiary, k);
-        let border = lerp_rgba(
-            (t.component_border_color << 8) | 0xFF,
-            (t.border_color << 8) | 0xFF,
-            k,
-        );
+        // Border is transparent at rest and fades in with the hover.
+        // Alpha-only fade: lerping RGB from black causes a dark flash.
+        let border = fade_in((t.border_color << 8) | 0xFF, k);
         let mut shadow = t.shadow_sm();
         shadow.color = gpui::rgba(fade_in(t.item_shadow_color, k)).into();
+        let fg = if destructive {
+            rgb(0xE53E3E)
+        } else {
+            rgb(t.text_primary)
+        };
 
         div()
             .id(SharedString::from(format!("ctx-{index}")))
             .flex()
             .items_center()
+            .gap_x(px(4.))
             .h(px(26.))
-            .px(px(10.))
+            .px(px(4.))
             .rounded(px(6.))
             .text_sm()
-            .text_color(if destructive {
-                rgb(0xE53E3E)
-            } else {
-                rgb(t.text_primary)
-            })
+            .text_color(fg)
             .cursor_pointer()
             .border_1()
             .border_color(rgba(border))
@@ -365,6 +421,7 @@ pub fn render_context_menu(
                     });
                 }
             })
+            .child(svg().data(icon).w(px(13.)).h(px(13.)).text_color(fg))
             .child(label)
             .into_any_element()
     };
@@ -374,7 +431,7 @@ pub fn render_context_menu(
         .absolute()
         .left(px(left))
         .top(px(top))
-        .w(px(160.))
+        .w(px(120.))
         .flex()
         .flex_col()
         .px(px(4.))
@@ -382,11 +439,11 @@ pub fn render_context_menu(
         .gap_y(px(2.))
         .bg(rgb(t.bg_darker))
         .border_1()
-        .border_color(rgb(t.component_border_color))
+        .border_color(rgb(t.menu_border_color))
         .rounded(px(8.))
         .shadow(vec![t.shadow_sm()])
         .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-        .child(entry("Open", 0, false))
-        .child(entry("Rename", 1, false))
-        .child(entry("Delete", 2, true))
+        .child(entry("Open", ICON_OPEN, 0, false))
+        .child(entry("Rename", ICON_RENAME, 1, false))
+        .child(entry("Delete", ICON_DELETE, 2, true))
 }

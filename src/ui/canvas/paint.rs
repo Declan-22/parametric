@@ -87,6 +87,9 @@ pub fn build_draw_list(
     pending_line: Option<(Point2, Point2)>,
     constraint_markers: &[crate::editor::dims::ConstraintMarker],
     pending_circle: Option<crate::editor::PendingCircle>,
+    show_grid: bool,
+    grid_size: f64,
+    tool: crate::editor::Tool,
 ) -> Vec<Primitive> {
     let min = camera.screen_to_unit(Point2::new(0., 0.));
     let max = camera.screen_to_unit(Point2::new(
@@ -99,6 +102,16 @@ pub fn build_draw_list(
     let color: gpui::Background = rgb(0x808080).into();
     let accent: gpui::Background = rgb(t.accent).into();
     let mut list = Vec::new();
+
+    // 0) Infinite grid — viewport-culled, LOD-clamped, pan-aware. This is the
+    // "genius" part: cost is O(viewport) not O(world). We never allocate
+    // world-sized geometry; we recompute the handful of lines intersecting the
+    // visible doc rect each frame, and we double the step when zoomed out so
+    // the primitive count stays bounded (~viewport/min_spacing). Pan just shifts
+    // which lines are emitted — the grid is document-anchored, not screen-locked.
+    push_grid(
+        &mut list, camera, viewport, visible, t, show_grid, grid_size,
+    );
 
     let scr = |p: Point2| {
         let s = camera.unit_to_screen(p);
@@ -143,7 +156,9 @@ pub fn build_draw_list(
                     });
                 }
                 ElementRef::Segment(sid) => {
-                    let Some(seg) = doc.segment(sid) else { continue };
+                    let Some(seg) = doc.segment(sid) else {
+                        continue;
+                    };
                     if seg.kind == SegmentKind::Ruler
                         && let Some((a, b)) = doc.segment_geom(sid)
                         && (visible.contains(a) || visible.contains(b))
@@ -173,20 +188,22 @@ pub fn build_draw_list(
                     // dashed complementary portion.
                     if seg.kind == SegmentKind::Arc {
                         let Some(sc) = seg.ctrl else { continue };
-                        let (Some(sa), Some(sb), Some(scp)) = (
-                            doc.point(seg.start),
-                            doc.point(seg.end),
-                            doc.point(sc),
-                        ) else {
-                            continue;
-                        };
-                        let n = crate::editor::arc::adaptive_samples(sa, sb, scp, camera.zoom);
-                        let Some(samples) = crate::editor::arc::segment_samples(doc, sid, n)
+                        let (Some(sa), Some(sb), Some(scp)) =
+                            (doc.point(seg.start), doc.point(seg.end), doc.point(sc))
                         else {
                             continue;
                         };
+                        let n = crate::editor::arc::adaptive_samples(sa, sb, scp, camera.zoom);
+                        let Some(samples) = crate::editor::arc::segment_samples(doc, sid, n) else {
+                            continue;
+                        };
                         if samples.iter().any(|p| visible.contains(*p)) {
-                            push_polyline(&mut list, &samples.iter().map(|p| scr(*p)).collect::<Vec<_>>(), 1.5, color);
+                            push_polyline(
+                                &mut list,
+                                &samples.iter().map(|p| scr(*p)).collect::<Vec<_>>(),
+                                1.5,
+                                color,
+                            );
                         }
                         // Dashed complement while incomplete — show whenever the
                         // arc itself is selected, or any of its defining
@@ -199,14 +216,19 @@ pub fn build_draw_list(
                                     || selection.contains(&ElementRef::Point(seg.start))
                                     || selection.contains(&ElementRef::Point(seg.end))
                             })
-                            || seg.center.is_some_and(|c| selection.contains(&ElementRef::Point(c)));
+                            || seg
+                                .center
+                                .is_some_and(|c| selection.contains(&ElementRef::Point(c)));
                         if !complete
                             && arc_selected
-                            && seg.ctrl.is_some_and(|c| selection.contains(&ElementRef::Point(c))
-                                || selection.contains(&ElementRef::Point(seg.start))
-                                || selection.contains(&ElementRef::Point(seg.end)))
+                            && seg.ctrl.is_some_and(|c| {
+                                selection.contains(&ElementRef::Point(c))
+                                    || selection.contains(&ElementRef::Point(seg.start))
+                                    || selection.contains(&ElementRef::Point(seg.end))
+                            })
                         {
-                            let comp = crate::editor::arc::complement_samples(sa, sb, scp, n.max(32));
+                            let comp =
+                                crate::editor::arc::complement_samples(sa, sb, scp, n.max(32));
                             let pts: Vec<(f32, f32)> = comp.iter().map(|p| scr(*p)).collect();
                             dashed_polyline(&mut list, &pts, accent);
                         }
@@ -230,8 +252,7 @@ pub fn build_draw_list(
     }
 
     // 2b) Constraint guide lines (distant H/V pairs), under everything.
-    let guide_color: gpui::Background =
-        rgba((t.accent << 8) | 0x66).into();
+    let guide_color: gpui::Background = rgba((t.accent << 8) | 0x66).into();
     for m in constraint_markers {
         if let Some(g) = m.guide {
             dashed_line(&mut list, g[0], g[1], g[2], g[3], guide_color);
@@ -240,15 +261,33 @@ pub fn build_draw_list(
 
     // 3) Snap feedback markers. During CREATION they mark the exact lock
     // location (cursor snapping) so it's obvious what you're joined to.
-    let creating = pending.is_some() || pending_line.is_some();
+    // Grid snap now only at intersections, so guides are at crossings.
+    let is_creation = matches!(
+        tool,
+        crate::editor::Tool::Rectangle
+            | crate::editor::Tool::Line
+            | crate::editor::Tool::Ruler
+            | crate::editor::Tool::Circle
+    );
     for g in snap_guides {
+        let s = camera.unit_to_screen(g.to);
         list.push(Primitive::Circle {
-            cx: g.to.x as f32,
-            cy: g.to.y as f32,
+            cx: s.x as f32,
+            cy: s.y as f32,
             radius: 4.,
         });
+        // When creating with crosshair and snapped, show 1px accent square
+        // border around the crosshair (spec). Only for creation tools.
+        if is_creation {
+            const SQUARE: f32 = 12.0;
+            list.push(Primitive::Outline {
+                x: s.x as f32 - SQUARE / 2.0,
+                y: s.y as f32 - SQUARE / 2.0,
+                w: SQUARE,
+                h: SQUARE,
+            });
+        }
     }
-    let _ = creating;
 
     // 4) Hover affordance: accent outline of the hovered element.
     if let Some(h) = hover
@@ -266,7 +305,11 @@ pub fn build_draw_list(
         for pid in doc.element_points(sel) {
             if let Some(p) = doc.point(pid) {
                 let (x, y) = scr(p);
-                list.push(Primitive::Circle { cx: x, cy: y, radius: 4. });
+                list.push(Primitive::Circle {
+                    cx: x,
+                    cy: y,
+                    radius: 4.,
+                });
             }
         }
     }
@@ -290,22 +333,23 @@ pub fn build_draw_list(
                 continue;
             }
             // Prefer the stored center point (real document point) if present.
-            let center_pos = seg
-                .center
-                .and_then(|id| doc.point(id))
-                .or_else(|| {
-                    let (Some(a), Some(b), Some(c)) = (
-                        doc.point(seg.start),
-                        doc.point(seg.end),
-                        seg.ctrl.and_then(|id| doc.point(id)),
-                    ) else {
-                        return None;
-                    };
-                    crate::editor::arc::circumcircle(a, b, c).map(|(o, _)| o)
-                });
+            let center_pos = seg.center.and_then(|id| doc.point(id)).or_else(|| {
+                let (Some(a), Some(b), Some(c)) = (
+                    doc.point(seg.start),
+                    doc.point(seg.end),
+                    seg.ctrl.and_then(|id| doc.point(id)),
+                ) else {
+                    return None;
+                };
+                crate::editor::arc::circumcircle(a, b, c).map(|(o, _)| o)
+            });
             if let Some(center) = center_pos {
                 let (cx0, cy0) = scr(center);
-                list.push(Primitive::Circle { cx: cx0, cy: cy0, radius: 3. });
+                list.push(Primitive::Circle {
+                    cx: cx0,
+                    cy: cy0,
+                    radius: 3.,
+                });
             }
         }
     }
@@ -401,7 +445,14 @@ pub fn build_draw_list(
     if let Some((a, b)) = pending_line {
         let (ax, ay) = scr(a);
         let (bx, by) = scr(b);
-        list.push(Primitive::Line { ax, ay, bx, by, width: 1., color: accent });
+        list.push(Primitive::Line {
+            ax,
+            ay,
+            bx,
+            by,
+            width: 1.,
+            color: accent,
+        });
     }
 
     // In-progress circle preview, per stage:
@@ -423,13 +474,21 @@ pub fn build_draw_list(
                     let pts: Vec<(f32, f32)> = arc.iter().map(|p| scr(*p)).collect();
                     push_polyline(&mut list, &pts, 1.5, color);
                     let comp = crate::editor::arc::complement_samples(a, b, pc.cursor, n.max(32));
-                    dashed_polyline(&mut list, &comp.iter().map(|p| scr(*p)).collect::<Vec<_>>(), accent);
+                    dashed_polyline(
+                        &mut list,
+                        &comp.iter().map(|p| scr(*p)).collect::<Vec<_>>(),
+                        accent,
+                    );
                     // Radius guide: true center -> cursor (visible handle).
                     if let Some((center, _)) = crate::editor::arc::circumcircle(a, b, pc.cursor) {
                         let (mx, my) = scr(center);
                         let (cx0, cy0) = scr(pc.cursor);
                         dashed_polyline(&mut list, &[(mx, my), (cx0, cy0)], accent);
-                        list.push(Primitive::Circle { cx: mx, cy: my, radius: 3. });
+                        list.push(Primitive::Circle {
+                            cx: mx,
+                            cy: my,
+                            radius: 3.,
+                        });
                     }
                 }
             }
@@ -448,15 +507,35 @@ fn push_chord_preview(
 ) {
     let (ax, ay) = scr(a);
     let (bx, by) = scr(b);
-    list.push(Primitive::Line { ax, ay, bx, by, width: 1., color: accent });
-    list.push(Primitive::Circle { cx: ax, cy: ay, radius: 3. });
-    list.push(Primitive::Circle { cx: bx, cy: by, radius: 3. });
+    list.push(Primitive::Line {
+        ax,
+        ay,
+        bx,
+        by,
+        width: 1.,
+        color: accent,
+    });
+    list.push(Primitive::Circle {
+        cx: ax,
+        cy: ay,
+        radius: 3.,
+    });
+    list.push(Primitive::Circle {
+        cx: bx,
+        cy: by,
+        radius: 3.,
+    });
 }
 
 const LINE_W: f32 = 1.5;
 
 // Solid polyline (arc rendering).
-fn push_polyline(list: &mut Vec<Primitive>, pts: &[(f32, f32)], width: f32, color: gpui::Background) {
+fn push_polyline(
+    list: &mut Vec<Primitive>,
+    pts: &[(f32, f32)],
+    width: f32,
+    color: gpui::Background,
+) {
     for w in pts.windows(2) {
         list.push(Primitive::Line {
             ax: w[0].0,
@@ -492,7 +571,11 @@ fn dashed_polyline(list: &mut Vec<Primitive>, pts: &[(f32, f32)], color: gpui::B
         while t < len {
             let phase = (acc + t) % PERIOD;
             let is_dash = phase < DASH;
-            let remaining = if is_dash { DASH - phase } else { PERIOD - phase };
+            let remaining = if is_dash {
+                DASH - phase
+            } else {
+                PERIOD - phase
+            };
             let seg = remaining.min(len - t);
             if is_dash {
                 list.push(Primitive::Line {
@@ -524,7 +607,11 @@ fn element_outline(
         ElementRef::Point(pid) => {
             if let Some(p) = doc.point(pid) {
                 let (x, y) = scr(p);
-                list.push(Primitive::Circle { cx: x, cy: y, radius: 4. });
+                list.push(Primitive::Circle {
+                    cx: x,
+                    cy: y,
+                    radius: 4.,
+                });
             }
         }
         ElementRef::Segment(sid) => {
@@ -544,14 +631,29 @@ fn element_outline(
             } else if let Some((a, b)) = doc.segment_geom(sid) {
                 let (ax, ay) = scr(a);
                 let (bx, by) = scr(b);
-                list.push(Primitive::Line { ax, ay, bx, by, width: 2.5, color: accent });
+                list.push(Primitive::Line {
+                    ax,
+                    ay,
+                    bx,
+                    by,
+                    width: 2.5,
+                    color: accent,
+                });
             }
-        }        ElementRef::Fill(fid) => {
+        }
+        ElementRef::Fill(fid) => {
             if let Some(pts) = crate::editor::pick::loop_points(doc, fid) {
                 for i in 0..pts.len() {
                     let (ax, ay) = scr(pts[i]);
                     let (bx, by) = scr(pts[(i + 1) % pts.len()]);
-                    list.push(Primitive::Line { ax, ay, bx, by, width: 2., color: accent });
+                    list.push(Primitive::Line {
+                        ax,
+                        ay,
+                        bx,
+                        by,
+                        width: 2.,
+                        color: accent,
+                    });
                 }
             }
         }
@@ -567,8 +669,10 @@ fn overlaps(a: Rect, b: Rect) -> bool {
 
 fn screen_rect(unit: Rect, cam: &Camera) -> (f32, f32, f32, f32) {
     let tl = cam.unit_to_screen(unit.origin);
-    let br =
-        cam.unit_to_screen(Point2::new(unit.origin.x + unit.size.w, unit.origin.y + unit.size.h));
+    let br = cam.unit_to_screen(Point2::new(
+        unit.origin.x + unit.size.w,
+        unit.origin.y + unit.size.h,
+    ));
     (
         tl.x.min(br.x) as f32,
         tl.y.min(br.y) as f32,
@@ -586,7 +690,14 @@ fn push_ruler(list: &mut Vec<Primitive>, a: Point2, b: Point2, cam: &Camera, t: 
     // Baseline sits exactly on the stored segment.
     let (ax, ay) = ruler::to_screen(cam, a);
     let (bx, by) = ruler::to_screen(cam, b);
-    list.push(Primitive::Line { ax, ay, bx, by, width: 1., color: ink });
+    list.push(Primitive::Line {
+        ax,
+        ay,
+        bx,
+        by,
+        width: 1.,
+        color: ink,
+    });
 
     for tick in ruler::ticks(a, b) {
         let (x0, y0) = ruler::to_screen(cam, tick.base);
@@ -610,8 +721,182 @@ fn push_ruler(list: &mut Vec<Primitive>, a: Point2, b: Point2, cam: &Camera, t: 
             in_value: format!("{in_n}"),
         });
     }
-}// Dashed straight line between two screen points, any angle.
-fn dashed_line(list: &mut Vec<Primitive>, ax: f32, ay: f32, bx: f32, by: f32, color: gpui::Background) {    const DASH: f32 = 6.;
+} // Infinite document-anchored grid. Optimized to feel free:
+//  - Screen-space tiling: offset = -(pan*zoom) % step_screen, so pan slides
+//    the lattice (different parts become visible) instead of a static overlay.
+//  - Viewport-culled: only emits lines whose screen coord lands in [0, viewport].
+//  - LOD clamp: effective doc step doubles until screen spacing >= MIN_PX, so
+//    zoomed-out never emits thousands of sub-pixel lines.
+//  - O(viewport) primitive count: at most ~viewport/MIN_PX per axis.
+//  - Pixel-snapped 1px quads (cheapest GPU primitive), no allocation beyond vec.
+fn push_grid(
+    list: &mut Vec<Primitive>,
+    camera: &Camera,
+    viewport: Size<Pixels>,
+    _visible: Rect,
+    t: Theme,
+    show_grid: bool,
+    grid_size: f64,
+) {
+    if !show_grid {
+        return;
+    }
+    if grid_size < 1e-6 || camera.zoom < 1e-9 {
+        return;
+    }
+    let vw = f64::from(viewport.width);
+    let vh = f64::from(viewport.height);
+    if vw < 1. || vh < 1. {
+        return;
+    }
+
+    // Hierarchical 5x5 grid like Fusion360: big squares contain 5x5
+    // smaller squares, and as you zoom in each 5x5 cell subdivides into
+    // another 5x5. Grid is document-anchored (multiples of grid_size) so
+    // an object placed on an intersection stays on that intersection when
+    // you zoom — no popping to the middle of a cell.
+    // Opacity: outer shell full border_color, each finer level 50% of parent.
+    const MIN_SCREEN_PX: f64 = 16.0;
+    const MAX_SCREEN_PX: f64 = 80.0; // 16*5, so one 5x step fits the band
+    // Find the minor level where screen spacing is in [MIN,MAX]. This is the
+    // finest level that is still readable; coarser is major, finer is subdiv.
+    let mut minor_step = grid_size;
+    let mut minor_screen = minor_step * camera.zoom;
+    // First, bring into band by multiplying/dividing by 5 (stable, not 2)
+    for _ in 0..16 {
+        if minor_screen >= MIN_SCREEN_PX && minor_screen <= MAX_SCREEN_PX {
+            break;
+        }
+        if minor_screen < MIN_SCREEN_PX {
+            minor_step *= 5.0;
+            minor_screen *= 5.0;
+        } else if minor_screen > MAX_SCREEN_PX {
+            minor_step /= 5.0;
+            minor_screen /= 5.0;
+        }
+        if minor_step > 1e7 || minor_step < 1e-6 {
+            return;
+        }
+    }
+    // Clamp once more if still out of band (extreme zoom)
+    if minor_screen < MIN_SCREEN_PX * 0.5 || minor_screen > MAX_SCREEN_PX * 2.0 {
+        // Fallback to single level at base grid_size
+        minor_step = grid_size;
+        minor_screen = minor_step * camera.zoom;
+    }
+
+    let major_step = minor_step * 5.0;
+    let major_screen = minor_screen * 5.0;
+    let finer_step = minor_step / 5.0;
+    let finer_screen = minor_screen / 5.0;
+
+    let vw_f = vw as f32;
+    let vh_f = vh as f32;
+
+    // Helper to draw a grid level with given step and color
+    let mut draw_level = |step: f64, screen: f64, color: gpui::Background| {
+        if step < 1e-6 || screen < 4.0 {
+            return;
+        }
+        // Don't draw if it would be too dense (thousands of lines) or too sparse
+        if screen < 8.0 || screen > 400.0 {
+            return;
+        }
+        let off_x = (-camera.pan.x * camera.zoom).rem_euclid(screen);
+        let off_y = (-camera.pan.y * camera.zoom).rem_euclid(screen);
+        let mut x = off_x;
+        let mut count = 0usize;
+        while x <= vw + 1e-6 && count < 4096 {
+            let sx = x.floor() as f32;
+            if sx >= 0.0 && sx < vw_f {
+                list.push(Primitive::Rect {
+                    x: sx,
+                    y: 0.0,
+                    w: 1.0,
+                    h: vh_f,
+                    color,
+                });
+            }
+            x += screen;
+            count += 1;
+        }
+        let mut y = off_y;
+        count = 0;
+        while y <= vh + 1e-6 && count < 4096 {
+            let sy = y.floor() as f32;
+            if sy >= 0.0 && sy < vh_f {
+                list.push(Primitive::Rect {
+                    x: 0.0,
+                    y: sy,
+                    w: vw_f,
+                    h: 1.0,
+                    color,
+                });
+            }
+            y += screen;
+            count += 1;
+        }
+    };
+
+    // Draw from coarsest to finest so finer (more transparent) is on top
+    // Major (outer shell) full opacity
+    let major_color: gpui::Background = rgb(t.border_color).into();
+    // Minor 50% lower opacity than major
+    let minor_color: gpui::Background =
+        rgba((t.border_color << 8) | 0x80).into(); // 50%
+    // Finer 50% lower than minor (25% of original)
+    let finer_color: gpui::Background =
+        rgba((t.border_color << 8) | 0x40).into(); // 25%
+
+    // Only draw finer if it will be readable (not too dense)
+    let finer_visible = finer_screen >= 8.0 && finer_screen < MIN_SCREEN_PX * 2.0;
+    let minor_visible = minor_screen >= MIN_SCREEN_PX && minor_screen <= MAX_SCREEN_PX * 2.0;
+    let major_visible = major_screen >= MIN_SCREEN_PX && major_screen <= 600.0;
+
+    if major_visible {
+        draw_level(major_step, major_screen, major_color);
+    }
+    if minor_visible {
+        // If major was drawn, minor is the 5x subdivision inside it at 50% opacity.
+        // If major wasn't drawn (extreme zoom), minor becomes the outer shell at full opacity.
+        let c = if major_visible { minor_color } else { major_color };
+        draw_level(minor_step, minor_screen, c);
+    }
+    if finer_visible {
+        // Finer subdivision inside minor
+        let c = if minor_visible && major_visible {
+            finer_color
+        } else if minor_visible {
+            minor_color
+        } else {
+            major_color
+        };
+        draw_level(finer_step, finer_screen, c);
+    }
+    // Fallback: if nothing was drawn (extreme), draw base grid at full opacity
+    if !major_visible && !minor_visible && !finer_visible {
+        draw_level(grid_size, grid_size * camera.zoom, major_color);
+    }
+
+    // Push the whole grid down 36px so it doesn't sit under the TitleBar.
+    const GRID_Y_OFFSET: f32 = crate::ui::shell::title_bar::TITLE_BAR_HEIGHT;
+    for prim in list.iter_mut() {
+        if let Primitive::Rect { y, .. } = prim {
+            *y += GRID_Y_OFFSET;
+        }
+    }
+}
+
+// Dashed straight line between two screen points, any angle.
+fn dashed_line(
+    list: &mut Vec<Primitive>,
+    ax: f32,
+    ay: f32,
+    bx: f32,
+    by: f32,
+    color: gpui::Background,
+) {
+    const DASH: f32 = 6.;
     const GAP: f32 = 4.;
     let dx = bx - ax;
     let dy = by - ay;

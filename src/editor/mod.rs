@@ -98,6 +98,11 @@ pub struct Editor {
     pub(crate) dragging: Option<DragState>,
     next_layer_id: u64,
     pan_start: Option<(gpui::Pixels, gpui::Pixels, Camera)>,
+    // Canvas grid + snapping (phase 2).
+    pub show_grid: bool,
+    pub grid_size: f64,
+    pub snap_to_grid: bool,
+    pub snap_to_objects: bool,
 }
 
 const HANDLE_TOL_PX: f64 = 14.0;
@@ -155,6 +160,10 @@ impl Editor {
             dragging: None,
             next_layer_id: next_layer_id.max(2),
             pan_start: None,
+            show_grid: true,
+            grid_size: 20.0,
+            snap_to_grid: false,
+            snap_to_objects: true,
         }
     }
 
@@ -219,8 +228,46 @@ impl Editor {
         v
     }
 
+    /// Grid snap: strongest at intersections. Requires BOTH axes within
+    /// tolerance so you can move freely between grid lines but snap
+    /// strongly when near an intersection. This keeps the grid feeling
+    /// like a magnet at crossings, not a rail along lines.
+    fn grid_snap(&self, p: Point2) -> (Point2, Vec<SnapGuide>) {
+        if !self.snap_to_grid || self.grid_size < 1e-6 {
+            return (p, Vec::new());
+        }
+        let tol = self.snap_tol_doc();
+        let gx = (p.x / self.grid_size).round() * self.grid_size;
+        let gy = (p.y / self.grid_size).round() * self.grid_size;
+        let dx = gx - p.x;
+        let dy = gy - p.y;
+        // Only snap when near an intersection (both axes within tol).
+        // This lets you drag freely between intersections but locks
+        // strongly at crossings.
+        if dx.abs() > tol || dy.abs() > tol {
+            return (p, Vec::new());
+        }
+        let to = Point2::new(gx, gy);
+        let guide = SnapGuide {
+            vertical: false,
+            from: p,
+            to,
+            kind: snapping::SnapKind::Endpoint,
+            span_is_x: false,
+            span_lo: 0.0,
+            span_hi: 0.0,
+        };
+        (to, vec![guide])
+    }
+
     /// Snaps a free point (shape-tool placement) to the best target.
     fn snap_point(&self, p: Point2) -> (Point2, Vec<SnapGuide>) {
+        if self.snap_to_grid {
+            return self.grid_snap(p);
+        }
+        if !self.snap_to_objects {
+            return (p, Vec::new());
+        }
         let (adj, guides) =
             snapping::best(&self.doc, self.snap_tol_doc(), p, &[], &[], false, false, self.snap_visible());
         (Point2::new(p.x + adj.x, p.y + adj.y), guides)
@@ -228,8 +275,15 @@ impl Editor {
 
     /// Creation-tool cursor snapping: the cursor itself locks onto nearby
     /// points, midpoints, and edge bodies so new geometry lands perfectly
-    /// joined.
+    /// joined. Respects Snap to Grid / Snap to Objects toggles — when Grid is
+    /// on, object snaps are completely disabled.
     fn snap_creation_point(&self, p: Point2) -> (Point2, Vec<SnapGuide>) {
+        if self.snap_to_grid {
+            return self.grid_snap(p);
+        }
+        if !self.snap_to_objects {
+            return (p, Vec::new());
+        }
         let (pos, guide) = snapping::cursor_snap(
             &self.doc,
             self.snap_tol_doc(),
@@ -681,28 +735,50 @@ impl Editor {
 
         // Per-axis consensus voting: every dragged point proposes its own
         // snap corrections; each axis adopts the most-agreed proposal and
-        // applies it RIGIDLY to all points. One lucky corner no longer
-        // drags the whole object somewhere the other three hate.
+        // applies it RIGIDLY to all points. Respects Snap to Grid / Snap to
+        // Objects — when Grid is on, object snaps are completely disabled.
         let mut proposals_x: Vec<f64> = Vec::new();
         let mut proposals_y: Vec<f64> = Vec::new();
         if !self.alt_down {
             for &(_pid, start) in &drag.points {
                 let target = Point2::new(start.x + delta.x, start.y + delta.y);
-                let (adj, _) = snapping::best(
-                    &self.doc,
-                    self.snap_tol_doc(),
-                    target,
-                    &exclude_pts,
-                    &exclude_segs,
-                    endpoints_only,
-                    false,
-                    self.snap_visible(),
-                );
-                if adj.x != 0. {
-                    proposals_x.push(adj.x);
+                let (adj_x, adj_y) = if self.snap_to_grid {
+                    // Grid intersection only — both axes must be within tol
+                    // so you can move freely between intersections.
+                    if self.grid_size < 1e-6 {
+                        (0.0, 0.0)
+                    } else {
+                        let tol = self.snap_tol_doc();
+                        let gx = (target.x / self.grid_size).round() * self.grid_size;
+                        let gy = (target.y / self.grid_size).round() * self.grid_size;
+                        let dx = gx - target.x;
+                        let dy = gy - target.y;
+                        if dx.abs() <= tol && dy.abs() <= tol {
+                            (dx, dy)
+                        } else {
+                            (0.0, 0.0)
+                        }
+                    }
+                } else if !self.snap_to_objects {
+                    (0.0, 0.0)
+                } else {
+                    let (adj, _) = snapping::best(
+                        &self.doc,
+                        self.snap_tol_doc(),
+                        target,
+                        &exclude_pts,
+                        &exclude_segs,
+                        endpoints_only,
+                        false,
+                        self.snap_visible(),
+                    );
+                    (adj.x, adj.y)
+                };
+                if adj_x != 0. {
+                    proposals_x.push(adj_x);
                 }
-                if adj.y != 0. {
-                    proposals_y.push(adj.y);
+                if adj_y != 0. {
+                    proposals_y.push(adj_y);
                 }
             }
         }

@@ -926,8 +926,9 @@ impl Render for Shell {
                     let editor = self.editor.clone().expect("design view without editor");
                     div()
                         .flex_1()
+                        .flex()
+                        .flex_col()
                         .relative()
-                        .overflow_hidden()
                         .child(CanvasView {
                             editor: editor.downgrade(),
                             shell: cx.entity().downgrade(),

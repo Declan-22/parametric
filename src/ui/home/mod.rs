@@ -161,6 +161,9 @@ impl RenderOnce for DesignCard {
                         None, // pending line
                         &[],  // constraint markers
                         None, // pending circle
+                        false, // show_grid (thumbnails never show grid)
+                        20.0,
+                        crate::editor::Tool::Move,
                     ),
                     None => Vec::new(),
                 }

@@ -40,7 +40,10 @@ impl RenderOnce for CanvasView {
         div()
             .id("canvas")
             .relative()
-            .size_full()
+            .flex()
+            .flex_1()
+            .w_full()
+            .h_full()
             // Hold focus while interacting so modifier changes reach the
             // canvas even when the mouse is still.
             .track_focus(&self.focus)
@@ -309,6 +312,9 @@ impl CanvasView {
                 pending_line,
                 &ed.constraint_markers,
                 ed.pending_circle,
+                ed.show_grid,
+                ed.grid_size,
+                ed.tool,
             );
             (list, hitbox)
         };

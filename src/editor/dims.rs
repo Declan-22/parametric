@@ -10,7 +10,7 @@ use crate::core::ids::PointId;
 // Rulers never participate: no dims while drawing one or with one
 // selected — their markings are vector geometry, not dimensions.
 
-const PREVIEW_DIM_OFFSET_DOC: f64 = 18.0;
+const DIM_OFFSET_PX: f64 = 18.0;
 
 /// Screen-space render data for one constraint chip. `out` is the
 /// preferred spot (just off the constrained edge's outer side); `in_` is
@@ -178,7 +178,7 @@ pub fn update(ed: &mut Editor) {
                 &ed.camera,
                 Point2::new(b.origin.x, b.origin.y + b.size.h),
                 Point2::new(b.origin.x + b.size.w, b.origin.y + b.size.h),
-                PREVIEW_DIM_OFFSET_DOC,
+                DIM_OFFSET_PX,
                 b.size.w,
             ));
         }
@@ -190,7 +190,7 @@ pub fn update(ed: &mut Editor) {
                 &ed.camera,
                 Point2::new(b.origin.x + b.size.w, b.origin.y + b.size.h),
                 Point2::new(b.origin.x + b.size.w, b.origin.y),
-                PREVIEW_DIM_OFFSET_DOC,
+                DIM_OFFSET_PX,
                 b.size.h,
             ));
         }
@@ -384,7 +384,7 @@ fn push_line_dim(ed: &mut Editor, a: Point2, b: Point2, prefer: Option<Point2>) 
         &ed.camera,
         a,
         b,
-        PREVIEW_DIM_OFFSET_DOC,
+        DIM_OFFSET_PX,
         pick::distance(a, b),
     ));
 }
@@ -541,9 +541,10 @@ fn dedup_collinear(edges: Vec<(Point2, Point2, Option<Point2>)>) -> Vec<(Point2,
 }
 
 /// Builds screen-space render data for a dimension between two doc points.
-/// `offset_doc` shifts the dim line along the LEFT normal of b-a; `value`
-/// is the displayed measurement.
-fn linear_dim(doc: &Document, cam: &super::Camera, a: Point2, b: Point2, offset_doc: f64, value: f64) -> DimRender {
+/// `offset_px` is a constant screen-space distance along the LEFT normal of
+/// b-a, intentionally NOT scaled by zoom so the dim line and its container
+/// sit at the same pixel offset at any zoom (like a CAD overlay).
+fn linear_dim(doc: &Document, cam: &super::Camera, a: Point2, b: Point2, offset_px: f64, value: f64) -> DimRender {
     let scr = |p: Point2| cam.unit_to_screen(p);
     let sa = scr(a);
     let sb = scr(b);
@@ -553,7 +554,7 @@ fn linear_dim(doc: &Document, cam: &super::Camera, a: Point2, b: Point2, offset_
     // Left normal in screen space (y down).
     let nx = -dy / len;
     let ny = dx / len;
-    let off = offset_doc * cam.zoom;
+    let off = offset_px;
     let lax = sa.x + nx * off;
     let lay = sa.y + ny * off;
     let lbx = sb.x + nx * off;

@@ -12,6 +12,8 @@ pub enum SnapKind {
     Endpoint,
     Midpoint,
     Edge,
+    /// A drawn grid intersection (both axes lock together).
+    Grid,
 }
 
 // A visual snap connection: what locked onto what. Edge snaps carry the
@@ -203,12 +205,53 @@ fn span_ok(t: &SnapTarget, p: Point2) -> bool {
     }
 }
 
+/// Grid tolerance: the ordinary snap tolerance, capped to a fraction of the
+/// drawn cell so there is always free space between intersections — the
+/// grid is a magnet at crossings, never a rail along the lines.
+fn grid_tol(tol: f64, step: f64, zoom: f64) -> f64 {
+    if zoom < 1e-9 {
+        return tol;
+    }
+    tol.min(0.4 * step * zoom) / zoom
+}
+
+/// Nearest drawn-grid intersection to `p`, if both axes are within `gtol`.
+fn nearest_intersection(p: Point2, step: f64, gtol: f64) -> Option<(Point2, f64, f64)> {
+    let gx = (p.x / step).round() * step;
+    let gy = (p.y / step).round() * step;
+    let dx = gx - p.x;
+    let dy = gy - p.y;
+    if dx.abs() <= gtol && dy.abs() <= gtol {
+        Some((Point2::new(gx, gy), dx, dy))
+    } else {
+        None
+    }
+}
+
+fn grid_guide(p: Point2, to: Point2) -> SnapGuide {
+    SnapGuide {
+        vertical: false,
+        from: p,
+        to,
+        kind: SnapKind::Grid,
+        span_is_x: false,
+        span_lo: 0.,
+        span_hi: 0.,
+    }
+}
+
 /// Best single correction for a point against all targets. Returns
 /// (adjustment delta, guides). `coincident_only` demands BOTH axes hit —
 /// used while dragging so a passing row/column alignment doesn't yank a
 /// single axis (the "slight 90-degree snap"). `visible` culls targets to
 /// the viewport (plus margin already applied by the caller) — snapping is
 /// a proximity affair, not a document-wide search.
+///
+/// `grid_step` (Some when Snap to Grid is on) adds the DRAWN grid's
+/// intersections as targets. Objects keep priority: the grid only fills
+/// axes no object locked, so both snap modes work together instead of
+/// excluding each other. Single-axis grid fills are skipped for
+/// `coincident_only` / `endpoints_only` drags (resizes stay fluid).
 pub fn best(
     doc: &Document,
     tol: f64,
@@ -218,6 +261,8 @@ pub fn best(
     endpoints_only: bool,
     coincident_only: bool,
     visible: Rect,
+    grid_step: Option<f64>,
+    zoom: f64,
 ) -> (Point2, Vec<SnapGuide>) {
     let mut best: Option<(f64, f64, f64, bool, bool, SnapTarget)> = None;
     for tgt in targets(doc, exclude_pts, exclude_segs, endpoints_only, visible) {
@@ -290,6 +335,16 @@ pub fn best(
     }
 
     let Some((_, dx, dy, hit_x, hit_y, tgt)) = best else {
+        // No object target: fall back to the grid, intersections only.
+        if let Some(step) = grid_step {
+            let gtol = grid_tol(tol, step, zoom);
+            if let Some((to, _, _)) = nearest_intersection(p, step, gtol) {
+                return (
+                    Point2::new(to.x - p.x, to.y - p.y),
+                    vec![grid_guide(p, to)],
+                );
+            }
+        }
         return (Point2::new(0., 0.), Vec::new());
     };
     let mut adj = Point2::new(0., 0.);
@@ -318,11 +373,232 @@ pub fn best(
             span_hi: tgt.span_hi,
         });
     }
+    // One axis free: fill it from the nearest grid LINE so drags ride
+    // object edges while landing exactly on drawn crossings.
+    if let Some(step) = grid_step {
+        let fillable = !coincident_only && !endpoints_only;
+        if fillable && (hit_x != hit_y) {
+            let gtol = grid_tol(tol, step, zoom);
+            if !hit_x {
+                let gx = (p.x / step).round() * step;
+                let gdx = gx - p.x;
+                if gdx.abs() <= gtol {
+                    adj.x = gdx;
+                    guides.push(SnapGuide {
+                        vertical: true,
+                        from: p,
+                        to: Point2::new(gx, p.y),
+                        kind: SnapKind::Grid,
+                        span_is_x: false,
+                        span_lo: 0.,
+                        span_hi: 0.,
+                    });
+                }
+            } else {
+                let gy = (p.y / step).round() * step;
+                let gdy = gy - p.y;
+                if gdy.abs() <= gtol {
+                    adj.y = gdy;
+                    guides.push(SnapGuide {
+                        vertical: false,
+                        from: p,
+                        to: Point2::new(p.x, gy),
+                        kind: SnapKind::Grid,
+                        span_is_x: false,
+                        span_lo: 0.,
+                        span_hi: 0.,
+                    });
+                }
+            }
+        }
+    }
     (adj, guides)
 }
 
 pub fn mid(a: Point2, b: Point2) -> Point2 {
     Point2::new((a.x + b.x) / 2., (a.y + b.y) / 2.)
+}
+
+/// One axis' lock candidate for combined snapping.
+struct AxisLock {
+    to: f64,
+    kind: SnapKind,
+}
+
+/// Per-axis object locks: a point's coordinate or an axis-aligned edge span
+/// can lock a SINGLE axis when the cursor is aligned with it (within tol on
+/// that axis) but not close enough for a full point lock. Nearest wins.
+fn per_axis_object_locks(
+    doc: &Document,
+    tol: f64,
+    p: Point2,
+    visible: Rect,
+) -> (Option<AxisLock>, Option<AxisLock>) {
+    let mut best_x: Option<(f64, AxisLock)> = None;
+    let mut best_y: Option<(f64, AxisLock)> = None;
+
+    // Endpoints.
+    for (_, q) in doc.all_points() {
+        if !visible.contains(q) {
+            continue;
+        }
+        let dx = q.x - p.x;
+        if dx.abs() <= tol && best_x.as_ref().map_or(true, |(s, _)| dx.abs() < *s) {
+            best_x = Some((dx.abs(), AxisLock { to: q.x, kind: SnapKind::Endpoint }));
+        }
+        let dy = q.y - p.y;
+        if dy.abs() <= tol && best_y.as_ref().map_or(true, |(s, _)| dy.abs() < *s) {
+            best_y = Some((dy.abs(), AxisLock { to: q.y, kind: SnapKind::Endpoint }));
+        }
+    }
+    // Arc centers (circumcenters) — midpoint-grade targets.
+    for (_, seg) in doc.all_segments() {
+        if seg.kind != SegmentKind::Arc {
+            continue;
+        }
+        let Some(sc) = seg.ctrl else { continue };
+        let (Some(a), Some(b), Some(c)) =
+            (doc.point(seg.start), doc.point(seg.end), doc.point(sc))
+        else {
+            continue;
+        };
+        let Some((center, _)) = crate::editor::arc::circumcircle(a, b, c) else {
+            continue;
+        };
+        if !visible.contains(center) {
+            continue;
+        }
+        let dx = center.x - p.x;
+        if dx.abs() <= tol && best_x.as_ref().map_or(true, |(s, _)| dx.abs() < *s) {
+            best_x = Some((dx.abs(), AxisLock { to: center.x, kind: SnapKind::Midpoint }));
+        }
+        let dy = center.y - p.y;
+        if dy.abs() <= tol && best_y.as_ref().map_or(true, |(s, _)| dy.abs() < *s) {
+            best_y = Some((dy.abs(), AxisLock { to: center.y, kind: SnapKind::Midpoint }));
+        }
+    }
+    // Segment midpoints + axis-aligned edge spans.
+    for (sid, seg) in doc.all_segments() {
+        if seg.kind == SegmentKind::Ruler {
+            continue;
+        }
+        let Some((a, b)) = doc.segment_geom(sid) else {
+            continue;
+        };
+        let m = mid(a, b);
+        if visible.contains(m) {
+            let dx = m.x - p.x;
+            if dx.abs() <= tol && best_x.as_ref().map_or(true, |(s, _)| dx.abs() < *s) {
+                best_x = Some((dx.abs(), AxisLock { to: m.x, kind: SnapKind::Midpoint }));
+            }
+            let dy = m.y - p.y;
+            if dy.abs() <= tol && best_y.as_ref().map_or(true, |(s, _)| dy.abs() < *s) {
+                best_y = Some((dy.abs(), AxisLock { to: m.y, kind: SnapKind::Midpoint }));
+            }
+        }
+        let horizontal = (a.y - b.y).abs() < 1e-9;
+        let vertical = (a.x - b.x).abs() < 1e-9;
+        if horizontal && p.x >= a.x.min(b.x) && p.x <= a.x.max(b.x) {
+            let dy = a.y - p.y;
+            if dy.abs() <= tol && best_y.as_ref().map_or(true, |(s, _)| dy.abs() < *s) {
+                best_y = Some((dy.abs(), AxisLock { to: a.y, kind: SnapKind::Edge }));
+            }
+        } else if vertical && p.y >= a.y.min(b.y) && p.y <= a.y.max(b.y) {
+            let dx = a.x - p.x;
+            if dx.abs() <= tol && best_x.as_ref().map_or(true, |(s, _)| dx.abs() < *s) {
+                best_x = Some((dx.abs(), AxisLock { to: a.x, kind: SnapKind::Edge }));
+            }
+        }
+    }
+    (best_x.map(|(_, l)| l), best_y.map(|(_, l)| l))
+}
+
+/// Creation-tool combined snapping (Fusion-style):
+///   1. OBJECTS FIRST, all-or-nothing: nearest endpoint > arc center >
+///      midpoint > edge body > arc body within tolerance locks both axes;
+///   2. otherwise per-axis: a point's coordinate or an axis-aligned edge
+///      span locks the axis it aligns with;
+///   3. axes still free go to the grid, intersections only: both axes free
+///      snaps to the nearest DRAWN crossing (both within the grid
+///      tolerance); one axis object-locked snaps the other to the nearest
+///      grid line, so you ride object edges landing exactly on crossings;
+///   4. everything else stays free — between intersections the cursor is
+///      never yanked along a grid line.
+pub fn cursor_snap_combined(
+    doc: &Document,
+    tol: f64,
+    p: Point2,
+    visible: Rect,
+    grid_step: Option<f64>,
+    snap_objects: bool,
+    zoom: f64,
+) -> (Point2, Vec<SnapGuide>) {
+    // 1) Full object locks.
+    if snap_objects {
+        let (pos, guide) = cursor_snap(doc, tol, p, visible);
+        if let Some(g) = guide {
+            return (pos, vec![g]);
+        }
+    }
+
+    // 2) Per-axis object locks.
+    let (mut x_lock, mut y_lock) = if snap_objects {
+        per_axis_object_locks(doc, tol, p, visible)
+    } else {
+        (None, None)
+    };
+
+    // 3) Grid fills only what the objects left free.
+    if let Some(step) = grid_step {
+        let gtol = grid_tol(tol, step, zoom);
+        if x_lock.is_none() && y_lock.is_none() {
+            // Pure grid mode for this cursor: intersections only.
+            if let Some((to, _, _)) = nearest_intersection(p, step, gtol) {
+                return (to, vec![grid_guide(p, to)]);
+            }
+        } else if x_lock.is_none() || y_lock.is_none() {
+            // One axis is object-locked: the free axis may snap to the
+            // nearest grid line, putting the point on a drawn crossing.
+            if x_lock.is_none() {
+                let gx = (p.x / step).round() * step;
+                if (gx - p.x).abs() <= gtol {
+                    x_lock = Some(AxisLock { to: gx, kind: SnapKind::Grid });
+                }
+            } else {
+                let gy = (p.y / step).round() * step;
+                if (gy - p.y).abs() <= gtol {
+                    y_lock = Some(AxisLock { to: gy, kind: SnapKind::Grid });
+                }
+            }
+        }
+    }
+
+    let x = x_lock.as_ref().map_or(p.x, |l| l.to);
+    let y = y_lock.as_ref().map_or(p.y, |l| l.to);
+    let mut guides = Vec::new();
+    if let Some(l) = &x_lock {
+        guides.push(SnapGuide {
+            vertical: true,
+            from: p,
+            to: Point2::new(l.to, p.y),
+            kind: l.kind,
+            span_is_x: false,
+            span_lo: 0.,
+            span_hi: 0.,
+        });
+    }
+    if let Some(l) = &y_lock {
+        guides.push(SnapGuide {
+            vertical: false,
+            from: p,
+            to: Point2::new(p.x, l.to),
+            kind: l.kind,
+            span_is_x: false,
+            span_lo: 0.,
+            span_hi: 0.,
+        });
+    }
+    (Point2::new(x, y), guides)
 }
 
 /// Creation-tool cursor snapping. Priority:

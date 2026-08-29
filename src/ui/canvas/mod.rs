@@ -65,7 +65,7 @@ impl RenderOnce for CanvasView {
                 let _ = editor_down_l.update(cx, |ed, cx| {
                     if ed.canvas_down(
                         MouseButton::Left,
-                        e.position,
+                        canvas_pos(e.position),
                         e.modifiers.shift,
                         e.click_count,
                     ) {
@@ -78,7 +78,7 @@ impl RenderOnce for CanvasView {
                 move |e: &MouseDownEvent, window, cx| {
                     window.focus(&focus_m, cx);
                     let _ = editor_down_m.update(cx, |ed, cx| {
-                        if ed.canvas_down(MouseButton::Middle, e.position, false, 1) {
+                        if ed.canvas_down(MouseButton::Middle, canvas_pos(e.position), false, 1) {
                             cx.notify();
                         }
                     });
@@ -93,9 +93,9 @@ impl RenderOnce for CanvasView {
                     // While idle, track which resize handle is under the
                     // cursor (used for cursor styling).
                     if ed.is_idle() {
-                        changed |= ed.canvas_hover(e.position);
+                        changed |= ed.canvas_hover(canvas_pos(e.position));
                     }
-                    changed |= ed.canvas_drag(e.position, shift);
+                    changed |= ed.canvas_drag(canvas_pos(e.position), shift);
                     if changed {
                         cx.notify();
                     }
@@ -107,7 +107,7 @@ impl RenderOnce for CanvasView {
                     ScrollDelta::Lines(l) => l.y * 16.,
                 };
                 let _ = editor_scroll.update(cx, |ed, cx| {
-                    ed.zoom_at(e.position, amount);
+                    ed.zoom_at(canvas_pos(e.position), amount);
                     cx.notify();
                 });
             })
@@ -128,6 +128,7 @@ impl RenderOnce for CanvasView {
             .child(self.paint_layer())
             .child(self.constraint_chip_layer(cx))
             .child(self.dimension_layer())
+            .child(self.snap_cursor_layer(cx))
             .children(context_menu::draw(
                 self.editor.clone(),
                 self.shell.clone(),
@@ -137,6 +138,15 @@ impl RenderOnce for CanvasView {
 }
 
 pub(crate) const CHIP_SIZE: f32 = 18.;
+
+// All editor-facing canvas coordinates are CANVAS-LOCAL: the origin is the
+// canvas element's top-left (which sits below the title bar). gpui delivers
+// mouse events in WINDOW coords — convert once here at the boundary, so the
+// editor, the paint callbacks (which add bounds.origin) and the DOM overlay
+// layers all share one space and painted geometry lines up with the cursor.
+fn canvas_pos(p: gpui::Point<gpui::Pixels>) -> gpui::Point<gpui::Pixels> {
+    gpui::point(p.x, p.y - px(TITLE_BAR_HEIGHT))
+}
 
 // Constraint chip glyphs (12x12 source SVGs, rendered at the full chip
 // size so the glyph fills it). Stroke width is bumped from the source
@@ -204,42 +214,46 @@ impl CanvasView {
                 .collect::<Vec<_>>()
         };
 
-        let paint_labels =
-            move |_: Bounds<Pixels>, labels: Vec<LabelPrim>, window: &mut Window, cx: &mut App| {
-                for l in labels {
-                    const PAD_X: f32 = 6.;
-                    const BORDER: f32 = 4.;
-                    const BOX_H: f32 = 22.;
-                    let line_h = font_size_px() * 1.4;
-                    let box_w = l.line.width.as_f32() + PAD_X * 2. + BORDER;
-                    // Optically center: nudge down by the descent share of
-                    // the line box (glyphs sit above the box center).
-                    const OPTICAL_NUDGE: f32 = 2.;
-                    // Border stroke eats 2px of each padding side; offset by
-                    // half the border width so left/right gaps are equal.
-                    let origin = Point {
-                        x: px(l.center_x - box_w / 2. + PAD_X + BORDER / 2.),
-                        y: px(l.center_y - line_h.as_f32() / 2. + OPTICAL_NUDGE),
-                    };
-                    // Container background + border: sized to the measured
-                    // text (adaptable width) via padding, not fixed.
-                    window.paint_quad(gpui::quad(
-                        Bounds {
-                            origin: Point {
-                                x: px(l.center_x - box_w / 2.),
-                                y: px(l.center_y - BOX_H / 2.),
-                            },
-                            size: Size {
-                                width: px(box_w),
-                                height: px(BOX_H),
-                            },
+        let paint_labels = move |bounds: Bounds<Pixels>,
+                                 labels: Vec<LabelPrim>,
+                                 window: &mut Window,
+                                 cx: &mut App| {
+            // Convert canvas-local prim coords to window space.
+            let (ox, oy) = (bounds.origin.x, bounds.origin.y);
+            for l in labels {
+                const PAD_X: f32 = 6.;
+                const BORDER: f32 = 4.;
+                const BOX_H: f32 = 22.;
+                let line_h = font_size_px() * 1.4;
+                let box_w = l.line.width.as_f32() + PAD_X * 2. + BORDER;
+                // Optically center: nudge down by the descent share of
+                // the line box (glyphs sit above the box center).
+                const OPTICAL_NUDGE: f32 = 2.;
+                // Border stroke eats 2px of each padding side; offset by
+                // half the border width so left/right gaps are equal.
+                let origin = Point {
+                    x: px(l.center_x - box_w / 2. + PAD_X + BORDER / 2.) + ox,
+                    y: px(l.center_y - line_h.as_f32() / 2. + OPTICAL_NUDGE) + oy,
+                };
+                // Container background + border: sized to the measured
+                // text (adaptable width) via padding, not fixed.
+                window.paint_quad(gpui::quad(
+                    Bounds {
+                        origin: Point {
+                            x: px(l.center_x - box_w / 2.) + ox,
+                            y: px(l.center_y - BOX_H / 2.) + oy,
                         },
-                        px(6.),
-                        l.bg,
-                        gpui::Edges::all(px(2.)),
-                        rgb(crate::theme::active(cx).accent),
-                        gpui::BorderStyle::Solid,
-                    ));
+                        size: Size {
+                            width: px(box_w),
+                            height: px(BOX_H),
+                        },
+                    },
+                    px(6.),
+                    l.bg,
+                    gpui::Edges::all(px(2.)),
+                    rgb(crate::theme::active(cx).accent),
+                    gpui::BorderStyle::Solid,
+                ));
                     let _ = l.line.paint(
                         origin,
                         font_size_px(),
@@ -249,7 +263,7 @@ impl CanvasView {
                         cx,
                     );
                 }
-            };
+        };
 
         canvas(prepaint, paint_labels)
             .absolute()
@@ -294,9 +308,7 @@ impl CanvasView {
                 div()
                     .absolute()
                     .left(px(m.cx_out - S / 2.))
-                    // Marker coords are window-space; this layer starts
-                    // below the title bar, so convert y.
-                    .top(px(m.cy_out - S / 2. - TITLE_BAR_HEIGHT))
+                    .top(px(m.cy_out - S / 2.))
                     .w(px(S as f32 + 2.0))
                     .h(px(S as f32 + 2.0))
                     .rounded(px(6.))
@@ -405,16 +417,17 @@ impl CanvasView {
                 &ed.constraint_markers,
                 ed.pending_circle,
                 ed.show_grid,
-                ed.grid_size,
                 ed.tool,
             );
             (list, hitbox)
         };
 
-        let paint = move |_: Bounds<Pixels>,
+        let paint = move |bounds: Bounds<Pixels>,
                           (list, hitbox): (Vec<paint::Primitive>, gpui::Hitbox),
                           window: &mut Window,
                           cx: &mut App| {
+            // Convert canvas-local prim coords to window space.
+            let (ox, oy) = (bounds.origin.x, bounds.origin.y);
             // Dynamic cursor per tool/state.
             if let Some(editor) = editor_paint.upgrade() {
                 let style = editor.read(cx).cursor_style();
@@ -425,7 +438,10 @@ impl CanvasView {
                     paint::Primitive::Rect { x, y, w, h, color } => {
                         window.paint_quad(fill(
                             Bounds {
-                                origin: Point { x: px(x), y: px(y) },
+                                origin: Point {
+                                    x: px(x) + ox,
+                                    y: px(y) + oy,
+                                },
                                 size: Size {
                                     width: px(w),
                                     height: px(h),
@@ -438,7 +454,10 @@ impl CanvasView {
                         if points.len() < 3 {
                             continue;
                         }
-                        let to_px = |(x, y): (f32, f32)| Point { x: px(x), y: px(y) };
+                        let to_px = |(x, y): (f32, f32)| Point {
+                            x: px(x) + ox,
+                            y: px(y) + oy,
+                        };
                         let mut path = gpui::Path::new(to_px(points[0]));
                         for &pt in &points[1..] {
                             path.line_to(to_px(pt));
@@ -464,31 +483,34 @@ impl CanvasView {
                         let nx = -dy / len * width / 2.;
                         let ny = dx / len * width / 2.;
                         let mut path = gpui::Path::new(Point {
-                            x: px(ax + nx),
-                            y: px(ay + ny),
+                            x: px(ax + nx) + ox,
+                            y: px(ay + ny) + oy,
                         });
                         path.line_to(Point {
-                            x: px(bx + nx),
-                            y: px(by + ny),
+                            x: px(bx + nx) + ox,
+                            y: px(by + ny) + oy,
                         });
                         path.line_to(Point {
-                            x: px(bx - nx),
-                            y: px(by - ny),
+                            x: px(bx - nx) + ox,
+                            y: px(by - ny) + oy,
                         });
                         path.line_to(Point {
-                            x: px(ax - nx),
-                            y: px(ay - ny),
+                            x: px(ax - nx) + ox,
+                            y: px(ay - ny) + oy,
                         });
                         path.line_to(Point {
-                            x: px(ax + nx),
-                            y: px(ay + ny),
+                            x: px(ax + nx) + ox,
+                            y: px(ay + ny) + oy,
                         });
                         window.paint_path(path, color);
                     }
                     paint::Primitive::Outline { x, y, w, h } => {
                         window.paint_quad(gpui::quad(
                             Bounds {
-                                origin: Point { x: px(x), y: px(y) },
+                                origin: Point {
+                                    x: px(x) + ox,
+                                    y: px(y) + oy,
+                                },
                                 size: Size {
                                     width: px(w),
                                     height: px(h),
@@ -510,8 +532,8 @@ impl CanvasView {
                         window.paint_quad(gpui::quad(
                             Bounds {
                                 origin: Point {
-                                    x: px(mcx) - r,
-                                    y: px(mcy) - r,
+                                    x: px(mcx) - r + ox,
+                                    y: px(mcy) - r + oy,
                                 },
                                 size: Size {
                                     width: r * 2.,
@@ -579,8 +601,8 @@ impl CanvasView {
                             let origin_x = center_x - line.width.as_f32() / 2.;
                             let _ = line.paint(
                                 Point {
-                                    x: px(origin_x),
-                                    y: px(top_y),
+                                    x: px(origin_x) + ox,
+                                    y: px(top_y) + oy,
                                 },
                                 px(SIZE),
                                 gpui::TextAlign::Left,
@@ -596,7 +618,47 @@ impl CanvasView {
 
         canvas(prepaint, paint).absolute().inset_0().size_full()
     }
+
+    // Creation-tool snap cursor: the makeshift crosshair that rides the real
+    // cursor. Unsnapped, its center is glued to the cursor point; when a snap
+    // locks (endpoint, edge, grid crossing) it detaches to the target and the
+    // accent square lights up. The OS cursor stays a plain arrow.
+    fn snap_cursor_layer(&self, cx: &App) -> impl IntoElement {
+        let t = *crate::theme::active(cx);
+        let state = self
+            .editor
+            .upgrade()
+            .and_then(|e| e.read(cx).creation_cursor);
+        let Some((x, y, snapped)) = state else {
+            return div().absolute();
+        };
+        const S: f32 = 18.;
+        let mut layer = div()
+            .absolute()
+            // Crosshair glyph centered on the (possibly snapped-away) point.
+            .left(px(x - S / 2.))
+            .top(px(y - S / 2.))
+            .w(px(S))
+            .h(px(S))
+            .child(svg().data(ICON_CROSSHAIR).size_full().text_color(rgb(t.text_primary)));
+        if snapped {
+            const SQUARE: f32 = 14.;
+            layer = layer.child(
+                div()
+                    .absolute()
+                    .left(px((S - SQUARE) / 2.))
+                    .top(px((S - SQUARE) / 2.))
+                    .w(px(SQUARE))
+                    .h(px(SQUARE))
+                    .border_1()
+                    .border_color(rgb(t.accent)),
+            );
+        }
+        layer
+    }
 }
 
-// Layout offset where the canvas starts below the title bar (for overlays).
-pub const CANVAS_TOP_INSET: Pixels = px(TITLE_BAR_HEIGHT);
+// The snapping cursor glyph: a thin plus, drawn in ink; the accent square
+// badge comes from the layer above it when a snap is engaged.
+const ICON_CROSSHAIR: &[u8] =
+    br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24"><path d="M0 0h24v24H0z" fill="none" /><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 4v16m8-8H4" /></svg>"#;

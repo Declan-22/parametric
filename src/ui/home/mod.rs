@@ -162,23 +162,29 @@ impl RenderOnce for DesignCard {
                         &[],  // constraint markers
                         None, // pending circle
                         false, // show_grid (thumbnails never show grid)
-                        20.0,
                         crate::editor::Tool::Move,
                     ),
                     None => Vec::new(),
                 }
             };
 
-        let paint_thumbs = move |_: Bounds<Pixels>,
+        let paint_thumbs = move |bounds: Bounds<Pixels>,
                                  list: Vec<paint::Primitive>,
                                  window: &mut Window,
                                  _: &mut App| {
+            // Convert canvas-local prim coords to window space. Without the
+            // element origin, thumbnails painted at the window origin and
+            // were clipped away by their cards (blank thumbnails).
+            let (ox, oy) = (bounds.origin.x, bounds.origin.y);
             for prim in list {
                 match prim {
                     paint::Primitive::Rect { x, y, w, h, color } => {
                         window.paint_quad(fill(
                             Bounds {
-                                origin: Point { x: px(x), y: px(y) },
+                                origin: Point {
+                                    x: px(x) + ox,
+                                    y: px(y) + oy,
+                                },
                                 size: Size {
                                     width: px(w),
                                     height: px(h),

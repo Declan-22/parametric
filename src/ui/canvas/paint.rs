@@ -75,7 +75,6 @@ pub fn build_draw_list(
     constraint_markers: &[crate::editor::dims::ConstraintMarker],
     pending_circle: Option<crate::editor::PendingCircle>,
     show_grid: bool,
-    grid_size: f64,
     tool: crate::editor::Tool,
 ) -> Vec<Primitive> {
     let min = camera.screen_to_unit(Point2::new(0., 0.));
@@ -96,9 +95,7 @@ pub fn build_draw_list(
     // visible doc rect each frame, and we double the step when zoomed out so
     // the primitive count stays bounded (~viewport/min_spacing). Pan just shifts
     // which lines are emitted — the grid is document-anchored, not screen-locked.
-    push_grid(
-        &mut list, camera, viewport, visible, t, show_grid, grid_size,
-    );
+    push_grid(&mut list, camera, viewport, visible, t, show_grid);
 
     let scr = |p: Point2| {
         let s = camera.unit_to_screen(p);
@@ -246,9 +243,9 @@ pub fn build_draw_list(
         }
     }
 
-    // 3) Snap feedback markers. During CREATION they mark the exact lock
-    // location (cursor snapping) so it's obvious what you're joined to.
-    // Grid snap now only at intersections, so guides are at crossings.
+    // 3) Snap feedback markers. During CREATION the white dots are replaced
+    // by the DOM snap-cursor layer (crosshair + accent square), so only the
+    // dashed guides render here; drags keep the classic dot markers.
     let is_creation = matches!(
         tool,
         crate::editor::Tool::Rectangle
@@ -256,22 +253,13 @@ pub fn build_draw_list(
             | crate::editor::Tool::Ruler
             | crate::editor::Tool::Circle
     );
-    for g in snap_guides {
-        let s = camera.unit_to_screen(g.to);
-        list.push(Primitive::Circle {
-            cx: s.x as f32,
-            cy: s.y as f32,
-            radius: 4.,
-        });
-        // When creating with crosshair and snapped, show 1px accent square
-        // border around the crosshair (spec). Only for creation tools.
-        if is_creation {
-            const SQUARE: f32 = 12.0;
-            list.push(Primitive::Outline {
-                x: s.x as f32 - SQUARE / 2.0,
-                y: s.y as f32 - SQUARE / 2.0,
-                w: SQUARE,
-                h: SQUARE,
+    if !is_creation {
+        for g in snap_guides {
+            let s = camera.unit_to_screen(g.to);
+            list.push(Primitive::Circle {
+                cx: s.x as f32,
+                cy: s.y as f32,
+                radius: 4.,
             });
         }
     }
@@ -670,8 +658,8 @@ fn push_ruler(list: &mut Vec<Primitive>, a: Point2, b: Point2, cam: &Camera, t: 
 //  - Screen-space tiling: offset = -(pan*zoom) % step_screen, so pan slides
 //    the lattice (different parts become visible) instead of a static overlay.
 //  - Viewport-culled: only emits lines whose screen coord lands in [0, viewport].
-//  - LOD clamp: effective doc step doubles until screen spacing >= MIN_PX, so
-//    zoomed-out never emits thousands of sub-pixel lines.
+//  - LOD clamp: the 5x-step level selection lives in editor::grid so the
+//    drawn lattice and the snap lattice (grid::snap_step) can never drift.
 //  - O(viewport) primitive count: at most ~viewport/MIN_PX per axis.
 //  - Pixel-snapped 1px quads (cheapest GPU primitive), no allocation beyond vec.
 fn push_grid(
@@ -681,12 +669,11 @@ fn push_grid(
     _visible: Rect,
     t: Theme,
     show_grid: bool,
-    grid_size: f64,
 ) {
     if !show_grid {
         return;
     }
-    if grid_size < 1e-6 || camera.zoom < 1e-9 {
+    if camera.zoom < 1e-9 {
         return;
     }
     let vw = f64::from(viewport.width);
@@ -697,39 +684,13 @@ fn push_grid(
 
     // Hierarchical 5x5 grid like Fusion360: big squares contain 5x5
     // smaller squares, and as you zoom in each 5x5 cell subdivides into
-    // another 5x5. Grid is document-anchored (multiples of grid_size) so
-    // an object placed on an intersection stays on that intersection when
-    // you zoom — no popping to the middle of a cell.
-    // Opacity: outer shell full border_color, each finer level 50% of parent.
-    const MIN_SCREEN_PX: f64 = 16.0;
-    const MAX_SCREEN_PX: f64 = 80.0; // 16*5, so one 5x step fits the band
-    // Find the minor level where screen spacing is in [MIN,MAX]. This is the
-    // finest level that is still readable; coarser is major, finer is subdiv.
-    let mut minor_step = grid_size;
-    let mut minor_screen = minor_step * camera.zoom;
-    // First, bring into band by multiplying/dividing by 5 (stable, not 2)
-    for _ in 0..16 {
-        if minor_screen >= MIN_SCREEN_PX && minor_screen <= MAX_SCREEN_PX {
-            break;
-        }
-        if minor_screen < MIN_SCREEN_PX {
-            minor_step *= 5.0;
-            minor_screen *= 5.0;
-        } else if minor_screen > MAX_SCREEN_PX {
-            minor_step /= 5.0;
-            minor_screen /= 5.0;
-        }
-        if minor_step > 1e7 || minor_step < 1e-6 {
-            return;
-        }
-    }
-    // Clamp once more if still out of band (extreme zoom)
-    if minor_screen < MIN_SCREEN_PX * 0.5 || minor_screen > MAX_SCREEN_PX * 2.0 {
-        // Fallback to single level at base grid_size
-        minor_step = grid_size;
-        minor_screen = minor_step * camera.zoom;
-    }
-
+    // another 5x5. Grid is document-anchored (multiples of grid::GRID_BASE)
+    // so an object placed on an intersection stays on that intersection
+    // when you zoom — no popping to the middle of a cell. The level
+    // selection here is THE SAME computation snapping uses.
+    let lv = crate::editor::grid::levels(camera.zoom);
+    let minor_step = lv.minor;
+    let minor_screen = minor_step * camera.zoom;
     let major_step = minor_step * 5.0;
     let major_screen = minor_screen * 5.0;
     let finer_step = minor_step / 5.0;
@@ -794,9 +755,9 @@ fn push_grid(
         rgba((t.border_color << 8) | 0x40).into(); // 25%
 
     // Only draw finer if it will be readable (not too dense)
-    let finer_visible = finer_screen >= 8.0 && finer_screen < MIN_SCREEN_PX * 2.0;
-    let minor_visible = minor_screen >= MIN_SCREEN_PX && minor_screen <= MAX_SCREEN_PX * 2.0;
-    let major_visible = major_screen >= MIN_SCREEN_PX && major_screen <= 600.0;
+    let finer_visible = lv.finer_visible;
+    let minor_visible = lv.minor_visible;
+    let major_visible = lv.major_visible;
 
     if major_visible {
         draw_level(major_step, major_screen, major_color);
@@ -820,15 +781,11 @@ fn push_grid(
     }
     // Fallback: if nothing was drawn (extreme), draw base grid at full opacity
     if !major_visible && !minor_visible && !finer_visible {
-        draw_level(grid_size, grid_size * camera.zoom, major_color);
-    }
-
-    // Push the whole grid down 36px so it doesn't sit under the TitleBar.
-    const GRID_Y_OFFSET: f32 = crate::ui::shell::title_bar::TITLE_BAR_HEIGHT;
-    for prim in list.iter_mut() {
-        if let Primitive::Rect { y, .. } = prim {
-            *y += GRID_Y_OFFSET;
-        }
+        draw_level(
+            crate::editor::grid::GRID_BASE,
+            crate::editor::grid::GRID_BASE * camera.zoom,
+            major_color,
+        );
     }
 }
 

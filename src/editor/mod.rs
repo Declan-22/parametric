@@ -2,6 +2,7 @@ pub mod arc;
 mod clipboard;
 mod camera;
 pub mod dims;
+pub mod grid;
 pub mod pick;
 pub mod ruler;
 mod snapping;
@@ -98,11 +99,17 @@ pub struct Editor {
     pub(crate) dragging: Option<DragState>,
     next_layer_id: u64,
     pan_start: Option<(gpui::Pixels, gpui::Pixels, Camera)>,
-    // Canvas grid + snapping (phase 2).
+    // Canvas grid + snapping (phase 2). The grid size is FIXED
+    // (grid::GRID_BASE — not a setting); only visibility and the snap
+    // toggles are user-facing.
     pub show_grid: bool,
-    pub grid_size: f64,
     pub snap_to_grid: bool,
     pub snap_to_objects: bool,
+    // Creation-tool snap cursor: position (canvas-local px) of the drawn
+    // crosshair plus whether it's currently locked onto a target. The OS
+    // cursor stays a plain arrow; this is the makeshift snapping cursor.
+    // None when no creation tool is active or while panning.
+    pub creation_cursor: Option<(f32, f32, bool)>,
 }
 
 const HANDLE_TOL_PX: f64 = 14.0;
@@ -161,9 +168,9 @@ impl Editor {
             next_layer_id: next_layer_id.max(2),
             pan_start: None,
             show_grid: true,
-            grid_size: 20.0,
             snap_to_grid: false,
             snap_to_objects: true,
+            creation_cursor: None,
         }
     }
 
@@ -172,6 +179,9 @@ impl Editor {
             return false;
         }
         self.tool = tool;
+        // The snap crosshair belongs to creation tools only; it reappears
+        // (freshly positioned) on the first mouse move over the canvas.
+        self.creation_cursor = None;
         self.pending_shape = None;
         self.pending_ruler = None;
         self.pending_line = None;
@@ -228,69 +238,40 @@ impl Editor {
         v
     }
 
-    /// Grid snap: strongest at intersections. Requires BOTH axes within
-    /// tolerance so you can move freely between grid lines but snap
-    /// strongly when near an intersection. This keeps the grid feeling
-    /// like a magnet at crossings, not a rail along lines.
-    fn grid_snap(&self, p: Point2) -> (Point2, Vec<SnapGuide>) {
-        if !self.snap_to_grid || self.grid_size < 1e-6 {
-            return (p, Vec::new());
-        }
-        let tol = self.snap_tol_doc();
-        let gx = (p.x / self.grid_size).round() * self.grid_size;
-        let gy = (p.y / self.grid_size).round() * self.grid_size;
-        let dx = gx - p.x;
-        let dy = gy - p.y;
-        // Only snap when near an intersection (both axes within tol).
-        // This lets you drag freely between intersections but locks
-        // strongly at crossings.
-        if dx.abs() > tol || dy.abs() > tol {
-            return (p, Vec::new());
-        }
-        let to = Point2::new(gx, gy);
-        let guide = SnapGuide {
-            vertical: false,
-            from: p,
-            to,
-            kind: snapping::SnapKind::Endpoint,
-            span_is_x: false,
-            span_lo: 0.0,
-            span_hi: 0.0,
-        };
-        (to, vec![guide])
-    }
-
-    /// Snaps a free point (shape-tool placement) to the best target.
-    fn snap_point(&self, p: Point2) -> (Point2, Vec<SnapGuide>) {
+    /// The drawn grid's snap lattice step right now (doc units). Snap
+    /// targets are exactly the intersections you can SEE: the fixed base
+    /// grid subdivides 5x per level as you zoom, and `grid::snap_step`
+    /// returns the finest currently-drawn level.
+    fn grid_step(&self) -> Option<f64> {
         if self.snap_to_grid {
-            return self.grid_snap(p);
+            Some(grid::snap_step(self.camera.zoom))
+        } else {
+            None
         }
-        if !self.snap_to_objects {
-            return (p, Vec::new());
-        }
-        let (adj, guides) =
-            snapping::best(&self.doc, self.snap_tol_doc(), p, &[], &[], false, false, self.snap_visible());
-        (Point2::new(p.x + adj.x, p.y + adj.y), guides)
     }
 
-    /// Creation-tool cursor snapping: the cursor itself locks onto nearby
-    /// points, midpoints, and edge bodies so new geometry lands perfectly
-    /// joined. Respects Snap to Grid / Snap to Objects toggles — when Grid is
-    /// on, object snaps are completely disabled.
+    /// Creation-tool cursor snapping — Fusion-style combined snapping:
+    ///   1. OBJECTS FIRST, all-or-nothing: nearest endpoint > arc center >
+    ///      midpoint > edge body > arc body within tolerance locks BOTH
+    ///      axes (works whether Snap to Grid is on or off);
+    ///   2. otherwise, per-axis: nearest point coordinate / axis-aligned
+    ///      edge span can lock ONE axis;
+    ///   3. axes still free go to the GRID, intersections only: both axes
+    ///      free snaps to the nearest lattice crossing (both within tol);
+    ///      one axis object-locked snaps the other to the nearest grid
+    ///      line, so you ride object edges landing exactly on crossings;
+    ///   4. whatever remains stays free — between intersections the
+    ///      cursor is never yanked along a grid line.
     fn snap_creation_point(&self, p: Point2) -> (Point2, Vec<SnapGuide>) {
-        if self.snap_to_grid {
-            return self.grid_snap(p);
-        }
-        if !self.snap_to_objects {
-            return (p, Vec::new());
-        }
-        let (pos, guide) = snapping::cursor_snap(
+        snapping::cursor_snap_combined(
             &self.doc,
             self.snap_tol_doc(),
             p,
             self.snap_visible(),
-        );
-        (pos, guide.into_iter().collect())
+            self.grid_step(),
+            self.snap_to_objects,
+            self.camera.zoom,
+        )
     }
 
     // Mouse down on the canvas. Returns true if a repaint is needed.
@@ -314,6 +295,9 @@ impl Editor {
                 true
             }
             gpui::MouseButton::Left => {
+                // Keep the snap crosshair in sync with click placements
+                // (click-created shapes land exactly on the drawn crosshair).
+                let _ = self.update_creation_cursor(cursor);
                 // Constraint chips sit ON TOP of geometry — clicking one
                 // toggles the chip selection and never touches geometry.
                 if self.tool == Tool::Move
@@ -338,6 +322,7 @@ impl Editor {
                         self.pending_via_click = false;
                         self.snap_guides.clear();
                         self.tool = Tool::Move;
+                        self.creation_cursor = None;
                         let b = pending.bounds();
                         if b.size.w > 0. && b.size.h > 0. {
                             let layer_id = self.doc.layers[0].id;
@@ -362,6 +347,7 @@ impl Editor {
                         self.pending_via_click = false;
                         self.snap_guides.clear();
                         self.tool = Tool::Move;
+                        self.creation_cursor = None;
                         let (_, b) = pending.snapped(shift);
                         if pick::distance(b, pending.start) > 1e-6 {
                             let layer_id = self.doc.layers[0].id;
@@ -382,6 +368,7 @@ impl Editor {
                         self.pending_via_click = false;
                         self.snap_guides.clear();
                         self.tool = Tool::Move;
+                        self.creation_cursor = None;
                         let (_, b) = pending.snapped(shift);
                         if pick::distance(b, pending.start) > 1e-6 {
                             let layer_id = self.doc.layers[0].id;
@@ -404,6 +391,7 @@ impl Editor {
                             self.pending_via_click = false;
                             self.snap_guides.clear();
                             self.tool = Tool::Move;
+                            self.creation_cursor = None;
                             if let (Some(a), Some(b)) = (pending.a, pending.b) {
                                 let c = pending.cursor;
                                 let layer_id = self.doc.layers[0].id;
@@ -574,6 +562,9 @@ impl Editor {
     pub fn canvas_drag(&mut self, cursor: gpui::Point<gpui::Pixels>, shift: bool) -> bool {
         self.last_cursor = Some(cursor);
         self.shift = shift;
+        // The snap crosshair tracks every move (idle or drag-out) so it's
+        // always glued to the cursor when a creation tool is active.
+        let mut changed = self.update_creation_cursor(cursor);
         if self.pan_delta(cursor) {
             self.snap_guides.clear();
             return true;
@@ -635,10 +626,11 @@ impl Editor {
             if !matches!(self.tool, Tool::Line | Tool::Rectangle | Tool::Ruler) {
                 self.snap_guides.clear();
             }
-            return false;
+            return changed;
         }
 
-        self.solve_drag(shift)
+        changed |= self.solve_drag(shift);
+        changed
     }
 
     // Live constraint-solve drag: cursor targets go in, solved positions
@@ -735,45 +727,27 @@ impl Editor {
 
         // Per-axis consensus voting: every dragged point proposes its own
         // snap corrections; each axis adopts the most-agreed proposal and
-        // applies it RIGIDLY to all points. Respects Snap to Grid / Snap to
-        // Objects — when Grid is on, object snaps are completely disabled.
+        // applies it RIGIDLY to all points. Grid and object snaps work
+        // TOGETHER: objects keep priority, the drawn grid's intersections
+        // fill the axes objects leave free.
         let mut proposals_x: Vec<f64> = Vec::new();
         let mut proposals_y: Vec<f64> = Vec::new();
-        if !self.alt_down {
+        if !self.alt_down && (self.snap_to_objects || self.snap_to_grid) {
             for &(_pid, start) in &drag.points {
                 let target = Point2::new(start.x + delta.x, start.y + delta.y);
-                let (adj_x, adj_y) = if self.snap_to_grid {
-                    // Grid intersection only — both axes must be within tol
-                    // so you can move freely between intersections.
-                    if self.grid_size < 1e-6 {
-                        (0.0, 0.0)
-                    } else {
-                        let tol = self.snap_tol_doc();
-                        let gx = (target.x / self.grid_size).round() * self.grid_size;
-                        let gy = (target.y / self.grid_size).round() * self.grid_size;
-                        let dx = gx - target.x;
-                        let dy = gy - target.y;
-                        if dx.abs() <= tol && dy.abs() <= tol {
-                            (dx, dy)
-                        } else {
-                            (0.0, 0.0)
-                        }
-                    }
-                } else if !self.snap_to_objects {
-                    (0.0, 0.0)
-                } else {
-                    let (adj, _) = snapping::best(
-                        &self.doc,
-                        self.snap_tol_doc(),
-                        target,
-                        &exclude_pts,
-                        &exclude_segs,
-                        endpoints_only,
-                        false,
-                        self.snap_visible(),
-                    );
-                    (adj.x, adj.y)
-                };
+                let (adj, _) = snapping::best(
+                    &self.doc,
+                    self.snap_tol_doc(),
+                    target,
+                    &exclude_pts,
+                    &exclude_segs,
+                    endpoints_only,
+                    false,
+                    self.snap_visible(),
+                    self.grid_step(),
+                    self.camera.zoom,
+                );
+                let (adj_x, adj_y) = (adj.x, adj.y);
                 if adj_x != 0. {
                     proposals_x.push(adj_x);
                 }
@@ -1003,14 +977,33 @@ impl Editor {
         if self.tool == Tool::Pan {
             return CursorStyle::OpenHand;
         }
-        if self.tool == Tool::Rectangle
-            || self.tool == Tool::Ruler
-            || self.tool == Tool::Line
-            || self.tool == Tool::Circle
-        {
-            return CursorStyle::Crosshair;
-        }
+        // Creation tools keep the idle ARROW cursor: the drawn crosshair
+        // (CanvasView::snap_cursor_layer) is the makeshift snapping cursor.
         CursorStyle::Arrow
+    }
+
+    /// Recomputes the drawn snap-cursor state for creation tools: position
+    /// of the crosshair (the snapped point — detached from the raw cursor
+    /// while locked) plus whether a snap is engaged. Returns true if the
+    /// state changed (repaint needed). Always runs while a creation tool is
+    /// active so the crosshair tracks every mouse move; hides itself while
+    /// panning and for non-creation tools.
+    fn update_creation_cursor(&mut self, cursor: gpui::Point<gpui::Pixels>) -> bool {
+        let is_creation = matches!(
+            self.tool,
+            Tool::Rectangle | Tool::Line | Tool::Ruler | Tool::Circle
+        );
+        let next = if is_creation && self.pan_start.is_none() {
+            let (pos, guides) = self.snap_creation_point(self.cursor_doc(cursor));
+            Some((pos.x as f32, pos.y as f32, !guides.is_empty()))
+        } else {
+            None
+        };
+        if self.creation_cursor == next {
+            return false;
+        }
+        self.creation_cursor = next;
+        true
     }
 
     pub fn canvas_up(&mut self, button: gpui::MouseButton, shift: bool) -> bool {
@@ -1079,6 +1072,7 @@ impl Editor {
             }
             self.pending_via_click = false;
             self.tool = Tool::Move;
+            self.creation_cursor = None;
             if pick::distance(b, pending.start) > 1e-6 {
                 let layer_id = self.doc.layers[0].id;
                 let seg = self.create_line(layer_id, pending.start, b);
@@ -1094,6 +1088,7 @@ impl Editor {
             }
             self.pending_via_click = false;
             self.tool = Tool::Move;
+            self.creation_cursor = None;
             if pick::distance(b, pending.start) > 1e-6 {
                 let layer_id = self.doc.layers[0].id;
                 let seg = self.create_ruler(layer_id, pending.start, b);
@@ -1115,6 +1110,7 @@ impl Editor {
         self.pending_via_click = false;
         let b = pending.bounds();
         self.tool = Tool::Move;
+        self.creation_cursor = None;
         if b.size.w > 0. && b.size.h > 0. {
             let layer_id = self.doc.layers[0].id;
             let fill = self.create_rectangle(

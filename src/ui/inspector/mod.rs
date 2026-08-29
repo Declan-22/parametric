@@ -20,7 +20,7 @@ impl RenderOnce for Inspector {
 
         // Snapshot editor state for this frame. Reading through `App`
         // subscribes this window to Editor notifications.
-        let (has_selection, show_grid, grid_size, snap_to_grid, snap_to_objects) = self
+        let (has_selection, show_grid, snap_to_grid, snap_to_objects) = self
             .editor
             .upgrade()
             .map(|e| {
@@ -28,12 +28,11 @@ impl RenderOnce for Inspector {
                 (
                     !ed.selection.is_empty(),
                     ed.show_grid,
-                    ed.grid_size,
                     ed.snap_to_grid,
                     ed.snap_to_objects,
                 )
             })
-            .unwrap_or((true, false, 20.0, false, true));
+            .unwrap_or((true, false, false, true));
 
         let mut root = div()
             // Single column, flush against the far-right edge, full height
@@ -54,13 +53,7 @@ impl RenderOnce for Inspector {
             .border_color(rgb(t.component_border_color));
 
         if !has_selection {
-            root = root.child(self.grid_section(
-                t,
-                show_grid,
-                grid_size,
-                snap_to_grid,
-                snap_to_objects,
-            ));
+            root = root.child(self.grid_section(t, show_grid, snap_to_grid, snap_to_objects));
         }
 
         root
@@ -72,13 +65,10 @@ impl Inspector {
         &self,
         t: Theme,
         show_grid: bool,
-        grid_size: f64,
         snap_to_grid: bool,
         snap_to_objects: bool,
     ) -> impl IntoElement {
         let editor_show = self.editor.clone();
-        let editor_size_dec = self.editor.clone();
-        let editor_size_inc = self.editor.clone();
         let editor_snap_grid = self.editor.clone();
         let editor_snap_obj = self.editor.clone();
 
@@ -130,95 +120,6 @@ impl Inspector {
                         t,
                         |ed| ed.show_grid = !ed.show_grid,
                     )),
-            )
-            .child(
-                // Grid Size stepper
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(8.))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(t.text_secondary))
-                            .child("Grid Size"),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.))
-                            .child(
-                                div()
-                                    .id("grid-size-dec")
-                                    .w(px(22.))
-                                    .h(px(22.))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(4.))
-                                    .bg(rgb(t.bg_tertiary))
-                                    .border_1()
-                                    .border_color(rgb(t.component_border_color))
-                                    .text_sm()
-                                    .text_color(rgb(t.text_primary))
-                                    .cursor_pointer()
-                                    .child("−")
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        move |_, _, cx| {
-                                            cx.stop_propagation();
-                                            let _ = editor_size_dec.update(cx, |ed, cx| {
-                                                ed.grid_size = (ed.grid_size - 5.0).max(5.0);
-                                                cx.notify();
-                                            });
-                                        },
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .w(px(42.))
-                                    .h(px(22.))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(4.))
-                                    .bg(rgb(t.bg_primary))
-                                    .border_1()
-                                    .border_color(rgb(t.component_border_color))
-                                    .text_sm()
-                                    .text_color(rgb(t.text_primary))
-                                    .child(format!("{:.0}", grid_size)),
-                            )
-                            .child(
-                                div()
-                                    .id("grid-size-inc")
-                                    .w(px(22.))
-                                    .h(px(22.))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(4.))
-                                    .bg(rgb(t.bg_tertiary))
-                                    .border_1()
-                                    .border_color(rgb(t.component_border_color))
-                                    .text_sm()
-                                    .text_color(rgb(t.text_primary))
-                                    .cursor_pointer()
-                                    .child("+")
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        move |_, _, cx| {
-                                            cx.stop_propagation();
-                                            let _ = editor_size_inc.update(cx, |ed, cx| {
-                                                ed.grid_size = (ed.grid_size + 5.0).min(100.0);
-                                                cx.notify();
-                                            });
-                                        },
-                                    ),
-                            ),
-                    ),
             )
             .child(
                 div()

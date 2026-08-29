@@ -1,7 +1,7 @@
 use gpui::{
     App, Bounds, HitboxBehavior, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, RenderOnce, ScrollDelta, ScrollWheelEvent, Size,
-    Window, canvas, div, fill, prelude::*, px, rgb,
+    MouseUpEvent, Pixels, Point, RenderOnce, ScrollDelta, ScrollWheelEvent, Size, Window, canvas,
+    div, fill, prelude::*, px, rgb, rgba, svg,
 };
 
 use crate::editor::Editor;
@@ -126,6 +126,7 @@ impl RenderOnce for CanvasView {
                 });
             })
             .child(self.paint_layer())
+            .child(self.constraint_chip_layer(cx))
             .child(self.dimension_layer())
             .children(context_menu::draw(
                 self.editor.clone(),
@@ -136,6 +137,44 @@ impl RenderOnce for CanvasView {
 }
 
 pub(crate) const CHIP_SIZE: f32 = 18.;
+
+// Constraint chip glyphs (12x12 source SVGs, rendered at the full chip
+// size so the glyph fills it). Stroke width is bumped from the source
+// files' 0.75 to 1 to keep the glyph readable at 18px.
+const ICON_CHIP_COINCIDENT: &[u8] =
+    br#"<svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg"><g clip-path="url(#clip0_5_128)">
+<path d="M2.75 1V7.06M5 9.25H11M2.305 10.481C2.4015 10.5 2.5175 10.5 2.75 10.5C2.9825 10.5 3.0985 10.5 3.195 10.481C3.38908 10.4424 3.56736 10.3472 3.70727 10.2073C3.84719 10.0674 3.94245 9.88908 3.981 9.695C4 9.5985 4 9.4825 4 9.25C4 9.0175 4 8.9015 3.981 8.805C3.94245 8.61092 3.84719 8.43264 3.70727 8.29273C3.56736 8.15281 3.38908 8.05755 3.195 8.019C3.0985 8 2.9825 8 2.75 8C2.5175 8 2.4015 8 2.305 8.019C2.11092 8.05755 1.93264 8.15281 1.79273 8.29273C1.65281 8.43264 1.55755 8.61092 1.519 8.805C1.5 8.9015 1.5 9.0175 1.5 9.25C1.5 9.4825 1.5 9.5985 1.519 9.695C1.55755 9.88908 1.65281 10.0674 1.79273 10.2073C1.93264 10.3472 2.11092 10.4424 2.305 10.481Z" stroke="black" stroke-width="0.75" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+<defs>
+<clipPath id="clip0_5_128">
+<rect width="12" height="12" fill="white"/>
+</clipPath>
+</defs>
+</svg>"#;
+
+const ICON_CHIP_HORIZONTAL: &[u8] =
+    br#"<svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
+<g clip-path="url(#clip0_5_124)">
+<path d="M1.375 4.31H10.625M1.5 6.185H10.5M4 6.3921L2.70711 7.685M6.75 6.3921L5.45711 7.685M9.25 6.3921L7.95711 7.685" stroke="black" stroke-width="0.75" stroke-linecap="round"/>
+</g>
+<defs>
+<clipPath id="clip0_5_124">
+<rect width="12" height="12" fill="white"/>
+</clipPath>
+</defs>
+</svg>"#;
+
+const ICON_CHIP_VERTICAL: &[u8] =
+    br#"<svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
+<g clip-path="url(#clip0_5_111)">
+<path d="M7.685 1.375V10.625M5.81 1.5V10.5M5.60289 4L4.31 2.70711M5.60289 6.75L4.31 5.45711M5.60289 9.25L4.31 7.95711" stroke="black" stroke-width="0.75" stroke-linecap="round"/>
+</g>
+<defs>
+<clipPath id="clip0_5_111">
+<rect width="12" height="12" fill="white"/>
+</clipPath>
+</defs>
+</svg>"#;
 
 impl CanvasView {
     // Dimension labels painted directly into the canvas pass — same
@@ -216,6 +255,59 @@ impl CanvasView {
             .absolute()
             .inset_0()
             .size_full()
+    }
+
+    // Constraint chips: DOM overlay glued to the painted geometry. Chip
+    // square + glyph ride a real SVG asset (same convention as the
+    // toolbar). Purely visual — hit-testing stays editor-side
+    // (constraint_chip_at), so nothing here intercepts clicks.
+    fn constraint_chip_layer(&self, cx: &App) -> impl IntoElement {
+        use crate::core::constraints::ConstraintKind;
+
+        let t = *crate::theme::active(cx);
+        let markers = self
+            .editor
+            .upgrade()
+            .map(|e| e.read(cx).constraint_markers.clone())
+            .unwrap_or_default();
+
+        div()
+            .absolute()
+            .inset_0()
+            .size_full()
+            .children(markers.iter().filter(|m| m.visible).map(|m| {
+                const S: f32 = CHIP_SIZE;
+                let icon = match m.constraint.kind {
+                    ConstraintKind::Coincident => ICON_CHIP_COINCIDENT,
+                    ConstraintKind::Horizontal => ICON_CHIP_HORIZONTAL,
+                    ConstraintKind::Vertical => ICON_CHIP_VERTICAL,
+                };
+                let border = if m.clicked { t.accent_border } else { t.accent };
+                let bg = if m.emphasized { t.accent } else { t.bg_primary };
+                let icon_color = if m.emphasized {
+                    rgb(0xFFFFFF)
+                } else {
+                    // 70% so the glyph stays readable over bg_primary;
+                    // full opacity once the chip itself is hovered.
+                    rgba((t.accent_border << 8) | if m.hovered { 0xFF } else { 0xB3 })
+                };
+                div()
+                    .absolute()
+                    .left(px(m.cx_out - S / 2.))
+                    // Marker coords are window-space; this layer starts
+                    // below the title bar, so convert y.
+                    .top(px(m.cy_out - S / 2. - TITLE_BAR_HEIGHT))
+                    .w(px(S as f32 + 2.0))
+                    .h(px(S as f32 + 2.0))
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(rgb(border))
+                    .bg(rgb(bg))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(svg().data(icon).w(px(S)).h(px(S)).text_color(icon_color))
+            }))
     }
 }
 
@@ -432,110 +524,6 @@ impl CanvasView {
                             rgb(crate::theme::active(cx).accent),
                             gpui::BorderStyle::Solid,
                         ));
-                    }
-                    paint::Primitive::Chip {
-                        x,
-                        y,
-                        size,
-                        bg,
-                        border,
-                        icon,
-                        kind,
-                    } => {
-                        window.paint_quad(gpui::quad(
-                            Bounds {
-                                origin: Point { x: px(x), y: px(y) },
-                                size: Size {
-                                    width: px(size),
-                                    height: px(size),
-                                },
-                            },
-                            px(6.),
-                            bg.unwrap_or(gpui::transparent_black().into()),
-                            gpui::Edges::all(px(1.)),
-                            border,
-                            gpui::BorderStyle::Solid,
-                        ));
-                        // Tiny vector icon strokes inside the chip.
-                        let cx0 = x + size / 2.;
-                        let cy0 = y + size / 2.;
-                        let mut stroke = |ax: f32, ay: f32, bx: f32, by: f32| {
-                            let dx = bx - ax;
-                            let dy = by - ay;
-                            let len = (dx * dx + dy * dy).sqrt();
-                            if len < 1e-3 {
-                                return;
-                            }
-                            let w = 1.2;
-                            let nx = -dy / len * w / 2.;
-                            let ny = dx / len * w / 2.;
-                            let mut path = gpui::Path::new(Point {
-                                x: px(ax + nx),
-                                y: px(ay + ny),
-                            });
-                            path.line_to(Point {
-                                x: px(bx + nx),
-                                y: px(by + ny),
-                            });
-                            path.line_to(Point {
-                                x: px(bx - nx),
-                                y: px(by - ny),
-                            });
-                            path.line_to(Point {
-                                x: px(ax - nx),
-                                y: px(ay - ny),
-                            });
-                            path.line_to(Point {
-                                x: px(ax + nx),
-                                y: px(ay + ny),
-                            });
-                            window.paint_path(path, icon);
-                        };
-                        match kind {
-                            0 => {
-                                // Vertical double arrow.
-                                stroke(cx0, cy0 - 5., cx0, cy0 + 5.);
-                                stroke(cx0 - 2., cy0 - 3.2, cx0, cy0 - 5.);
-                                stroke(cx0 + 2., cy0 - 3.2, cx0, cy0 - 5.);
-                                stroke(cx0 - 2., cy0 + 3.2, cx0, cy0 + 5.);
-                                stroke(cx0 + 2., cy0 + 3.2, cx0, cy0 + 5.);
-                            }
-                            1 => {
-                                // Horizontal double arrow.
-                                stroke(cx0 - 5., cy0, cx0 + 5., cy0);
-                                stroke(cx0 - 3.2, cy0 - 2., cx0 - 5., cy0);
-                                stroke(cx0 - 3.2, cy0 + 2., cx0 - 5., cy0);
-                                stroke(cx0 + 3.2, cy0 - 2., cx0 + 5., cy0);
-                                stroke(cx0 + 3.2, cy0 + 2., cx0 + 5., cy0);
-                            }
-                            _ => {
-                                // Coincident: dot, elbow down-left, dot.
-                                stroke(cx0, cy0 - 4.5, cx0, cy0);
-                                stroke(cx0, cy0, cx0 - 3.5, cy0);
-                                let mut dot = |dx: f32, dy: f32| {
-                                    let r = 1.1;
-                                    window.paint_quad(gpui::quad(
-                                        Bounds {
-                                            origin: Point {
-                                                x: px(dx - r),
-                                                y: px(dy - r),
-                                            },
-                                            size: Size {
-                                                width: px(r * 2.),
-                                                height: px(r * 2.),
-                                            },
-                                        },
-                                        px(r),
-                                        icon,
-                                        gpui::Edges::all(px(0.)),
-                                        icon,
-                                        gpui::BorderStyle::Solid,
-                                    ));
-                                };
-                                dot(cx0, cy0 - 5.5);
-                                dot(cx0 - 4.5, cy0);
-                            }
-                        }
                     }
                     paint::Primitive::RulerLabel {
                         center_x,

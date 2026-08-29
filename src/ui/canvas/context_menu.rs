@@ -64,11 +64,17 @@ impl ContextMenu {
 // -- icons --
 
 pub const ICON_COINCIDENT: &[u8] =
-    br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
-  <circle cx="12" cy="5" r="2" fill="currentColor"/>
-  <circle cx="12" cy="19" r="2" fill="currentColor"/>
-  <path d="M12 7v10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-</svg>"#;
+    br#"<svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <g clip-path="url(#clip0_5_128)">
+    <path d="M2.75 1V7.06M5 9.25H11M2.305 10.481C2.4015 10.5 2.5175 10.5 2.75 10.5C2.9825 10.5 3.0985 10.5 3.195 10.481C3.38908 10.4424 3.56736 10.3472 3.70727 10.2073C3.84719 10.0674 3.94245 9.88908 3.981 9.695C4 9.5985 4 9.4825 4 9.25C4 9.0175 4 8.9015 3.981 8.805C3.94245 8.61092 3.84719 8.43264 3.70727 8.29273C3.56736 8.15281 3.38908 8.05755 3.195 8.019C3.0985 8 2.9825 8 2.75 8C2.5175 8 2.4015 8 2.305 8.019C2.11092 8.05755 1.93264 8.15281 1.79273 8.29273C1.65281 8.43264 1.55755 8.61092 1.519 8.805C1.5 8.9015 1.5 9.0175 1.5 9.25C1.5 9.4825 1.5 9.5985 1.519 9.695C1.55755 9.88908 1.65281 10.0674 1.79273 10.2073C1.93264 10.3472 2.11092 10.4424 2.305 10.481Z" stroke="black" stroke-width="0.75" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+    <defs>
+    <clipPath id="clip0_5_128">
+    <rect width="12" height="12" fill="white"/>
+    </clipPath>
+    </defs>
+    </svg>
+"#;
 
 pub const ICON_MERGE_POINTS: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 256 256">
 	<path d="M0 0h256v256H0z" fill="none" />

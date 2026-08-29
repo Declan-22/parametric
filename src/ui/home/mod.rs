@@ -191,7 +191,6 @@ impl RenderOnce for DesignCard {
                     paint::Primitive::Line { .. } => {}
                     paint::Primitive::Outline { .. } => {}
                     paint::Primitive::Circle { .. } => {}
-                    paint::Primitive::Chip { .. } => {}
                     paint::Primitive::RulerLabel { .. } => {}
                 }
             }

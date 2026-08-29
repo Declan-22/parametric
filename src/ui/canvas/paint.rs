@@ -57,19 +57,6 @@ pub enum Primitive {
         px_value: String,
         in_value: String,
     },
-    // Constraint chip: bordered square with a tiny vector icon. Painted in
-    // the canvas pass so it shares EXACT coordinates with geometry (DOM
-    // overlays drift relative to painted content).
-    Chip {
-        x: f32,
-        y: f32,
-        size: f32,
-        bg: Option<gpui::Hsla>,
-        border: gpui::Hsla,
-        icon: gpui::Hsla,
-        // 0 = vertical, 1 = horizontal, 2 = coincident.
-        kind: u8,
-    },
 }
 
 pub fn build_draw_list(
@@ -352,48 +339,6 @@ pub fn build_draw_list(
                 });
             }
         }
-    }
-
-    // 5b) Constraint chips — topmost interactive affordances.
-    for m in constraint_markers {
-        if !m.visible {
-            continue;
-        }
-        const S: f32 = crate::ui::canvas::CHIP_SIZE;
-        let faded_alpha: u32 = if m.hovered { 0xFF } else { 0x73 };
-        let border: gpui::Hsla = if m.clicked {
-            rgb(t.accent_border).into()
-        } else {
-            rgb(t.accent).into()
-        };
-        let icon: gpui::Hsla = if m.emphasized {
-            rgb(0xFFFFFF).into()
-        } else {
-            rgba((t.accent << 8) | faded_alpha).into()
-        };
-        // Emphasized: solid accent bg. Otherwise: bg_primary so the chip
-        // reads as a real container over any geometry underneath.
-        let bg: Option<gpui::Hsla> = Some(if m.emphasized {
-            rgb(t.accent).into()
-        } else {
-            rgb(t.bg_primary).into()
-        });
-        let kind = if m.coincident {
-            2
-        } else if m.vertical {
-            0
-        } else {
-            1
-        };
-        list.push(Primitive::Chip {
-            x: m.cx_out - S / 2.,
-            y: m.cy_out - S / 2.,
-            size: S,
-            bg,
-            border,
-            icon,
-            kind,
-        });
     }
 
     // 6) Marquee band: low-opacity accent fill + 1px accent border.

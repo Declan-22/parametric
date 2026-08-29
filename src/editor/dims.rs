@@ -20,9 +20,6 @@ const DIM_OFFSET_PX: f64 = 18.0;
 pub struct ConstraintMarker {
     pub key: String,
     pub constraint: crate::core::constraints::Constraint,
-    // Icon selection: coincident chip, else vertical/horizontal arrow.
-    pub vertical: bool,
-    pub coincident: bool,
     // Visibility: only when the owning element is hovered/selected or the
     // constraint is actively channeling a drag.
     pub visible: bool,
@@ -323,8 +320,6 @@ fn update_constraint_markers(ed: &mut Editor) {
         ed.constraint_markers.push(ConstraintMarker {
             key,
             constraint: c,
-            vertical: c.kind != crate::core::constraints::ConstraintKind::Vertical,
-            coincident: coincident_pt,
             cx_out: cx,
             cy_out: cy,
             cx_in: cx,

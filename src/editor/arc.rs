@@ -129,6 +129,88 @@ pub fn is_complete(doc: &Document, sid: SegmentId) -> bool {
     })
 }
 
+/// The point at the middle of the arc's SWEEP — ON the curve. (The chord
+/// midpoint of an arc floats in empty space off the bend, so snap targets
+/// must use this instead.)
+pub fn curve_midpoint(a: Point2, b: Point2, c: Point2) -> Option<Point2> {
+    const TAU: f64 = std::f64::consts::TAU;
+    let (o, r) = circumcircle(a, b, c)?;
+    let ang = |p: Point2| (p.y - o.y).atan2(p.x - o.x);
+    let norm = |mut t: f64| {
+        while t < 0. {
+            t += TAU;
+        }
+        while t >= TAU {
+            t -= TAU;
+        }
+        t
+    };
+    let a0 = ang(a);
+    let s_pos = norm(ang(b) - a0);
+    let sweep = if norm(ang(c) - a0) < s_pos { s_pos } else { s_pos - TAU };
+    let m0 = a0 + sweep / 2.;
+    Some(Point2::new(o.x + r * m0.cos(), o.y + r * m0.sin()))
+}
+
+/// SHIFT constraint for the arc bulge: snap the sweep of the arc
+/// a -> b through c to the nearest 90 degrees (perfect quarter, half, or
+/// three-quarter arc), preserving which side it bends to. The third point
+/// is the radial projection of c onto the snapped arc, clamped inside its
+/// span — so the bend follows the mouse along the arc instead of jumping
+/// to the apex. None when degenerate (collinear).
+pub fn snap_sweep(a: Point2, b: Point2, c: Point2) -> Option<Point2> {
+    const QUARTER: f64 = std::f64::consts::FRAC_PI_2;
+    const TAU: f64 = std::f64::consts::TAU;
+    // Current signed sweep (which side c bends to).
+    let (o0, _) = circumcircle(a, b, c)?;
+    let ang_wrt = |p: Point2, o: Point2| (p.y - o.y).atan2(p.x - o.x);
+    let norm = |mut t: f64| {
+        while t < 0. {
+            t += TAU;
+        }
+        while t >= TAU {
+            t -= TAU;
+        }
+        t
+    };
+    let a00 = ang_wrt(a, o0);
+    let s_pos = norm(ang_wrt(b, o0) - a00);
+    let sweep = if norm(ang_wrt(c, o0) - a00) < s_pos { s_pos } else { s_pos - TAU };
+    // Nearest multiple of 90°, preserving the bend direction; never 0 and
+    // never a full turn (a 3-point arc can't express either).
+    let mut steps = (sweep / QUARTER).round();
+    if steps.abs() < 1. {
+        steps = sweep.signum();
+    }
+    steps = steps.clamp(-3., 3.);
+    let s = steps * QUARTER;
+    // The circle through a and b with EXACTLY that sweep (the chord is
+    // fixed, so the snapped sweep fully determines center and radius).
+    let chx = b.x - a.x;
+    let chy = b.y - a.y;
+    let ch = (chx * chx + chy * chy).sqrt();
+    if ch < 1e-9 {
+        return None;
+    }
+    let r = ch / (2. * (s.abs() / 2.).sin());
+    let d = r * (s / 2.).cos();
+    let mid = Point2::new((a.x + b.x) / 2., (a.y + b.y) / 2.);
+    // Signed offset along the chord's LEFT normal — flips sides past 180°.
+    let o = Point2::new(mid.x - chy / ch * d, mid.y + chx / ch * d);
+    let a0 = ang_wrt(a, o);
+    // Radial projection of the cursor onto the snapped arc, clamped inside
+    // the span (a little shy of the endpoints so the arc stays valid).
+    let rel = if sweep >= 0. {
+        norm(ang_wrt(c, o) - a0)
+    } else {
+        norm(ang_wrt(c, o) - a0) - TAU
+    };
+    const EPS: f64 = 1e-3;
+    let t = rel.clamp(EPS, s.abs() - EPS) * s.signum();
+    let th = a0 + t;
+    Some(Point2::new(o.x + r * th.cos(), o.y + r * th.sin()))
+}
+
 /// Sample count so the polyline approximation's chord error stays under
 /// ~0.5 screen px regardless of zoom. `zoom` = camera zoom.
 pub fn adaptive_samples(a: Point2, b: Point2, c: Point2, zoom: f64) -> usize {

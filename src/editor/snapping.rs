@@ -17,13 +17,21 @@ pub enum SnapKind {
 }
 
 // A visual snap connection: what locked onto what. Edge snaps carry the
-// target's full span so rendering can trace it.
-#[derive(Clone, Copy, Debug)]
+// target's full span so rendering can trace it. `from` is the FEATURE
+// (what locked), `to` the manipulated point — the line between them is the
+// connection drawn on screen. `solid` marks FULL feature locks (both axes
+// onto one feature, or a grid crossing): only those earn the accent badge.
+// `linked` marks features ALREADY connected to the point by existing
+// geometry — the shape itself shows that connection, so the stub line is
+// suppressed (dot + badge still render).
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SnapGuide {
     pub vertical: bool,
     pub from: Point2,
     pub to: Point2,
     pub kind: SnapKind,
+    pub solid: bool,
+    pub linked: bool,
     pub span_is_x: bool,
     pub span_lo: f64,
     pub span_hi: f64,
@@ -146,7 +154,7 @@ pub fn targets(
             continue;
         }
         let Some((a, b)) = doc.segment_geom(sid) else { continue };
-        let m = mid(a, b);
+        let m = segment_mid_target(doc, seg, a, b);
         // Midpoints are positional targets: own-component edges never
         // offer them.
         if exclude_pts.contains(&seg.start) || exclude_pts.contains(&seg.end) {
@@ -234,6 +242,8 @@ fn grid_guide(p: Point2, to: Point2) -> SnapGuide {
         from: p,
         to,
         kind: SnapKind::Grid,
+        solid: true,
+        linked: false,
         span_is_x: false,
         span_lo: 0.,
         span_hi: 0.,
@@ -336,45 +346,30 @@ pub fn best(
 
     let Some((_, dx, dy, hit_x, hit_y, tgt)) = best else {
         // No object target: fall back to the grid, intersections only.
+        // Feature and snapped point COINCIDE at the crossing: no connection
+        // line, and the badge anchors at the locked position — anchoring it
+        // at the raw cursor would make it trail the cursor while dragging.
         if let Some(step) = grid_step {
             let gtol = grid_tol(tol, step, zoom);
-            if let Some((to, _, _)) = nearest_intersection(p, step, gtol) {
+            if let Some((crossing, _, _)) = nearest_intersection(p, step, gtol) {
                 return (
-                    Point2::new(to.x - p.x, to.y - p.y),
-                    vec![grid_guide(p, to)],
+                    Point2::new(crossing.x - p.x, crossing.y - p.y),
+                    vec![grid_guide(crossing, crossing)],
                 );
             }
         }
         return (Point2::new(0., 0.), Vec::new());
     };
     let mut adj = Point2::new(0., 0.);
-    let mut guides = Vec::new();
     if hit_x {
         adj.x = dx;
-        guides.push(SnapGuide {
-            vertical: true,
-            from: p,
-            to: Point2::new(tgt.x, p.y),
-            kind: tgt.kind,
-            span_is_x: tgt.span_is_x,
-            span_lo: tgt.span_lo,
-            span_hi: tgt.span_hi,
-        });
     }
     if hit_y {
         adj.y = dy;
-        guides.push(SnapGuide {
-            vertical: false,
-            from: p,
-            to: Point2::new(p.x, tgt.y),
-            kind: tgt.kind,
-            span_is_x: tgt.span_is_x,
-            span_lo: tgt.span_lo,
-            span_hi: tgt.span_hi,
-        });
     }
     // One axis free: fill it from the nearest grid LINE so drags ride
-    // object edges while landing exactly on drawn crossings.
+    // object edges while landing exactly on drawn crossings. Grid fills
+    // emit no connection line — the locked crossing IS the final point.
     if let Some(step) = grid_step {
         let fillable = !coincident_only && !endpoints_only;
         if fillable && (hit_x != hit_y) {
@@ -384,33 +379,59 @@ pub fn best(
                 let gdx = gx - p.x;
                 if gdx.abs() <= gtol {
                     adj.x = gdx;
-                    guides.push(SnapGuide {
-                        vertical: true,
-                        from: p,
-                        to: Point2::new(gx, p.y),
-                        kind: SnapKind::Grid,
-                        span_is_x: false,
-                        span_lo: 0.,
-                        span_hi: 0.,
-                    });
                 }
             } else {
                 let gy = (p.y / step).round() * step;
                 let gdy = gy - p.y;
                 if gdy.abs() <= gtol {
                     adj.y = gdy;
-                    guides.push(SnapGuide {
-                        vertical: false,
-                        from: p,
-                        to: Point2::new(p.x, gy),
-                        kind: SnapKind::Grid,
-                        span_is_x: false,
-                        span_lo: 0.,
-                        span_hi: 0.,
-                    });
                 }
             }
         }
+    }
+    // Connection guide: a line between the two snapping pieces — the
+    // feature (from) and the snapped point (to). An axis lock spans the
+    // FULL distance between them (Fusion-style alignment line); edge spans
+    // anchor at their nearest end.
+    let snapped = Point2::new(p.x + adj.x, p.y + adj.y);
+    let mut guides = Vec::new();
+    if hit_x {
+        let anchor_y = match tgt.kind {
+            SnapKind::Edge => snapped
+                .y
+                .clamp(tgt.span_lo.min(tgt.span_hi), tgt.span_lo.max(tgt.span_hi)),
+            _ => tgt.y,
+        };
+        guides.push(SnapGuide {
+            vertical: true,
+            from: Point2::new(tgt.x, anchor_y),
+            to: snapped,
+            kind: tgt.kind,
+            solid: hit_x && hit_y,
+            linked: false,
+            span_is_x: tgt.span_is_x,
+            span_lo: tgt.span_lo,
+            span_hi: tgt.span_hi,
+        });
+    }
+    if hit_y {
+        let anchor_x = match tgt.kind {
+            SnapKind::Edge => snapped
+                .x
+                .clamp(tgt.span_lo.min(tgt.span_hi), tgt.span_lo.max(tgt.span_hi)),
+            _ => tgt.x,
+        };
+        guides.push(SnapGuide {
+            vertical: false,
+            from: Point2::new(anchor_x, tgt.y),
+            to: snapped,
+            kind: tgt.kind,
+            solid: hit_x && hit_y,
+            linked: false,
+            span_is_x: tgt.span_is_x,
+            span_lo: tgt.span_lo,
+            span_hi: tgt.span_hi,
+        });
     }
     (adj, guides)
 }
@@ -419,10 +440,29 @@ pub fn mid(a: Point2, b: Point2) -> Point2 {
     Point2::new((a.x + b.x) / 2., (a.y + b.y) / 2.)
 }
 
+/// Segment midpoint as a snap target: lines use the chord midpoint; arcs
+/// project to the middle of their sweep — ON the curve (the chord midpoint
+/// of an arc floats in empty space off the bend).
+fn segment_mid_target(doc: &Document, seg: crate::core::document::Segment, a: Point2, b: Point2) -> Point2 {
+    if seg.kind == SegmentKind::Arc
+        && let Some(sc) = seg.ctrl
+        && let Some(c) = doc.point(sc)
+        && let Some(m) = crate::editor::arc::curve_midpoint(a, b, c)
+    {
+        return m;
+    }
+    mid(a, b)
+}
+
 /// One axis' lock candidate for combined snapping.
 struct AxisLock {
     to: f64,
     kind: SnapKind,
+    // The feature's full position — anchors the connection line.
+    feature: Point2,
+    // Edge spans anchor the connection at their nearest end to the point.
+    span_lo: f64,
+    span_hi: f64,
 }
 
 /// Per-axis object locks: a point's coordinate or an axis-aligned edge span
@@ -444,11 +484,17 @@ fn per_axis_object_locks(
         }
         let dx = q.x - p.x;
         if dx.abs() <= tol && best_x.as_ref().map_or(true, |(s, _)| dx.abs() < *s) {
-            best_x = Some((dx.abs(), AxisLock { to: q.x, kind: SnapKind::Endpoint }));
+            best_x = Some((
+                dx.abs(),
+                AxisLock { to: q.x, kind: SnapKind::Endpoint, feature: q, span_lo: 0., span_hi: 0. },
+            ));
         }
         let dy = q.y - p.y;
         if dy.abs() <= tol && best_y.as_ref().map_or(true, |(s, _)| dy.abs() < *s) {
-            best_y = Some((dy.abs(), AxisLock { to: q.y, kind: SnapKind::Endpoint }));
+            best_y = Some((
+                dy.abs(),
+                AxisLock { to: q.y, kind: SnapKind::Endpoint, feature: q, span_lo: 0., span_hi: 0. },
+            ));
         }
     }
     // Arc centers (circumcenters) — midpoint-grade targets.
@@ -470,11 +516,29 @@ fn per_axis_object_locks(
         }
         let dx = center.x - p.x;
         if dx.abs() <= tol && best_x.as_ref().map_or(true, |(s, _)| dx.abs() < *s) {
-            best_x = Some((dx.abs(), AxisLock { to: center.x, kind: SnapKind::Midpoint }));
+            best_x = Some((
+                dx.abs(),
+                AxisLock {
+                    to: center.x,
+                    kind: SnapKind::Midpoint,
+                    feature: center,
+                    span_lo: 0.,
+                    span_hi: 0.,
+                },
+            ));
         }
         let dy = center.y - p.y;
         if dy.abs() <= tol && best_y.as_ref().map_or(true, |(s, _)| dy.abs() < *s) {
-            best_y = Some((dy.abs(), AxisLock { to: center.y, kind: SnapKind::Midpoint }));
+            best_y = Some((
+                dy.abs(),
+                AxisLock {
+                    to: center.y,
+                    kind: SnapKind::Midpoint,
+                    feature: center,
+                    span_lo: 0.,
+                    span_hi: 0.,
+                },
+            ));
         }
     }
     // Segment midpoints + axis-aligned edge spans.
@@ -485,15 +549,33 @@ fn per_axis_object_locks(
         let Some((a, b)) = doc.segment_geom(sid) else {
             continue;
         };
-        let m = mid(a, b);
+        let m = segment_mid_target(doc, seg, a, b);
         if visible.contains(m) {
             let dx = m.x - p.x;
             if dx.abs() <= tol && best_x.as_ref().map_or(true, |(s, _)| dx.abs() < *s) {
-                best_x = Some((dx.abs(), AxisLock { to: m.x, kind: SnapKind::Midpoint }));
+                best_x = Some((
+                    dx.abs(),
+                    AxisLock {
+                        to: m.x,
+                        kind: SnapKind::Midpoint,
+                        feature: m,
+                        span_lo: 0.,
+                        span_hi: 0.,
+                    },
+                ));
             }
             let dy = m.y - p.y;
             if dy.abs() <= tol && best_y.as_ref().map_or(true, |(s, _)| dy.abs() < *s) {
-                best_y = Some((dy.abs(), AxisLock { to: m.y, kind: SnapKind::Midpoint }));
+                best_y = Some((
+                    dy.abs(),
+                    AxisLock {
+                        to: m.y,
+                        kind: SnapKind::Midpoint,
+                        feature: m,
+                        span_lo: 0.,
+                        span_hi: 0.,
+                    },
+                ));
             }
         }
         let horizontal = (a.y - b.y).abs() < 1e-9;
@@ -501,12 +583,30 @@ fn per_axis_object_locks(
         if horizontal && p.x >= a.x.min(b.x) && p.x <= a.x.max(b.x) {
             let dy = a.y - p.y;
             if dy.abs() <= tol && best_y.as_ref().map_or(true, |(s, _)| dy.abs() < *s) {
-                best_y = Some((dy.abs(), AxisLock { to: a.y, kind: SnapKind::Edge }));
+                best_y = Some((
+                    dy.abs(),
+                    AxisLock {
+                        to: a.y,
+                        kind: SnapKind::Edge,
+                        feature: a,
+                        span_lo: a.x.min(b.x),
+                        span_hi: a.x.max(b.x),
+                    },
+                ));
             }
         } else if vertical && p.y >= a.y.min(b.y) && p.y <= a.y.max(b.y) {
             let dx = a.x - p.x;
             if dx.abs() <= tol && best_x.as_ref().map_or(true, |(s, _)| dx.abs() < *s) {
-                best_x = Some((dx.abs(), AxisLock { to: a.x, kind: SnapKind::Edge }));
+                best_x = Some((
+                    dx.abs(),
+                    AxisLock {
+                        to: a.x,
+                        kind: SnapKind::Edge,
+                        feature: a,
+                        span_lo: a.y.min(b.y),
+                        span_hi: a.y.max(b.y),
+                    },
+                ));
             }
         }
     }
@@ -562,12 +662,24 @@ pub fn cursor_snap_combined(
             if x_lock.is_none() {
                 let gx = (p.x / step).round() * step;
                 if (gx - p.x).abs() <= gtol {
-                    x_lock = Some(AxisLock { to: gx, kind: SnapKind::Grid });
+                    x_lock = Some(AxisLock {
+                        to: gx,
+                        kind: SnapKind::Grid,
+                        feature: Point2::new(gx, p.y),
+                        span_lo: 0.,
+                        span_hi: 0.,
+                    });
                 }
             } else {
                 let gy = (p.y / step).round() * step;
                 if (gy - p.y).abs() <= gtol {
-                    y_lock = Some(AxisLock { to: gy, kind: SnapKind::Grid });
+                    y_lock = Some(AxisLock {
+                        to: gy,
+                        kind: SnapKind::Grid,
+                        feature: Point2::new(p.x, gy),
+                        span_lo: 0.,
+                        span_hi: 0.,
+                    });
                 }
             }
         }
@@ -575,30 +687,57 @@ pub fn cursor_snap_combined(
 
     let x = x_lock.as_ref().map_or(p.x, |l| l.to);
     let y = y_lock.as_ref().map_or(p.y, |l| l.to);
+    let snapped = Point2::new(x, y);
+    // Connection guides between the two snapping pieces: the feature
+    // (from) and the snapped point (to), spanning their FULL distance —
+    // Fusion-style alignment lines. Grid fills are skipped: the locked
+    // crossing IS the final point (nothing to connect).
     let mut guides = Vec::new();
     if let Some(l) = &x_lock {
-        guides.push(SnapGuide {
-            vertical: true,
-            from: p,
-            to: Point2::new(l.to, p.y),
-            kind: l.kind,
-            span_is_x: false,
-            span_lo: 0.,
-            span_hi: 0.,
-        });
+        if l.kind != SnapKind::Grid {
+            let anchor_y = if l.kind == SnapKind::Edge {
+                snapped
+                    .y
+                    .clamp(l.span_lo.min(l.span_hi), l.span_lo.max(l.span_hi))
+            } else {
+                l.feature.y
+            };
+            guides.push(SnapGuide {
+                vertical: true,
+                from: Point2::new(l.to, anchor_y),
+                to: snapped,
+                kind: l.kind,
+                solid: false,
+                linked: false,
+                span_is_x: false,
+                span_lo: l.span_lo,
+                span_hi: l.span_hi,
+            });
+        }
     }
     if let Some(l) = &y_lock {
-        guides.push(SnapGuide {
-            vertical: false,
-            from: p,
-            to: Point2::new(p.x, l.to),
-            kind: l.kind,
-            span_is_x: false,
-            span_lo: 0.,
-            span_hi: 0.,
-        });
+        if l.kind != SnapKind::Grid {
+            let anchor_x = if l.kind == SnapKind::Edge {
+                snapped
+                    .x
+                    .clamp(l.span_lo.min(l.span_hi), l.span_lo.max(l.span_hi))
+            } else {
+                l.feature.x
+            };
+            guides.push(SnapGuide {
+                vertical: false,
+                from: Point2::new(anchor_x, l.to),
+                to: snapped,
+                kind: l.kind,
+                solid: false,
+                linked: false,
+                span_is_x: false,
+                span_lo: l.span_lo,
+                span_hi: l.span_hi,
+            });
+        }
     }
-    (Point2::new(x, y), guides)
+    (snapped, guides)
 }
 
 /// Creation-tool cursor snapping. Priority:
@@ -613,12 +752,17 @@ pub fn cursor_snap(
     p: Point2,
     visible: Rect,
 ) -> (Point2, Option<SnapGuide>) {
-    let guide = |to: Point2, kind: SnapKind| {
+    // Guide convention: `from` is the FEATURE (what locked), `to` is the
+    // manipulated point — so the connection line always runs between the
+    // two snapping pieces.
+    let guide = |feature: Point2, kind: SnapKind| {
         Some(SnapGuide {
             vertical: false,
-            from: p,
-            to,
+            from: feature,
+            to: p,
             kind,
+            solid: true,
+            linked: false,
             span_is_x: false,
             span_lo: 0.,
             span_hi: 0.,
@@ -676,7 +820,7 @@ pub fn cursor_snap(
         let Some((a, b)) = doc.segment_geom(sid) else {
             continue;
         };
-        let m = mid(a, b);
+        let m = segment_mid_target(doc, seg, a, b);
         if !visible.contains(m) {
             continue;
         }

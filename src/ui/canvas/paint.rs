@@ -227,11 +227,11 @@ pub fn build_draw_list(
     // any angle. Drawn UNDER points/selection so corner dots always sit
     // on top.
     for d in dim_renders {
-        dashed_line(&mut list, d.ax, d.ay, d.lax, d.lay, accent);
-        dashed_line(&mut list, d.bx, d.by, d.lbx, d.lby, accent);
-        dashed_line(&mut list, d.lax, d.lay, d.lbx, d.lby, accent);
+        dashed_line(&mut list, d.ax, d.ay, d.lax, d.lay, 1., accent);
+        dashed_line(&mut list, d.bx, d.by, d.lbx, d.lby, 1., accent);
+        dashed_line(&mut list, d.lax, d.lay, d.lbx, d.lby, 1., accent);
         for e in &d.extra_ext {
-            dashed_line(&mut list, e[0], e[1], e[2], e[3], accent);
+            dashed_line(&mut list, e[0], e[1], e[2], e[3], 1., accent);
         }
     }
 
@@ -239,13 +239,16 @@ pub fn build_draw_list(
     let guide_color: gpui::Background = rgba((t.accent << 8) | 0x66).into();
     for m in constraint_markers {
         if let Some(g) = m.guide {
-            dashed_line(&mut list, g[0], g[1], g[2], g[3], guide_color);
+            dashed_line(&mut list, g[0], g[1], g[2], g[3], 1., guide_color);
         }
     }
 
-    // 3) Snap feedback markers. During CREATION the white dots are replaced
-    // by the DOM snap-cursor layer (crosshair + accent square), so only the
-    // dashed guides render here; drags keep the classic dot markers.
+    // 3) Snap feedback: a 2px dashed accent CONNECTION LINE between the two
+    // snapping pieces — the feature (guide.from) and the snapped point
+    // (guide.to) — spanning their full distance, for EVERY snap, creation
+    // or drag. Fusion-style alignment lines. During creation the feature
+    // marker itself is the DOM snap-cursor (crosshair + accent square);
+    // drags keep the classic dot markers on the feature.
     let is_creation = matches!(
         tool,
         crate::editor::Tool::Rectangle
@@ -253,14 +256,41 @@ pub fn build_draw_list(
             | crate::editor::Tool::Ruler
             | crate::editor::Tool::Circle
     );
-    if !is_creation {
-        for g in snap_guides {
-            let s = camera.unit_to_screen(g.to);
+    for g in snap_guides {
+        let from = camera.unit_to_screen(g.from);
+        let to = camera.unit_to_screen(g.to);
+        // Linked features are already joined by the shape's own geometry —
+        // the dashed stub would double-draw an existing edge.
+        if !g.linked {
+            dashed_line(
+                &mut list,
+                from.x as f32,
+                from.y as f32,
+                to.x as f32,
+                to.y as f32,
+                2.,
+                accent,
+            );
+        }
+        if !is_creation {
             list.push(Primitive::Circle {
-                cx: s.x as f32,
-                cy: s.y as f32,
+                cx: from.x as f32,
+                cy: from.y as f32,
                 radius: 4.,
             });
+            // Snap badge: accent square outline around the snapped point,
+            // ONLY for solid feature locks (both axes onto one feature, or
+            // a grid crossing). One-axis alignments draw their connection
+            // line but must NOT claim "100% snapped".
+            if g.solid {
+                const SQUARE: f32 = 12.0;
+                list.push(Primitive::Outline {
+                    x: to.x as f32 - SQUARE / 2.0,
+                    y: to.y as f32 - SQUARE / 2.0,
+                    w: SQUARE,
+                    h: SQUARE,
+                });
+            }
         }
     }
 
@@ -796,6 +826,7 @@ fn dashed_line(
     ay: f32,
     bx: f32,
     by: f32,
+    width: f32,
     color: gpui::Background,
 ) {
     const DASH: f32 = 6.;
@@ -816,7 +847,7 @@ fn dashed_line(
             ay: ay + uy * t,
             bx: ax + ux * end,
             by: ay + uy * end,
-            width: 1.,
+            width,
             color,
         });
         t += DASH + GAP;

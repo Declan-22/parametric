@@ -622,16 +622,23 @@ impl CanvasView {
     // Creation-tool snap cursor: the makeshift crosshair that rides the real
     // cursor. Unsnapped, its center is glued to the cursor point; when a snap
     // locks (endpoint, edge, grid crossing) it detaches to the target and the
-    // accent square lights up. The OS cursor stays a plain arrow.
+    // accent square lights up. The OS cursor stays a plain arrow. The stored
+    // position is in DOC coords, re-projected through the live camera here —
+    // so it tracks zoom/pan perfectly instead of drifting off the cursor.
     fn snap_cursor_layer(&self, cx: &App) -> impl IntoElement {
         let t = *crate::theme::active(cx);
-        let state = self
-            .editor
-            .upgrade()
-            .and_then(|e| e.read(cx).creation_cursor);
-        let Some((x, y, snapped)) = state else {
+        let Some(editor) = self.editor.upgrade() else {
             return div().absolute();
         };
+        let (camera, state) = {
+            let ed = editor.read(cx);
+            (ed.camera, ed.creation_cursor)
+        };
+        let Some((dx, dy, snapped)) = state else {
+            return div().absolute();
+        };
+        let s = camera.unit_to_screen(crate::core::geometry::Point2::new(dx, dy));
+        let (x, y) = (s.x as f32, s.y as f32);
         const S: f32 = 18.;
         let mut layer = div()
             .absolute()
@@ -640,7 +647,9 @@ impl CanvasView {
             .top(px(y - S / 2.))
             .w(px(S))
             .h(px(S))
-            .child(svg().data(ICON_CROSSHAIR).size_full().text_color(rgb(t.text_primary)));
+            .child(
+                svg().data(ICON_CROSSHAIR).size_full().text_color(rgb(t.text_primary)),
+            );
         if snapped {
             const SQUARE: f32 = 14.;
             layer = layer.child(

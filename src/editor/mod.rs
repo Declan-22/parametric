@@ -105,11 +105,13 @@ pub struct Editor {
     pub show_grid: bool,
     pub snap_to_grid: bool,
     pub snap_to_objects: bool,
-    // Creation-tool snap cursor: position (canvas-local px) of the drawn
-    // crosshair plus whether it's currently locked onto a target. The OS
-    // cursor stays a plain arrow; this is the makeshift snapping cursor.
-    // None when no creation tool is active or while panning.
-    pub creation_cursor: Option<(f32, f32, bool)>,
+    // Creation-tool snap cursor: the crosshair's position in DOC
+    // coordinates plus whether a snap is engaged. Storing doc coords (not
+    // screen) lets the render layer re-project every frame, so the
+    // crosshair stays glued to its point across zoom and pan. The OS
+    // cursor stays a plain arrow. None when no creation tool is active or
+    // while panning.
+    pub creation_cursor: Option<(f64, f64, bool)>,
 }
 
 const HANDLE_TOL_PX: f64 = 14.0;
@@ -401,11 +403,15 @@ impl Editor {
                             return true;
                         }
                     }
-                    let (at, guides) = self.snap_creation_point(self.cursor_doc(cursor));
+                    let (mut at, guides) = self.snap_creation_point(self.cursor_doc(cursor));
                     self.snap_guides = guides;
                     match self.pending_circle.as_mut() {
-                        // Second click: fix the chord's far end.
+                        // Second click: fix the chord's far end. Shift locks
+                        // the chord's direction to 45-degree steps.
                         Some(p) if p.a.is_some() && p.b.is_none() => {
+                            if shift && let Some(a) = p.a {
+                                at = tools::snap_angle(a, at);
+                            }
                             p.b = Some(at);
                             p.cursor = at;
                             self.pending_via_click = true;
@@ -607,7 +613,14 @@ impl Editor {
         // Circle rubber band: cursor is the third (on-arc) point.
         if self.pending_circle.is_some() {
             let (at, guides) = self.snap_creation_point(self.cursor_doc(cursor));
-            self.snap_guides = guides;
+            let info = self.pending_circle.map(|p| (p.stage(), p.a, p.b));
+            let (at, shifted) = match info {
+                Some((stage, a, b)) => Self::arc_creation_shift(stage, a, b, at, shift),
+                None => (at, false),
+            };
+            // A sweep transform supersedes raw-cursor alignment guides —
+            // the arc itself is the constraint now.
+            self.snap_guides = if shifted { Vec::new() } else { guides };
             if let Some(pending) = self.pending_circle.as_mut() {
                 pending.cursor = at;
             }
@@ -623,7 +636,9 @@ impl Editor {
             }
             // Creation tools keep their hover snap-lock guides here —
             // clearing them wiped the crosshair highlight every move.
-            if !matches!(self.tool, Tool::Line | Tool::Rectangle | Tool::Ruler) {
+            // (update_creation_cursor refreshes them above; non-creation
+            // tools still clear stale drag leftovers.)
+            if !matches!(self.tool, Tool::Line | Tool::Rectangle | Tool::Ruler | Tool::Circle) {
                 self.snap_guides.clear();
             }
             return changed;
@@ -702,6 +717,31 @@ impl Editor {
             }
             i += 1;
         }
+        // Arc defining points form ONE snap-unit: the ctrl point is not a
+        // segment endpoint (the closure above never reaches it), so dragging
+        // the bend would otherwise snap to its own arc's endpoints/midpoint.
+        // If any of the three is excluded, all three are.
+        let mut arc_closure = true;
+        while arc_closure {
+            arc_closure = false;
+            for (_, s) in self.doc.all_segments() {
+                if s.kind != crate::core::document::SegmentKind::Arc {
+                    continue;
+                }
+                let Some(ctrl) = s.ctrl else { continue };
+                let defs = [s.start, s.end, ctrl];
+                let any_in = defs.iter().any(|d| exclude_pts.contains(d));
+                let any_out = defs.iter().any(|d| !exclude_pts.contains(d));
+                if any_in && any_out {
+                    for d in defs {
+                        if !exclude_pts.contains(&d) {
+                            exclude_pts.push(d);
+                        }
+                    }
+                    arc_closure = true;
+                }
+            }
+        }
         // Points CO-LOCATED with a dragged point's start (e.g. a partner
         // whose coincident constraint was just deleted) must not be snap
         // targets either — otherwise the point can never be pulled away.
@@ -729,13 +769,15 @@ impl Editor {
         // snap corrections; each axis adopts the most-agreed proposal and
         // applies it RIGIDLY to all points. Grid and object snaps work
         // TOGETHER: objects keep priority, the drawn grid's intersections
-        // fill the axes objects leave free.
-        let mut proposals_x: Vec<f64> = Vec::new();
-        let mut proposals_y: Vec<f64> = Vec::new();
+        // fill the axes objects leave free. The adopted proposal's guides
+        // are kept so the connection lines render during the drag — and
+        // they record WHICH point locked, so the badge/stub can be
+        // re-anchored at its FINAL (post-solver) position.
+        let mut proposals: Vec<(PointId, f64, f64, Vec<SnapGuide>)> = Vec::new();
         if !self.alt_down && (self.snap_to_objects || self.snap_to_grid) {
-            for &(_pid, start) in &drag.points {
+            for &(pid, start) in &drag.points {
                 let target = Point2::new(start.x + delta.x, start.y + delta.y);
-                let (adj, _) = snapping::best(
+                let (adj, guides) = snapping::best(
                     &self.doc,
                     self.snap_tol_doc(),
                     target,
@@ -747,12 +789,8 @@ impl Editor {
                     self.grid_step(),
                     self.camera.zoom,
                 );
-                let (adj_x, adj_y) = (adj.x, adj.y);
-                if adj_x != 0. {
-                    proposals_x.push(adj_x);
-                }
-                if adj_y != 0. {
-                    proposals_y.push(adj_y);
+                if adj.x != 0. || adj.y != 0. {
+                    proposals.push((pid, adj.x, adj.y, guides));
                 }
             }
         }
@@ -763,8 +801,25 @@ impl Editor {
                 sa.total_cmp(&sb)
             })
         };
-        let sx = consensus(&proposals_x).unwrap_or(0.);
-        let sy = consensus(&proposals_y).unwrap_or(0.);
+        let xs: Vec<f64> = proposals.iter().map(|p| p.1).collect();
+        let ys: Vec<f64> = proposals.iter().map(|p| p.2).collect();
+        let sx = consensus(&xs).unwrap_or(0.);
+        let sy = consensus(&ys).unwrap_or(0.);
+        let matched = if sx == 0. && sy == 0. {
+            None
+        } else {
+            proposals
+                .iter()
+                .find(|(_, x, y, _)| {
+                    (sx == 0. || (x - sx).abs() < 1e-9) && (sy == 0. || (y - sy).abs() < 1e-9)
+                })
+                .cloned()
+        };
+        let locked_pid = matched.as_ref().map(|(pid, _, _, _)| *pid);
+        let snap_guides: Vec<SnapGuide> = matched.map(|(_, _, _, g)| g).unwrap_or_default();
+        if self.snap_guides != snap_guides {
+            self.snap_guides = snap_guides;
+        }
         let snapped_delta = Point2::new(delta.x + sx, delta.y + sy);
 
         let mut targets: Vec<(PointId, Point2)> = drag
@@ -775,10 +830,15 @@ impl Editor {
             })
             .collect();
 
-        // Shift on a single-endpoint drag: snap the direction to 45-degree
-        // steps around the segment's other endpoint.
+        // Shift on a single-endpoint drag: ARC points get arc-specific
+        // constraints (rotate on circle / sweep snap); everything else snaps
+        // the direction to 45-degree steps around the segment's other
+        // endpoint.
         if shift && targets.len() == 1 {
-            snap_target_direction(&self.doc, &mut targets);
+            let (pid, target) = targets[0];
+            if !self.arc_shift_target(pid, target, &drag.points, &mut targets[0].1) {
+                snap_target_direction(&self.doc, &mut targets);
+            }
         }
 
         let solver = crate::core::solver::Solver::build(&self.doc, &targets, &drag.aux);
@@ -789,7 +849,112 @@ impl Editor {
             self.doc.move_point(id, pos);
         }
         self.resolve_arcs_after_drag(&moved);
+        // Re-anchor the connection guides at the locked point's FINAL
+        // position — the solver may project it off the raw proposal, and a
+        // badge/stub that trails the cursor instead of sitting on the point
+        // is worse than no feedback at all. Endpoint features DIRECTLY
+        // connected to the locked point by existing geometry also get their
+        // stub suppressed: the shape's own edge already draws that
+        // connection.
+        if let Some(pid) = locked_pid
+            && let Some(p) = self.doc.point(pid)
+        {
+            self.snap_guides = self
+                .snap_guides
+                .iter()
+                .map(|g| {
+                    let mut g = *g;
+                    g.to = p;
+                    if g.kind == snapping::SnapKind::Endpoint
+                        && self.point_directly_linked(pid, g.from)
+                    {
+                        g.linked = true;
+                    }
+                    g
+                })
+                .collect();
+        }
         true
+    }
+
+    /// True when a document segment directly connects `pid` to a point at
+    /// `feature` (same position) — the two snapping pieces are already
+    /// joined by visible geometry.
+    fn point_directly_linked(&self, pid: PointId, feature: Point2) -> bool {
+        for (_, s) in self.doc.all_segments() {
+            let other = if s.start == pid {
+                Some(s.end)
+            } else if s.end == pid {
+                Some(s.start)
+            } else {
+                None
+            };
+            if let Some(o) = other
+                && let Some(q) = self.doc.point(o)
+                && pick::distance(q, feature) < 1e-6
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// SHIFT constraint for single-point drags of ARC defining points:
+    ///  - start/end point: ROTATE ON CIRCLE — the target is projected
+    ///    radially onto the arc's original circle (the one at drag start),
+    ///    so the endpoint spins around the circle instead of warping it;
+    ///  - ctrl point: sweep snaps to 90-degree steps (perfect quarter /
+    ///    half / three-quarter arc).
+    /// Returns false when pid belongs to no arc (caller falls back to the
+    /// generic 45-degree direction snap).
+    fn arc_shift_target(
+        &self,
+        pid: PointId,
+        target: Point2,
+        drag_points: &[(PointId, Point2)],
+        out: &mut Point2,
+    ) -> bool {
+        for (_, s) in self.doc.all_segments() {
+            if s.kind != crate::core::document::SegmentKind::Arc {
+                continue;
+            }
+            let Some(ctrl_id) = s.ctrl else { continue };
+            let is_end = s.start == pid || s.end == pid;
+            let is_ctrl = ctrl_id == pid;
+            if !is_end && !is_ctrl {
+                continue;
+            }
+            let (Some(pa), Some(pb), Some(pc)) =
+                (self.doc.point(s.start), self.doc.point(s.end), self.doc.point(ctrl_id))
+            else {
+                return true;
+            };
+            // Defining triangle at DRAG START: the dragged point's original
+            // position plus the two unmoved points — that circle is the one
+            // worth preserving.
+            let pos = |id: PointId, cur: Point2| {
+                drag_points
+                    .iter()
+                    .find(|(p, _)| *p == id)
+                    .map(|(_, start)| *start)
+                    .unwrap_or(cur)
+            };
+            let (a, b, c) = (pos(s.start, pa), pos(s.end, pb), pos(ctrl_id, pc));
+            if is_end {
+                if let Some((o, r)) = crate::editor::arc::circumcircle(a, b, c) {
+                    let dx = target.x - o.x;
+                    let dy = target.y - o.y;
+                    let d = (dx * dx + dy * dy).sqrt();
+                    if d > 1e-9 {
+                        *out = Point2::new(o.x + dx / d * r, o.y + dy / d * r);
+                    }
+                }
+            } else if let Some(snapped) = crate::editor::arc::snap_sweep(a, b, target) {
+                *out = snapped;
+            }
+            return true;
+        }
+        false
     }
 
     /// Keeps every arc consistent after a drag. Two regimes:
@@ -982,6 +1147,34 @@ impl Editor {
         CursorStyle::Arrow
     }
 
+    /// SHIFT constraints for the arc creation cursor, applied to the
+    /// snapped position: stage 2 (chord) locks its direction to 45-degree
+    /// steps; stage 3 (bulge) snaps the sweep to 90-degree steps. Returns
+    /// the adjusted position plus whether a sweep transform engaged (which
+    /// invalidates raw-cursor alignment guides).
+    fn arc_creation_shift(
+        stage: u8,
+        a: Option<Point2>,
+        b: Option<Point2>,
+        at: Point2,
+        shift: bool,
+    ) -> (Point2, bool) {
+        if !shift {
+            return (at, false);
+        }
+        match stage {
+            2 => (a.map(|a| tools::snap_angle(a, at)).unwrap_or(at), false),
+            3 => match (a, b) {
+                (Some(a), Some(b)) => match crate::editor::arc::snap_sweep(a, b, at) {
+                    Some(snapped) => (snapped, true),
+                    None => (at, false),
+                },
+                _ => (at, false),
+            },
+            _ => (at, false),
+        }
+    }
+
     /// Recomputes the drawn snap-cursor state for creation tools: position
     /// of the crosshair (the snapped point — detached from the raw cursor
     /// while locked) plus whether a snap is engaged. Returns true if the
@@ -993,17 +1186,45 @@ impl Editor {
             self.tool,
             Tool::Rectangle | Tool::Line | Tool::Ruler | Tool::Circle
         );
-        let next = if is_creation && self.pan_start.is_none() {
-            let (pos, guides) = self.snap_creation_point(self.cursor_doc(cursor));
-            Some((pos.x as f32, pos.y as f32, !guides.is_empty()))
-        } else {
-            None
-        };
-        if self.creation_cursor == next {
+        if !is_creation || self.pan_start.is_some() {
+            if self.creation_cursor.is_some() {
+                self.creation_cursor = None;
+                return true;
+            }
             return false;
         }
+        let (pos, guides) = self.snap_creation_point(self.cursor_doc(cursor));
+        // Apply the arc-tool shift constraints so the crosshair matches the
+        // pending preview exactly; a sweep transform invalidates the raw
+        // cursor's alignment guides (the arc IS the constraint now).
+        let pending = self.pending_circle.map(|p| (p.stage(), p.a, p.b));
+        let at = if let Some((stage, a, b)) = pending {
+            let (at, shifted) = Self::arc_creation_shift(stage, a, b, pos, self.shift);
+            if shifted {
+                self.snap_guides.clear();
+                let next = Some((at.x, at.y, false));
+                let changed = self.creation_cursor != next;
+                self.creation_cursor = next;
+                return changed;
+            }
+            at
+        } else {
+            pos
+        };
+        // The badge means "fully locked onto a feature" — one-axis
+        // alignments draw their connection lines but never light it up.
+        let solid = guides.iter().any(|g| g.solid);
+        let next = Some((at.x, at.y, solid));
+        let mut changed = self.creation_cursor != next;
         self.creation_cursor = next;
-        true
+        // Publish the guides on idle hover too — drag-out branches below
+        // refresh them, but plain hovering never populated snap_guides, so
+        // the dashed stubs to the snap target only existed mid-drag.
+        if self.snap_guides != guides {
+            self.snap_guides = guides;
+            changed = true;
+        }
+        changed
     }
 
     pub fn canvas_up(&mut self, button: gpui::MouseButton, shift: bool) -> bool {
@@ -1680,7 +1901,7 @@ impl Editor {
 /// Snap a single drag target's direction to 45-degree steps around the
 /// other endpoint of its owning segment (shift-resize). Standalone lines
 /// get angle-only snapping — no inch-mark length quantization.
-fn snap_target_direction(doc: &Document, targets: &mut [(PointId, Point2)]) {
+    fn snap_target_direction(doc: &Document, targets: &mut [(PointId, Point2)]) {
     let (pid, target) = targets[0];
     let mut anchor: Option<Point2> = None;
     let mut bare_line = false;

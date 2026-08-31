@@ -191,6 +191,7 @@ impl CanvasView {
     // coordinates as the lines, so they are always anchored together.
     fn dimension_layer(&self) -> impl IntoElement {
         let editor = self.editor.clone();
+        let editor_hit = self.editor.clone();
 
         let prepaint = move |_: Bounds<Pixels>, window: &mut Window, cx: &mut App| {
             let Some(editor) = editor.upgrade() else {
@@ -199,7 +200,32 @@ impl CanvasView {
             let ed = editor.read(cx);
             let t = *crate::theme::active(cx);
 
-            ed.dim_renders
+            // Dimension labels: transient previews in accent, tool-created
+            // constraint dims in the muted constraint ink. Hover lifts a
+            // constraint dim to text_secondary. The EDITING dim keeps its
+            // normal container — the selection highlight goes on the TEXT.
+            let ink = |d_constraint: bool, d_hovered: bool, d_editing: bool| -> gpui::Hsla {
+                if d_editing {
+                    rgb(t.bg_primary).into()
+                } else if d_constraint && d_hovered {
+                    rgb(t.text_secondary).into()
+                } else if d_constraint {
+                    rgb(t.empty_text_secondary).into()
+                } else {
+                    rgb(t.accent).into()
+                }
+            };
+            let border = |d_constraint: bool, d_hovered: bool, d_editing: bool| -> u32 {
+                if d_constraint && d_hovered {
+                    t.text_secondary
+                } else if d_constraint {
+                    t.empty_text_secondary
+                } else {
+                    t.accent
+                }
+            };
+            let mut labels: Vec<LabelPrim> = ed
+                .dim_renders
                 .iter()
                 .map(|d| {
                     make_label(
@@ -208,10 +234,27 @@ impl CanvasView {
                         d.label_cx,
                         d.label_cy,
                         rgb(t.bg_primary).into(),
-                        rgb(t.accent).into(),
+                        ink(d.constraint, d.hovered, d.editing),
+                        border(d.constraint, d.hovered, d.editing),
+                        d.dim_index,
+                        d.editing,
                     )
                 })
-                .collect::<Vec<_>>()
+                .collect();
+            labels.extend(ed.angle_dim_renders.iter().map(|a| {
+                make_label(
+                    window,
+                    a.text.clone(),
+                    a.label_cx,
+                    a.label_cy,
+                    rgb(t.bg_primary).into(),
+                    ink(a.constraint, a.hovered, a.editing),
+                    border(a.constraint, a.hovered, a.editing),
+                    a.dim_index,
+                    a.editing,
+                )
+            }));
+            labels
         };
 
         let paint_labels = move |bounds: Bounds<Pixels>,
@@ -220,6 +263,24 @@ impl CanvasView {
                                  cx: &mut App| {
             // Convert canvas-local prim coords to window space.
             let (ox, oy) = (bounds.origin.x, bounds.origin.y);
+            // Hitboxes (canvas-local) for placed dims — consumed by the
+            // editor's hover/double-click/drag hit-testing.
+            let mut hitboxes: Vec<(usize, [f32; 4])> = Vec::new();
+            for l in &labels {
+                const PAD_X: f32 = 6.;
+                const BORDER: f32 = 4.;
+                const BOX_H: f32 = 22.;
+                if let Some(idx) = l.dim_index {
+                    let box_w = l.line.width.as_f32() + PAD_X * 2. + BORDER;
+                    hitboxes.push((
+                        idx,
+                        [l.center_x - box_w / 2., l.center_y - BOX_H / 2., box_w, BOX_H],
+                    ));
+                }
+            }
+            if let Some(editor) = editor_hit.upgrade() {
+                editor.update(cx, |ed, _| ed.dim_hitboxes = hitboxes);
+            }
             for l in labels {
                 const PAD_X: f32 = 6.;
                 const BORDER: f32 = 4.;
@@ -236,7 +297,9 @@ impl CanvasView {
                     y: px(l.center_y - line_h.as_f32() / 2. + OPTICAL_NUDGE) + oy,
                 };
                 // Container background + border: sized to the measured
-                // text (adaptable width) via padding, not fixed.
+                // text (adaptable width) via padding, not fixed. Editing
+                // keeps the container normal — the SELECTION goes on the
+                // text itself, like a real text input.
                 window.paint_quad(gpui::quad(
                     Bounds {
                         origin: Point {
@@ -251,18 +314,54 @@ impl CanvasView {
                     px(6.),
                     l.bg,
                     gpui::Edges::all(px(2.)),
-                    rgb(crate::theme::active(cx).accent),
+                    rgb(l.border),
                     gpui::BorderStyle::Solid,
                 ));
-                    let _ = l.line.paint(
-                        origin,
-                        font_size_px(),
-                        gpui::TextAlign::Center,
-                        Some(px(l.line.width.as_f32())),
-                        window,
-                        cx,
-                    );
+                let t = *crate::theme::active(cx);
+                if l.editing {
+                    // Selected-text bar behind the glyphs.
+                    window.paint_quad(gpui::fill(
+                        Bounds {
+                            origin: Point { x: origin.x - px(2.), y: origin.y },
+                            size: Size {
+                                width: px(l.line.width.as_f32() + 4.),
+                                height: line_h,
+                            },
+                        },
+                        rgb(t.accent),
+                    ));
                 }
+                let _ = l.line.paint(
+                    origin,
+                    font_size_px(),
+                    gpui::TextAlign::Center,
+                    Some(px(l.line.width.as_f32())),
+                    window,
+                    cx,
+                );
+                // Editing caret: a blinking 1px bar right after the text.
+                if l.editing {
+                    let caret_visible = editor_hit
+                        .upgrade()
+                        .map(|ed| ed.read(cx).dim_caret_visible)
+                        .unwrap_or(true);
+                    if caret_visible {
+                        window.paint_quad(gpui::fill(
+                            Bounds {
+                                origin: Point {
+                                    x: origin.x + l.line.width + px(2.),
+                                    y: origin.y,
+                                },
+                                size: Size {
+                                    width: px(1.),
+                                    height: line_h,
+                                },
+                            },
+                            rgb(t.text_primary),
+                        ));
+                    }
+                }
+            }
         };
 
         canvas(prepaint, paint_labels)
@@ -328,6 +427,9 @@ struct LabelPrim {
     center_x: f32,
     center_y: f32,
     bg: gpui::Background,
+    border: u32,
+    dim_index: Option<usize>,
+    editing: bool,
 }
 
 fn make_label(
@@ -337,6 +439,9 @@ fn make_label(
     center_y: f32,
     bg: gpui::Background,
     accent: gpui::Hsla,
+    border: u32,
+    dim_index: Option<usize>,
+    editing: bool,
 ) -> LabelPrim {
     let font_size = px(11.);
     let runs = [gpui::TextRun {
@@ -355,6 +460,9 @@ fn make_label(
         center_x,
         center_y,
         bg,
+        border,
+        dim_index,
+        editing,
     }
 }
 
@@ -410,6 +518,7 @@ impl CanvasView {
                 &ed.selection,
                 ed.hover.filter(|_| ed.dragging.is_none()),
                 &ed.dim_renders,
+                &ed.angle_dim_renders,
                 &ed.snap_guides,
                 ed.marquee,
                 pending_ruler,
@@ -559,7 +668,7 @@ impl CanvasView {
                         // Value in ink; unit suffix in empty_text_primary.
                         const SIZE: f32 = 9.;
                         const ROW_GAP: f32 = 2.;
-                        let t = crate::theme::active(cx);
+                let t = *crate::theme::active(cx);
                         let value_color = rgb(t.text_secondary).into();
                         let unit_color = rgb(t.empty_text_primary).into();
                         let font = gpui::Font {

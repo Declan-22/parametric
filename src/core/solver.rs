@@ -1,4 +1,4 @@
-use super::constraints::ConstraintKind;
+use super::constraints::{ConstraintKind, DimTarget};
 use super::document::Document;
 use super::geometry::Point2;
 use super::ids::PointId;
@@ -29,6 +29,10 @@ pub enum SolveStatus {
 pub struct Solution {
     pub status: SolveStatus,
     pub positions: Vec<(PointId, Point2)>,
+    /// Largest unsatisfied LINEAR residual (doc units) at the solution.
+    pub max_lin_residual: f64,
+    /// Largest unsatisfied ANGULAR residual (radians) at the solution.
+    pub max_angle_residual: f64,
 }
 
 const ANCHOR_WEIGHT: f64 = 1.0;
@@ -48,6 +52,15 @@ enum Eq {
     Vertical { a: usize, b: usize },
     // Residual: |ab| - target
     Distance { a: usize, b: usize, target: f64 },
+    // Residual: signed distance of p from line (l1->l2) - target
+    PointLineDist { p: usize, l1: usize, l2: usize, target: f64 },
+    // Residual: signed distance of b1 from line (a1->a2) - target
+    LineDist { a1: usize, a2: usize, b1: usize, target: f64 },
+    // Residual: signed angle between (a2-a1) and (b2-b1) - target (radians)
+    Angle { a1: usize, a2: usize, b1: usize, b2: usize, target: f64 },
+    // Residual: circumradius of the triangle (s,e,c) - target (doc units).
+    // Expresses an arc radius constraint through its three defining points.
+    ArcRadius { s: usize, e: usize, c: usize, target: f64 },
 }
 
 // A residual evaluated at one iterate: value plus sparse gradient over
@@ -77,6 +90,8 @@ pub struct Solver {
     // Map slot index -> free variable index (None when fixed).
     free_of: Vec<Option<usize>>,
     n_free: usize,
+    // Soft-anchor weight for free points (strong for dimension applies).
+    anchor_weight: f64,
 }
 
 impl Solver {
@@ -124,11 +139,96 @@ impl Solver {
             }
         }
         for d in &doc.dimensions {
-            let Some(target) = d.value else { continue };
-            let (Some(a), Some(b)) = (slot_of(d.a), slot_of(d.b)) else {
-                continue;
-            };
-            eqs.push(Eq::Distance { a, b, target });
+            match &d.target {
+                DimTarget::Points { a, b } => {
+                    let (Some(a), Some(b)) = (slot_of(*a), slot_of(*b)) else {
+                        continue;
+                    };
+                    eqs.push(Eq::Distance { a, b, target: d.value });
+                }
+                DimTarget::PointLine { p, line } => {
+                    let Some(seg) = doc.segment(*line) else { continue };
+                    let (Some(pp), Some(l1), Some(l2)) =
+                        (slot_of(*p), slot_of(seg.start), slot_of(seg.end))
+                    else {
+                        continue;
+                    };
+                    // Preserve whichever side of the line the point is on.
+                    let (Some(ppp), Some(l1p), Some(l2p)) = (
+                        doc.point(*p),
+                        doc.point(seg.start),
+                        doc.point(seg.end),
+                    ) else {
+                        continue;
+                    };
+                    let dx = l2p.x - l1p.x;
+                    let dy = l2p.y - l1p.y;
+                    let l = (dx * dx + dy * dy).sqrt().max(1e-9);
+                    let signed =
+                        (ppp.x - l1p.x) * (-dy / l) + (ppp.y - l1p.y) * (dx / l);
+                    eqs.push(Eq::PointLineDist {
+                        p: pp,
+                        l1,
+                        l2,
+                        target: signed.signum() * d.value,
+                    });
+                }
+                DimTarget::Lines { a, b } => {
+                    let Some(sega) = doc.segment(*a) else { continue };
+                    let Some(segb) = doc.segment(*b) else { continue };
+                    let (Some(a1), Some(a2)) = (slot_of(sega.start), slot_of(sega.end)) else {
+                        continue;
+                    };
+                    let (Some(b1), _) = (slot_of(segb.start), slot_of(segb.end)) else {
+                        continue;
+                    };
+                    let (Some(a1p), Some(a2p), Some(b1p)) = (
+                        doc.point(sega.start),
+                        doc.point(sega.end),
+                        doc.point(segb.start),
+                    ) else {
+                        continue;
+                    };
+                    let dx = a2p.x - a1p.x;
+                    let dy = a2p.y - a1p.y;
+                    let l = (dx * dx + dy * dy).sqrt().max(1e-9);
+                    let signed = (b1p.x - a1p.x) * (-dy / l) + (b1p.y - a1p.y) * (dx / l);
+                    eqs.push(Eq::LineDist { a1, a2, b1, target: signed.signum() * d.value });
+                }
+                DimTarget::Radius { seg } => {
+                    // Radius constraint: circumradius of the arc's defining
+                    // triangle equals the placed value.
+                    let Some(seg_d) = doc.segment(*seg) else { continue };
+                    let (Some(s), Some(e)) = (slot_of(seg_d.start), slot_of(seg_d.end)) else {
+                        continue;
+                    };
+                    let Some(cc) = seg_d.ctrl.and_then(|id| slot_of(id)) else {
+                        continue;
+                    };
+                    eqs.push(Eq::ArcRadius { s, e, c: cc, target: d.value });
+                }
+                DimTarget::Angle { a, b } => {
+                    let Some(sega) = doc.segment(*a) else { continue };
+                    let Some(segb) = doc.segment(*b) else { continue };
+                    let (Some(a1), Some(a2)) = (slot_of(sega.start), slot_of(sega.end)) else {
+                        continue;
+                    };
+                    let (Some(b1), Some(b2)) = (slot_of(segb.start), slot_of(segb.end)) else {
+                        continue;
+                    };
+                    // The placed SIGNED sweep (degrees) is the target — the
+                    // rotation from ray A to ray B in the placed direction,
+                    // exactly what the arc draws. Label, arc and constraint
+                    // can never disagree.
+                    eqs.push(Eq::Angle {
+                        a1,
+                        a2,
+                        b1,
+                        b2,
+                        target: d.sweep.to_radians(),
+                    });
+                }
+            }
         }
 
         // Constraint-less geometry (rulers, free lines) must still enter
@@ -185,12 +285,27 @@ impl Solver {
             aux: aux_idx,
             free_of,
             n_free,
+            anchor_weight: ANCHOR_WEIGHT,
         }
     }
 
     /// Convenience: no auxiliary followers.
     pub fn build_simple(doc: &Document, drag: &[(PointId, Point2)]) -> Solver {
         Self::build(doc, drag, &[])
+    }
+
+    /// Variant with a STRONG soft-anchor: used by dimension application,
+    /// where the freed component must deform minimally to satisfy the new
+    /// equation instead of drifting wherever the solve is easiest.
+    pub fn build_with_anchor(
+        doc: &Document,
+        drag: &[(PointId, Point2)],
+        aux: &[(PointId, Point2)],
+        anchor_weight: f64,
+    ) -> Solver {
+        let mut solver = Self::build(doc, drag, aux);
+        solver.anchor_weight = anchor_weight;
+        solver
     }
 
     pub fn is_empty(&self) -> bool {
@@ -257,6 +372,144 @@ impl Solver {
                     }
                     out.push(Residual { value: len - target, grad, weight: DIM_WEIGHT });
                 }
+                Eq::PointLineDist { p, l1, l2, target } => {
+                    let (pp, pl1, pl2) = (self.pos(p, x), self.pos(l1, x), self.pos(l2, x));
+                    let dx = pl2.x - pl1.x;
+                    let dy = pl2.y - pl1.y;
+                    let l = (dx * dx + dy * dy).sqrt().max(1e-9);
+                    let nx = -dy / l;
+                    let ny = dx / l;
+                    let mut grad = Vec::new();
+                    if let Some(v) = self.free_of[p] {
+                        grad.push((v * 2, nx));
+                        grad.push((v * 2 + 1, ny));
+                    }
+                    if let Some(v) = self.free_of[l1] {
+                        grad.push((v * 2, -nx));
+                        grad.push((v * 2 + 1, -ny));
+                    }
+                    // l2 only tilts the normal (second order) — no gradient.
+                    out.push(Residual {
+                        value: (pp.x - pl1.x) * nx + (pp.y - pl1.y) * ny - target,
+                        grad,
+                        weight: DIM_WEIGHT,
+                    });
+                }
+                Eq::LineDist { a1, a2, b1, target } => {
+                    let (pa1, pa2, pb1) =
+                        (self.pos(a1, x), self.pos(a2, x), self.pos(b1, x));
+                    let dx = pa2.x - pa1.x;
+                    let dy = pa2.y - pa1.y;
+                    let l = (dx * dx + dy * dy).sqrt().max(1e-9);
+                    let nx = -dy / l;
+                    let ny = dx / l;
+                    let mut grad = Vec::new();
+                    if let Some(v) = self.free_of[a1] {
+                        grad.push((v * 2, -nx));
+                        grad.push((v * 2 + 1, -ny));
+                    }
+                    if let Some(v) = self.free_of[b1] {
+                        grad.push((v * 2, nx));
+                        grad.push((v * 2 + 1, ny));
+                    }
+                    out.push(Residual {
+                        value: (pb1.x - pa1.x) * nx + (pb1.y - pa1.y) * ny - target,
+                        grad,
+                        weight: DIM_WEIGHT,
+                    });
+                }
+                Eq::Angle { a1, a2, b1, b2, target } => {
+                    let (pa1, pa2, pb1, pb2) = (
+                        self.pos(a1, x),
+                        self.pos(a2, x),
+                        self.pos(b1, x),
+                        self.pos(b2, x),
+                    );
+                    let ax = pa2.x - pa1.x;
+                    let ay = pa2.y - pa1.y;
+                    let bx = pb2.x - pb1.x;
+                    let by = pb2.y - pb1.y;
+                    let c = ax * by - ay * bx;
+                    let d = ax * bx + ay * by;
+                    let denom = (c * c + d * d).max(1e-9);
+                    // dTheta/dA and dTheta/dB of atan2(cross, dot).
+                    let gax = (by * d - c * bx) / denom;
+                    let gay = (-bx * d - c * by) / denom;
+                    let gbx = (-ay * d - c * ax) / denom;
+                    let gby = (ax * d - c * ay) / denom;
+                    let mut grad = Vec::new();
+                    if let Some(v) = self.free_of[a1] {
+                        grad.push((v * 2, -gax));
+                        grad.push((v * 2 + 1, -gay));
+                    }
+                    if let Some(v) = self.free_of[a2] {
+                        grad.push((v * 2, gax));
+                        grad.push((v * 2 + 1, gay));
+                    }
+                    if let Some(v) = self.free_of[b1] {
+                        grad.push((v * 2, -gbx));
+                        grad.push((v * 2 + 1, -gby));
+                    }
+                    if let Some(v) = self.free_of[b2] {
+                        grad.push((v * 2, gbx));
+                        grad.push((v * 2 + 1, gby));
+                    }
+                    out.push(Residual {
+                        // Wrapped into (-PI, PI]: correct for ordinary AND
+                        // reflex (|sweep| > 180 deg) targets.
+                        value: {
+                            let mut value = c.atan2(d) - target;
+                            while value > std::f64::consts::PI {
+                                value -= std::f64::consts::TAU;
+                            }
+                            while value <= -std::f64::consts::PI {
+                                value += std::f64::consts::TAU;
+                            }
+                            value
+                        },
+                        grad,
+                        weight: DIM_WEIGHT,
+                    });
+                }
+                Eq::ArcRadius { s, e, c, target } => {
+                    let (ps, pe, pc) = (self.pos(s, x), self.pos(e, x), self.pos(c, x));
+                    // Chord geometry: half-length m, bend height h (signed
+                    // perpendicular of the bend off the chord). Circumradius
+                    // R = (m^2 + h^2) / (2h).
+                    let wx = pe.x - ps.x;
+                    let wy = pe.y - ps.y;
+                    let l = (wx * wx + wy * wy).sqrt().max(1e-9);
+                    let ux = wx / l;
+                    let uy = wy / l;
+                    let m = l / 2.;
+                    // SIGNED bend height off the chord (either side is a
+                    // valid arc); R uses |h| — clamping the sign away made
+                    // half of all arcs unsatisfiable.
+                    let h = (pc.x - ps.x) * (-uy) + (pc.y - ps.y) * ux;
+                    let h_abs = h.abs().max(1e-6);
+                    let value = (m * m + h_abs * h_abs) / (2. * h_abs) - target;
+                    // dR/dh carries the sign of h (R is symmetric in +/-h),
+                    // dR/dm = m / |h|.
+                    let dr_dh = h.signum() * (h_abs * h_abs - m * m) / (2. * h_abs * h_abs);
+                    let dr_dm = m / h;
+                    let mut grad = Vec::new();
+                    if let Some(v) = self.free_of[c] {
+                        // dh/dc = perp(u)
+                        grad.push((v * 2, -uy * dr_dh));
+                        grad.push((v * 2 + 1, ux * dr_dh));
+                    }
+                    if let Some(v) = self.free_of[s] {
+                        // dh/ds = -perp(u); dm/ds = -u/2
+                        grad.push((v * 2, uy * dr_dh - ux / 2. * dr_dm));
+                        grad.push((v * 2 + 1, -ux * dr_dh - uy / 2. * dr_dm));
+                    }
+                    if let Some(v) = self.free_of[e] {
+                        // dh/de = 0 (first order); dm/de = +u/2
+                        grad.push((v * 2, ux / 2. * dr_dm));
+                        grad.push((v * 2 + 1, uy / 2. * dr_dm));
+                    }
+                    out.push(Residual { value, grad, weight: DIM_WEIGHT });
+                }
             }
         }
         // Drag targets dominate; auxiliary followers anchor strongly to
@@ -280,12 +533,12 @@ impl Solver {
                 out.push(Residual {
                     value: x[v].x - anchor.x,
                     grad: vec![(v * 2, 1.0)],
-                    weight: ANCHOR_WEIGHT,
+                    weight: self.anchor_weight,
                 });
                 out.push(Residual {
                     value: x[v].y - anchor.y,
                     grad: vec![(v * 2 + 1, 1.0)],
-                    weight: ANCHOR_WEIGHT,
+                    weight: self.anchor_weight,
                 });
             }
         }
@@ -297,10 +550,17 @@ impl Solver {
     }
 
     /// Runs LM from current geometry. Returns new positions for all slots
-    /// plus a status.
+    /// plus a status and the largest unsatisfied equation residuals
+    /// (linear in doc units, angular in radians) — large values mean the
+    /// system is over-constrained / infeasible.
     pub fn solve(&self) -> Solution {
         if !self.has_work() {
-            return Solution { status: SolveStatus::Converged, positions: Vec::new() };
+            return Solution {
+                status: SolveStatus::Converged,
+                positions: Vec::new(),
+                max_lin_residual: 0.,
+                max_angle_residual: 0.,
+            };
         }
 
         let n = self.n_free * 2;
@@ -386,8 +646,90 @@ impl Solver {
                 }
             })
             .collect();
-        Solution { status, positions }
+        let (max_lin_residual, max_angle_residual) = self.eq_residual_max(&x);
+        Solution {
+            status,
+            positions,
+            max_lin_residual,
+            max_angle_residual,
+        }
     }
+
+    /// Largest unsatisfied equation residual at the iterate `x`, split into
+    /// linear (doc units) and angular (radians) families.
+    fn eq_residual_max(&self, x: &[Point2]) -> (f64, f64) {
+        let mut lin = 0.0f64;
+        let mut ang = 0.0f64;
+        for eq in &self.eqs {
+            let v = match *eq {
+                Eq::Horizontal { a, b } => (self.pos(a, x).y - self.pos(b, x).y).abs(),
+                Eq::Vertical { a, b } => (self.pos(a, x).x - self.pos(b, x).x).abs(),
+                Eq::Distance { a, b, target } => {
+                    let (pa, pb) = (self.pos(a, x), self.pos(b, x));
+                    let dx = pb.x - pa.x;
+                    let dy = pb.y - pa.y;
+                    ((dx * dx + dy * dy).sqrt() - target).abs()
+                }
+                Eq::PointLineDist { p, l1, l2, target } => {
+                    let (pp, pl1, pl2) = (self.pos(p, x), self.pos(l1, x), self.pos(l2, x));
+                    let dx = pl2.x - pl1.x;
+                    let dy = pl2.y - pl1.y;
+                    let l = (dx * dx + dy * dy).sqrt().max(1e-9);
+                    (((pp.x - pl1.x) * (-dy / l) + (pp.y - pl1.y) * (dx / l)) - target).abs()
+                }
+                Eq::LineDist { a1, a2, b1, target } => {
+                    let (pa1, pa2, pb1) =
+                        (self.pos(a1, x), self.pos(a2, x), self.pos(b1, x));
+                    let dx = pa2.x - pa1.x;
+                    let dy = pa2.y - pa1.y;
+                    let l = (dx * dx + dy * dy).sqrt().max(1e-9);
+                    (((pb1.x - pa1.x) * (-dy / l) + (pb1.y - pa1.y) * (dx / l)) - target).abs()
+                }
+                Eq::Angle { a1, a2, b1, b2, target } => {
+                    let mut v = signed_angle(
+                        self.pos(a1, x),
+                        self.pos(a2, x),
+                        self.pos(b1, x),
+                        self.pos(b2, x),
+                    ) - target;
+                    // Wrap into (-PI, PI]: correct for reflex sweeps too.
+                    while v > std::f64::consts::PI {
+                        v -= std::f64::consts::TAU;
+                    }
+                    while v <= -std::f64::consts::PI {
+                        v += std::f64::consts::TAU;
+                    }
+                    ang = ang.max(v.abs());
+                    continue;
+                }
+                Eq::ArcRadius { s, e, c, target } => {
+                    let (ps, pe, pc) = (self.pos(s, x), self.pos(e, x), self.pos(c, x));
+                    let wx = pe.x - ps.x;
+                    let wy = pe.y - ps.y;
+                    let l = (wx * wx + wy * wy).sqrt().max(1e-9);
+                    let ux = wx / l;
+                    let uy = wy / l;
+                    let m = l / 2.;
+                    let h = (pc.x - ps.x) * (-uy) + (pc.y - ps.y) * ux;
+                    let h_abs = h.abs().max(1e-6);
+                    let v = ((m * m + h_abs * h_abs) / (2. * h_abs) - target).abs();
+                    lin = lin.max(v);
+                    continue;
+                }
+            };
+            lin = lin.max(v);
+        }
+        (lin, ang)
+    }
+}
+
+/// Signed angle (radians) between the directions a1->a2 and b1->b2.
+fn signed_angle(a1: Point2, a2: Point2, b1: Point2, b2: Point2) -> f64 {
+    let ax = a2.x - a1.x;
+    let ay = a2.y - a1.y;
+    let bx = b2.x - b1.x;
+    let by = b2.y - b1.y;
+    (ax * by - ay * bx).atan2(ax * bx + ay * by)
 }
 
 /// Gaussian elimination with partial pivoting; None when singular.

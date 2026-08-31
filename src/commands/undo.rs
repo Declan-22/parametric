@@ -20,6 +20,8 @@ impl Editor {
             if snap != self.doc {
                 self.undo_stack.push(snap);
                 self.redo_stack.clear();
+                // Generation bump signals autosave (Shell watches it).
+                self.doc_gen += 1;
             }
         }
     }

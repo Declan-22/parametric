@@ -26,6 +26,7 @@ actions!(
         // Tools
         ToolMove,
         ToolPan,
+        ToolDimension,
         ToolRuler,
         ToolLine,
         ToolRectangle,

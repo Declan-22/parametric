@@ -68,6 +68,7 @@ pub fn build_draw_list(
     selection: &[ElementRef],
     hover: Option<ElementRef>,
     dim_renders: &[DimRender],
+    angle_dim_renders: &[crate::editor::dims::AngleDimRender],
     snap_guides: &[SnapGuide],
     marquee: Option<(Point2, Point2)>,
     pending_ruler: Option<(Point2, Point2)>,
@@ -225,14 +226,43 @@ pub fn build_draw_list(
 
     // 2) Dimension lines: extension stubs + parallel dashed dim line,
     // any angle. Drawn UNDER points/selection so corner dots always sit
-    // on top.
+    // on top. Tool-created dimension constraints render in the muted
+    // constraint ink; transient measurement previews stay accent.
     for d in dim_renders {
-        dashed_line(&mut list, d.ax, d.ay, d.lax, d.lay, 1., accent);
-        dashed_line(&mut list, d.bx, d.by, d.lbx, d.lby, 1., accent);
-        dashed_line(&mut list, d.lax, d.lay, d.lbx, d.lby, 1., accent);
+        // Hover lifts the whole dimension (lines included) to
+        // text_secondary; constraint dims idle in the muted ink.
+        let ink = if d.constraint {
+            if d.hovered {
+                rgb(t.text_secondary).into()
+            } else {
+                rgb(t.empty_text_secondary).into()
+            }
+        } else {
+            accent
+        };
+        dashed_line(&mut list, d.ax, d.ay, d.lax, d.lay, 1., ink);
+        dashed_line(&mut list, d.bx, d.by, d.lbx, d.lby, 1., ink);
+        dashed_line(&mut list, d.lax, d.lay, d.lbx, d.lby, 1., ink);
         for e in &d.extra_ext {
-            dashed_line(&mut list, e[0], e[1], e[2], e[3], 1., accent);
+            dashed_line(&mut list, e[0], e[1], e[2], e[3], 1., ink);
         }
+    }
+
+    // 2a) Angle dimensions: a dashed arc between the two lines, with the
+    // value container riding on it (label painted by the DOM layer).
+    for a in angle_dim_renders {
+        let ink = if a.constraint {
+            rgb(t.empty_text_secondary).into()
+        } else {
+            accent
+        };
+        const N: usize = 48;
+        let mut pts = Vec::with_capacity(N + 1);
+        for k in 0..=N {
+            let th = a.a0 + a.sweep * (k as f32 / N as f32);
+            pts.push((a.cx + a.r * th.cos(), a.cy + a.r * th.sin()));
+        }
+        dashed_polyline(&mut list, &pts, ink);
     }
 
     // 2b) Constraint guide lines (distant H/V pairs), under everything.

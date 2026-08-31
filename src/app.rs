@@ -69,6 +69,7 @@ fn bind_keys(cx: &mut App) {
         // Tool selection (canvas focused; also works globally when not renaming)
         KeyBinding::new("v", ToolMove, None),
         KeyBinding::new("space", ToolPan, None),
+        KeyBinding::new("d", ToolDimension, None),
         KeyBinding::new("m", ToolRuler, None),
         KeyBinding::new("l", ToolLine, None),
         KeyBinding::new("r", ToolRectangle, None),

@@ -155,6 +155,7 @@ impl RenderOnce for DesignCard {
                         &[],  // selection
                         None, // hover
                         &[],  // dims
+                        &[],  // angle dims
                         &[],  // snap guides
                         None, // marquee
                         None, // pending ruler

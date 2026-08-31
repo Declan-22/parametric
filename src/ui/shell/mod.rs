@@ -72,6 +72,12 @@ pub struct Shell {
     pub(crate) delete_modal_animation: f32,
     pub(crate) cursor_trail: Vec<(Point<gpui::Pixels>, Instant)>,
     pub(crate) hovered_entry: Option<usize>,
+    // Autosave: watches the open editor's doc_gen and writes the file
+    // (debounced) whenever the document has uncommitted changes.
+    pub(crate) saved_gens: HashMap<i64, u64>,
+    pub(crate) save_in_flight: bool,
+    // Dimension value-input caret blink loop guard.
+    pub(crate) dim_blink_active: bool,
 }
 
 fn now_secs() -> i64 {
@@ -107,7 +113,93 @@ impl Shell {
             delete_modal_animation: 0.0,
             cursor_trail: Vec::new(),
             hovered_entry: None,
+            saved_gens: HashMap::new(),
+            save_in_flight: false,
+            dim_blink_active: false,
         }
+    }
+
+    /// Debounced autosave: whenever the open document's generation is ahead
+    /// of what's on disk, write it (with a short cooldown so gesture bursts
+    /// coalesce). Runs from render; the actual write happens on a spawned
+    /// task so frames never block on disk.
+    fn autosave(&mut self, cx: &mut Context<Self>) {
+        let Some(ed) = self.editor.as_ref() else {
+            return;
+        };
+        let View::Design(id) = self.view else {
+            return;
+        };
+        let generation = ed.read(cx).doc_gen;
+        if self.saved_gens.get(&id) == Some(&generation) || self.save_in_flight {
+            return;
+        }
+        self.save_in_flight = true;
+        cx.spawn(async move |this, cx| {
+            // Coalesce bursts: a drag emits dozens of commits.
+            cx.background_executor().timer(Duration::from_millis(300)).await;
+            let _ = this.update(cx, |shell, cx| {
+                shell.save_in_flight = false;
+                if let (Some(ed), View::Design(id)) = (&shell.editor, shell.view) {
+                    let generation = ed.read(cx).doc_gen;
+                    if shell.saved_gens.get(&id) != Some(&generation)
+                        && let Some(reg) = cx.try_global::<Registry>()
+                        && let Ok(metas) = reg.list_designs()
+                        && let Some(meta) = metas.iter().find(|m| m.id == id)
+                    {
+                        if let Ok(db) =
+                            Database::open(meta.path.to_string_lossy().as_ref())
+                        {
+                            let doc = ed.read(cx).doc.clone();
+                            if db.save_document(&doc).is_ok() {
+                                shell.saved_gens.insert(id, generation);
+                                // Thumbnail cache is now stale.
+                                shell.invalidate_thumb(id);
+                            }
+                        }
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Starts the caret blink loop for the dimension value input (the loop
+    /// self-terminates when the input goes away; render re-arms it).
+    fn start_dim_blink(&mut self, cx: &mut Context<Self>) {
+        if self.dim_blink_active {
+            return;
+        }
+        self.dim_blink_active = true;
+        let this = cx.entity().downgrade();
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(530))
+                .await;
+            let mut active = false;
+            let _ = this.update(cx, |shell, cx| {
+                let input_active = shell
+                    .editor
+                    .as_ref()
+                    .map(|ed| ed.read(cx).dim_input.is_some())
+                    .unwrap_or(false);
+                if input_active {
+                    active = true;
+                    if let Some(ed) = shell.editor.as_ref() {
+                        ed.update(cx, |ed, _| {
+                            ed.dim_caret_visible = !ed.dim_caret_visible;
+                        });
+                    }
+                    cx.notify();
+                } else {
+                    shell.dim_blink_active = false;
+                }
+            });
+            if !active {
+                break;
+            }
+        })
+        .detach();
     }
 
     // -- navigation --
@@ -542,6 +634,15 @@ impl Shell {
             return;
         };
         let removed = ed.update(cx, |ed, _| {
+            // A selected DIMENSION dies to Delete before anything else.
+            if let Some(idx) = ed.selected_dim.take() {
+                ed.history_begin();
+                ed.doc.dimensions.remove(idx);
+                ed.dim_hitboxes.clear();
+                ed.hovered_dim = None;
+                ed.flush_pending_history();
+                return true;
+            }
             // Selected constraint chips take priority: deleting them never
             // touches geometry, even if elements are also selected — chips
             // are tiny and sit on top of geometry, so co-selection is
@@ -669,6 +770,15 @@ fn fit_camera(doc: &Document, viewport: (f32, f32)) -> Camera {
 
 impl Render for Shell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.autosave(cx);
+        // Dimension value-input caret blink.
+        let dim_input_active = self
+            .editor
+            .as_ref()
+            .is_some_and(|ed| ed.read(cx).dim_input.is_some());
+        if dim_input_active {
+            self.start_dim_blink(cx);
+        }
         let t = theme::active(cx);
         let shell_keys = cx.entity().downgrade();
 
@@ -685,6 +795,47 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|shell, _: &crate::ui::actions::DeleteSelection, _, cx| {
                 shell.delete_selection(cx);
+            }))
+            .on_action(cx.listener(|shell, _: &crate::ui::actions::BondDismiss, _, cx| {
+                // Global escape, highest priority first: over-constrained
+                // modal > dimension editing/picking > any toggled tool
+                // (back to Move) > context menu.
+                if let Some(ed) = shell.editor.as_ref() {
+                    let handled = ed.update(cx, |ed, cx| {
+                        if ed.overconstrained {
+                            ed.overconstrained = false;
+                            return true;
+                        }
+                        if ed.dim_input.take().is_some() {
+                            ed.dim_picks.clear();
+                            ed.dim_target = None;
+                            ed.set_tool(crate::editor::Tool::Move);
+                            return true;
+                        }
+                        if ed.tool == crate::editor::Tool::Dimension
+                            && (!ed.dim_picks.is_empty() || ed.dim_target.is_some())
+                        {
+                            ed.dim_picks.clear();
+                            ed.dim_target = None;
+                            ed.set_tool(crate::editor::Tool::Move);
+                            return true;
+                        }
+                        if ed.tool != crate::editor::Tool::Move {
+                            ed.set_tool(crate::editor::Tool::Move);
+                            return true;
+                        }
+                        false
+                    });
+                    if handled {
+                        cx.notify();
+                        return;
+                    }
+                }
+                // Nothing else to unwind: dismiss the editor's bond menu.
+                if let Some(ed) = shell.editor.as_ref() {
+                    let _ = ed.update(cx, |ed, _| ed.dismiss_context_menu());
+                }
+                shell.close_menu(cx);
             }))
             .on_action(cx.listener(|shell, _: &crate::ui::actions::Undo, _, cx| {
                 if let Some(ed) = shell.editor.as_ref() {
@@ -727,31 +878,53 @@ impl Render for Shell {
                 },
             ))
             .on_action(cx.listener(|shell, _: &crate::ui::actions::BondCoincident, _, cx| {
+                // While a dimension value input is active, digit keystrokes
+                // feed the input (the binding would otherwise eat them).
                 if let Some(ed) = shell.editor.as_ref() {
+                    let feeding = ed.read(cx).dim_input.is_some();
+                    if feeding {
+                        let _ = ed.update(cx, |ed, cx| {
+                            if ed.dim_input_key("1") {
+                                cx.notify();
+                            }
+                        });
+                        return;
+                    }
                     let _ = ed.update(cx, |ed, _| ed.trigger_context_shortcut(0));
                     cx.notify();
                 }
             }))
-            .on_action(cx.listener(
-                |shell, _: &crate::ui::actions::BondCombinePoints, _, cx| {
-                    let Some(ed) = shell.editor.as_ref() else {
+            .on_action(cx.listener(|shell, _: &crate::ui::actions::BondCombinePoints, _, cx| {
+                    if shell.renaming.is_some()
+                        || shell
+                            .editor
+                            .as_ref()
+                            .is_some_and(|ed| ed.read(cx).dim_input.is_some())
+                    {
                         return;
-                    };
-                    let changed = ed.update(cx, |ed, _| ed.trigger_context_shortcut(1));
-                    if changed {
-                        shell.invalidate_thumbs_all();
                     }
-                    cx.notify();
-                },
-            ))
-            .on_action(cx.listener(|shell, _: &crate::ui::actions::BondDismiss, _, cx| {
-                if let Some(ed) = shell.editor.as_ref() {
-                    let _ = ed.update(cx, |ed, _| ed.dismiss_context_menu());
-                    cx.notify();
-                }
-            }))
-            .on_action(cx.listener(|shell, _: &crate::ui::actions::ToolMove, _, cx| {
-                if shell.renaming.is_some() {
+                    if let Some(ed) = shell.editor.as_ref() {
+                        if ed.read(cx).dim_input.is_some() {
+                            let _ = ed.update(cx, |ed, cx| {
+                                if ed.dim_input_key("2") {
+                                    cx.notify();
+                                }
+                            });
+                            return;
+                        }
+                        let changed = ed.update(cx, |ed, _| ed.trigger_context_shortcut(1));
+                        if changed {
+                            shell.invalidate_thumbs_all();
+                        }
+                        cx.notify();
+                    }
+                })).on_action(cx.listener(|shell, _: &crate::ui::actions::ToolMove, _, cx| {
+                if shell.renaming.is_some()
+                    || shell
+                        .editor
+                        .as_ref()
+                        .is_some_and(|ed| ed.read(cx).dim_input.is_some())
+                {
                     return;
                 }
                 if let Some(ed) = shell.editor.as_ref() {
@@ -763,7 +936,12 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|shell, _: &crate::ui::actions::ToolPan, _, cx| {
-                if shell.renaming.is_some() {
+                if shell.renaming.is_some()
+                    || shell
+                        .editor
+                        .as_ref()
+                        .is_some_and(|ed| ed.read(cx).dim_input.is_some())
+                {
                     return;
                 }
                 if let Some(ed) = shell.editor.as_ref() {
@@ -774,8 +952,30 @@ impl Render for Shell {
                     });
                 }
             }))
+            .on_action(cx.listener(|shell, _: &crate::ui::actions::ToolDimension, _, cx| {
+                if shell.renaming.is_some()
+                    || shell
+                        .editor
+                        .as_ref()
+                        .is_some_and(|ed| ed.read(cx).dim_input.is_some())
+                {
+                    return;
+                }
+                if let Some(ed) = shell.editor.as_ref() {
+                    ed.update(cx, |ed, cx| {
+                        if ed.set_tool(crate::editor::Tool::Dimension) {
+                            cx.notify();
+                        }
+                    });
+                }
+            }))
             .on_action(cx.listener(|shell, _: &crate::ui::actions::ToolRuler, _, cx| {
-                if shell.renaming.is_some() {
+                if shell.renaming.is_some()
+                    || shell
+                        .editor
+                        .as_ref()
+                        .is_some_and(|ed| ed.read(cx).dim_input.is_some())
+                {
                     return;
                 }
                 if let Some(ed) = shell.editor.as_ref() {
@@ -787,7 +987,12 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|shell, _: &crate::ui::actions::ToolLine, _, cx| {
-                if shell.renaming.is_some() {
+                if shell.renaming.is_some()
+                    || shell
+                        .editor
+                        .as_ref()
+                        .is_some_and(|ed| ed.read(cx).dim_input.is_some())
+                {
                     return;
                 }
                 if let Some(ed) = shell.editor.as_ref() {
@@ -799,7 +1004,12 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|shell, _: &crate::ui::actions::ToolRectangle, _, cx| {
-                if shell.renaming.is_some() {
+                if shell.renaming.is_some()
+                    || shell
+                        .editor
+                        .as_ref()
+                        .is_some_and(|ed| ed.read(cx).dim_input.is_some())
+                {
                     return;
                 }
                 if let Some(ed) = shell.editor.as_ref() {
@@ -811,7 +1021,12 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|shell, _: &crate::ui::actions::ToolCircle, _, cx| {
-                if shell.renaming.is_some() {
+                if shell.renaming.is_some()
+                    || shell
+                        .editor
+                        .as_ref()
+                        .is_some_and(|ed| ed.read(cx).dim_input.is_some())
+                {
                     return;
                 }
                 if let Some(ed) = shell.editor.as_ref() {
@@ -823,6 +1038,61 @@ impl Render for Shell {
                 }
             }))
             .on_key_down(move |e: &gpui::KeyDownEvent, _, cx| {
+                let key = e.keystroke.key.clone();
+                // Dimension value input: while a placed dim waits for its
+                // value, keystrokes drive it (Enter commits, Esc cancels,
+                // digits edit) — exactly like the rename flow.
+                let dim_active = shell_keys
+                    .upgrade()
+                    .and_then(|s| s.read(cx).editor.as_ref().map(|ed| ed.read(cx)))
+                    .is_some_and(|ed| ed.dim_input.is_some());
+                if dim_active {
+                    let handled = match key.as_str() {
+                        "enter" | "escape" | "backspace" => true,
+                        k => k.len() == 1 && (k == "-" || !e.keystroke.modifiers.modified()),
+                    };
+                    if handled {
+                        cx.stop_propagation();
+                    }
+                    let _ = shell_keys.update(cx, |shell, cx| {
+                        if let Some(ed) = shell.editor.as_ref() {
+                            if ed.update(cx, |ed, _| ed.dim_input_key(&key)) {
+                                cx.notify();
+                            }
+                        }
+                    });
+                    if handled {
+                        return;
+                    }
+                }
+                // Dimension tool idle: Esc walks the cancel stack — value
+                // input, picks, then the tool itself (back to Move).
+                if key == "escape" {
+                    let mut consumed = false;
+                    let _ = shell_keys.update(cx, |shell, cx| {
+                        if let Some(ed) = shell.editor.as_ref() {
+                            if ed.read(cx).overconstrained {
+                                ed.update(cx, |ed, _| ed.overconstrained = false);
+                                consumed = true;
+                                return;
+                            }
+                            let is_dim = ed.read(cx).tool == crate::editor::Tool::Dimension;
+                            if is_dim && ed.update(cx, |ed, _| ed.dim_escape()) {
+                                consumed = true;
+                            } else if is_dim
+                                && ed.update(cx, |ed, _| ed.set_tool(crate::editor::Tool::Move))
+                            {
+                                consumed = true;
+                            }
+                        }
+                        if consumed {
+                            cx.notify();
+                        }
+                    });
+                    if consumed {
+                        return;
+                    }
+                }
                 // Only capture keys while the inline rename input is active.
                 if shell_keys.upgrade().and_then(|s| Some(s.read(cx).renaming.is_some())) != Some(true) {
                     return;
@@ -1087,6 +1357,81 @@ impl Render for Shell {
                                                 })
                                                 .child("Delete")
                                         }),
+                                ),
+                        ),
+                )
+            })
+            .when(self.editor.as_ref().is_some_and(|ed| ed.read(cx).overconstrained), |root| {
+                let shell_ok = cx.entity().downgrade();
+                let shell_ok_bg = shell_ok.clone();
+                root.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .bg(rgba(0x00000073))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                            let _ = shell_ok_bg.update(cx, |shell, cx| {
+                                if let Some(ed) = shell.editor.as_ref() {
+                                    ed.update(cx, |ed, _| ed.overconstrained = false);
+                                }
+                                cx.notify();
+                            });
+                        })
+                        .child(
+                            div()
+                                .w(px(340.))
+                                .flex()
+                                .flex_col()
+                                .gap(px(10.))
+                                .p(px(20.))
+                                .bg(rgb(t.bg_darker))
+                                .border_1()
+                                .border_color(rgb(t.component_border_color))
+                                .rounded(px(12.))
+                                .shadow(vec![t.shadow_md()])
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(rgb(t.text_primary))
+                                        .child("Over-constrained"),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(t.text_secondary))
+                                        .child("This dimension conflicts with existing constraints — the geometry cannot satisfy it, so it was not applied."),
+                                )
+                                .child(
+                                    div()
+                                        .id("overconstrained-ok")
+                                        .flex()
+                                        .justify_end()
+                                        .child(
+                                            div()
+                                                .px(px(12.))
+                                                .py(px(6.))
+                                                .rounded(px(6.))
+                                                .bg(rgb(t.bg_tertiary))
+                                                .border_1()
+                                                .border_color(rgb(t.component_border_color))
+                                                .text_sm()
+                                                .text_color(rgb(t.text_primary))
+                                                .cursor_pointer()
+                                                .child("OK")
+                                                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                                    let _ = shell_ok.update(cx, |shell, cx| {
+                                                        if let Some(ed) = shell.editor.as_ref() {
+                                                            ed.update(cx, |ed, _| ed.overconstrained = false);
+                                                        }
+                                                        cx.notify();
+                                                    });
+                                                }),
+                                        ),
                                 ),
                         ),
                 )

@@ -56,10 +56,37 @@ pub struct DimRender {
     // Additional extension lines (screen x1,y1,x2,y2) reaching from other
     // objects' extremes to this dim line.
     pub extra_ext: Vec<[f32; 4]>,
+    // Constraint ink (empty_text_secondary) for TOOL-created dimensions;
+    // transient measurement previews stay accent.
+    pub constraint: bool,
+    // Some for tool-created dims (index into doc.dimensions) — drives
+    // hover recolor, editing, and hit-testing. None for transient previews.
+    pub dim_index: Option<usize>,
+    pub hovered: bool,
+    pub editing: bool,
+}
+
+/// Screen-space render data for one ANGLE dimension: a dashed arc between
+/// the two lines with the value container riding on it.
+#[derive(Clone, Debug)]
+pub struct AngleDimRender {
+    pub cx: f32,
+    pub cy: f32,
+    pub r: f32,
+    pub a0: f32,
+    pub sweep: f32,
+    pub label_cx: f32,
+    pub label_cy: f32,
+    pub text: String,
+    pub constraint: bool,
+    pub dim_index: Option<usize>,
+    pub hovered: bool,
+    pub editing: bool,
 }
 
 pub fn update(ed: &mut Editor) {
     ed.dim_renders.clear();
+    ed.angle_dim_renders.clear();
 
     // Ruler interactions suppress dims entirely (labels are part of the
     // ruler's own vector rendering in paint).
@@ -193,17 +220,375 @@ pub fn update(ed: &mut Editor) {
         }
     }
 
-    // Stored dimensions: rendered at their own angle and offset.
+    // Stored dimensions: rendered at their own angle and placement.
     let dims = ed.doc.dimensions.clone();
-    for d in &dims {
-        let (Some(a), Some(b)) = (ed.doc.point(d.a), ed.doc.point(d.b)) else {
-            continue;
+    for (i, d) in dims.iter().enumerate() {
+        let editing = ed
+            .dim_input.as_ref()
+            .is_some_and(|input| input.existing == Some(i));
+        let text = if editing {
+            // Editing shows the current value highlighted; typing replaces it.
+            let buffer = ed.dim_input.as_ref().map(|input| input.buffer.clone()).unwrap_or_default();
+            Some(if buffer.is_empty() {
+                crate::ui::canvas::fmt_dim(d.value)
+            } else {
+                buffer
+            })
+        } else {
+            None
         };
-        let len = d.value.unwrap_or_else(|| dist(a, b));
-        ed.dim_renders.push(linear_dim(&ed.doc, &ed.camera, a, b, d.offset, len));
+        let hovered = ed.hovered_dim == Some(i)
+            || ed.selected_dim == Some(i)
+            || ed.dim_drag.as_ref().map(|d| d.index) == Some(i);
+        push_dim_target(ed, &d.target, d.offset, d.slide, d.value, text, Some(i), hovered, editing);
+    }
+
+    // Dimension tool: the frozen value-input state, then the live preview
+    // following the cursor while a pick pair is assembled.
+    if ed.tool == crate::editor::Tool::Dimension {
+        if let Some(input) = ed.dim_input.clone() {
+            let text = if input.buffer.is_empty() {
+                None
+            } else {
+                Some(input.buffer.clone())
+            };
+            let idx = input.existing;
+            push_dim_target(ed, &input.target, input.offset, input.slide, input.measured, text, idx, true, true);
+        } else if let Some(target) = ed.dim_target
+            && let Some(cur) = ed.last_cursor
+        {
+            let doc_p = ed
+                .camera
+                .screen_to_unit(Point2::new(f64::from(cur.x), f64::from(cur.y)));
+            if let Some((offset, slide, measured)) = ed.dim_placement(target, doc_p) {
+                push_dim_target(ed, &target, offset, slide, measured, None, None, false, false);
+            }
+        }
     }
 
     update_constraint_markers(ed);
+}
+
+/// Renders one dimension target (stored, preview, or value-input) at the
+/// given placement. All tool-created dims use the constraint ink
+/// (empty_text_secondary); `text` overrides the formatted value (typed
+/// input). Distances get the standard px/in container; angles get the
+/// dashed arc with a degree readout.
+fn push_dim_target(
+    ed: &mut Editor,
+    target: &crate::core::constraints::DimTarget,
+    offset: f64,
+    slide: f64,
+    value: f64,
+    text: Option<String>,
+    dim_index: Option<usize>,
+    hovered: bool,
+    editing: bool,
+) {
+    use crate::core::constraints::DimTarget;
+    let zoom = ed.camera.zoom;
+    match target {
+        DimTarget::Points { a, b } => {
+            let (Some(pa), Some(pb)) = (ed.doc.point(*a), ed.doc.point(*b)) else {
+                return;
+            };
+            let mut r = linear_dim(&ed.doc, &ed.camera, pa, pb, offset * zoom, value);
+            // Container rides the dim line FROM ITS START (the first
+            // endpoint's foot) — anchoring it to the line's midpoint made
+            // it unreachable past halfway.
+            let (sa, sb) = (ed.camera.unit_to_screen(pa), ed.camera.unit_to_screen(pb));
+            let dx = sb.x - sa.x;
+            let dy = sb.y - sa.y;
+            let l = (dx * dx + dy * dy).sqrt().max(1e-9);
+            let s = slide.clamp(0., pick::distance(pa, pb));
+            r.label_cx = r.lax + (dx / l * s * zoom) as f32;
+            r.label_cy = r.lay + (dy / l * s * zoom) as f32;
+            r.constraint = true;
+            r.dim_index = dim_index;
+            r.hovered = hovered;
+            r.editing = editing;
+            r.text = text.unwrap_or_else(|| crate::ui::canvas::fmt_dim(value));
+            ed.dim_renders.push(r);
+        }
+        DimTarget::PointLine { p, line } => {
+            let (Some(sp), Some((la, lb))) =
+                (ed.doc.point(*p), ed.doc.segment_geom(*line))
+            else {
+                return;
+            };
+            let (u, n) = dim_axes(lb.x - la.x, lb.y - la.y);
+            let prel = (sp.x - la.x, sp.y - la.y);
+            let measured = prel.0 * n.0 + prel.1 * n.1;
+            // Measured span: the point to its perpendicular foot on the
+            // line. Dim line: parallel to the line, from the placed slide
+            // position to the point's parallel — extension stubs close the
+            // path.
+            let foot = Point2::new(la.x + u.0 * prel.0, la.y + u.1 * prel.1);
+            let f = Point2::new(la.x + u.0 * slide, la.y + u.1 * slide);
+            let p2 = Point2::new(f.x + n.0 * measured, f.y + n.1 * measured);
+            // Container rides the perpendicular dim line at the cursor's
+            // placed height, clamped onto the segment (never past its ends).
+            let ride = offset.clamp(0.0, measured.abs());
+            let lp = Point2::new(f.x + n.0 * ride, f.y + n.1 * ride);
+            let (s, e, fp, f2) = (
+                ed.camera.unit_to_screen(sp),
+                ed.camera.unit_to_screen(foot),
+                ed.camera.unit_to_screen(f),
+                ed.camera.unit_to_screen(p2),
+            );
+            let lps = ed.camera.unit_to_screen(lp);
+            ed.dim_renders.push(DimRender {
+                ax: s.x as f32,
+                ay: s.y as f32,
+                bx: e.x as f32,
+                by: e.y as f32,
+                lax: f2.x as f32,
+                lay: f2.y as f32,
+                lbx: fp.x as f32,
+                lby: fp.y as f32,
+                label_cx: lps.x as f32,
+                label_cy: lps.y as f32,
+                text: text.unwrap_or_else(|| crate::ui::canvas::fmt_dim(value)),
+                extra_ext: Vec::new(),
+                constraint: true,
+                dim_index,
+                hovered,
+                editing,
+            });
+        }
+        DimTarget::Lines { a, b } => {
+            let (Some((a0, _)), Some((b0, b1))) =
+                (ed.doc.segment_geom(*a), ed.doc.segment_geom(*b))
+            else {
+                return;
+            };
+            let (u, n) = dim_axes(b1.x - b0.x, b1.y - b0.y);
+            let gap = (b0.x - a0.x) * n.0 + (b0.y - a0.y) * n.1;
+            // Measured span at the placed slide: perpendicular between the
+            // lines. Dim line: parallel to them at the placed offset,
+            // extended past both stubs for the arrowheads.
+            let p1 = Point2::new(a0.x + u.0 * slide, a0.y + u.1 * slide);
+            let p2 = Point2::new(p1.x + n.0 * gap, p1.y + n.1 * gap);
+            let ext = 14. / zoom;
+            let e1 = Point2::new(p1.x + n.0 * offset - u.0 * ext, p1.y + n.1 * offset - u.1 * ext);
+            let e2 = Point2::new(p2.x + n.0 * offset + u.0 * ext, p2.y + n.1 * offset + u.1 * ext);
+            let (s1, s2, fe1, fe2) = (
+                ed.camera.unit_to_screen(p1),
+                ed.camera.unit_to_screen(p2),
+                ed.camera.unit_to_screen(e1),
+                ed.camera.unit_to_screen(e2),
+            );
+            ed.dim_renders.push(DimRender {
+                ax: s1.x as f32,
+                ay: s1.y as f32,
+                bx: s2.x as f32,
+                by: s2.y as f32,
+                lax: fe1.x as f32,
+                lay: fe1.y as f32,
+                lbx: fe2.x as f32,
+                lby: fe2.y as f32,
+                label_cx: ((fe1.x + fe2.x) / 2.) as f32,
+                label_cy: ((fe1.y + fe2.y) / 2.) as f32,
+                text: text.unwrap_or_else(|| crate::ui::canvas::fmt_dim(value)),
+                extra_ext: Vec::new(),
+                constraint: true,
+                dim_index,
+                hovered,
+                editing,
+            });
+        }
+        DimTarget::Angle { a, b } => {
+            // `value` carries the SIGNED sweep (degrees) for angle dims.
+            let Some((v, da, sweep, frac, r_doc)) = dim_angle_geometry(
+                ed,
+                *a,
+                *b,
+                None,
+                value.to_radians(),
+                offset.abs(),
+                slide,
+            ) else {
+                return;
+            };
+            let a_ang = da.1.atan2(da.0);
+            let zoom = ed.camera.zoom;
+            let vc = ed.camera.unit_to_screen(v);
+            let r_px = (r_doc * zoom) as f32;
+            let th = a_ang + sweep * frac;
+            let lp = Point2::new(
+                vc.x + r_px as f64 * th.cos(),
+                vc.y + r_px as f64 * th.sin(),
+            );
+            ed.angle_dim_renders.push(AngleDimRender {
+                cx: vc.x as f32,
+                cy: vc.y as f32,
+                r: r_px,
+                a0: a_ang as f32,
+                sweep: sweep as f32,
+                label_cx: lp.x as f32,
+                label_cy: lp.y as f32,
+                text: text.unwrap_or_else(|| format!("{value:.1}\u{00B0}")),
+                constraint: true,
+                dim_index,
+                hovered,
+                editing,
+            });
+        }
+        DimTarget::Radius { seg } => {
+            let Some(seg_d) = ed.doc.segment(*seg) else {
+                return;
+            };
+            let (Some(a), Some(b)) =
+                (ed.doc.point(seg_d.start), ed.doc.point(seg_d.end))
+            else {
+                return;
+            };
+            let Some(c) = seg_d.ctrl.and_then(|id| ed.doc.point(id)) else {
+                return;
+            };
+            let Some((center, r)) = crate::editor::arc::circumcircle(a, b, c) else {
+                return;
+            };
+            if r < 1e-9 {
+                return;
+            }
+            // Dashed line from the center to the on-arc bend point; the
+            // value container rides it at the placed fraction.
+            let frac = slide.clamp(0.25, 1.0);
+            let sc = ed.camera.unit_to_screen(center);
+            let ec = ed.camera.unit_to_screen(c);
+            let lp = Point2::new(
+                sc.x + (ec.x - sc.x) * frac as f64,
+                sc.y + (ec.y - sc.y) * frac as f64,
+            );
+            ed.dim_renders.push(DimRender {
+                ax: sc.x as f32,
+                ay: sc.y as f32,
+                bx: ec.x as f32,
+                by: ec.y as f32,
+                lax: sc.x as f32,
+                lay: sc.y as f32,
+                lbx: ec.x as f32,
+                lby: ec.y as f32,
+                label_cx: lp.x as f32,
+                label_cy: lp.y as f32,
+                text: text.unwrap_or_else(|| crate::ui::canvas::fmt_dim(value)),
+                extra_ext: Vec::new(),
+                constraint: true,
+                dim_index,
+                hovered,
+                editing,
+            });
+        }
+    }
+}
+
+/// Unit direction + LEFT normal of a vector (doc space is y-down like the
+/// screen, so the same handedness applies).
+pub(crate) fn dim_axes(dx: f64, dy: f64) -> ((f64, f64), (f64, f64)) {
+    let l = (dx * dx + dy * dy).sqrt().max(1e-9);
+    let u = (dx / l, dy / l);
+    (u, (-u.1, u.0))
+}
+
+/// One ray of an angle dimension: a point on the line plus its unit
+/// direction.
+#[allow(dead_code)]
+fn dim_angle_ray(ed: &Editor, sid: crate::core::ids::SegmentId) -> Option<(Point2, (f64, f64))> {
+    let (a, b) = ed.doc.segment_geom(sid)?;
+    let (u, _) = dim_axes(b.x - a.x, b.y - a.y);
+    Some((a, u))
+}
+
+/// Full angle-dimension geometry in the RAW ray convention: rays point
+/// along each segment's start->end direction from the intersection vertex,
+/// the SAME convention the solver's angle equation uses - label, arc and
+/// constraint can never disagree. Returns the vertex, ray A's unit
+/// direction, the SIGNED sweep (radians) on the picked side, the
+/// container's fractional position along it, and the arc radius in doc
+/// units. During placement the live cursor picks the sweep's sector,
+/// magnitude and fraction; stored/input dims use the stored signed sweep.
+pub(crate) fn dim_angle_geometry(
+    ed: &Editor,
+    a: crate::core::ids::SegmentId,
+    b: crate::core::ids::SegmentId,
+    cursor: Option<Point2>,
+    sweep_stored_rad: f64,
+    radius_doc: f64,
+    slide: f64,
+) -> Option<(Point2, (f64, f64), f64, f64, f64)> {
+    const TAU: f64 = std::f64::consts::TAU;
+    let (a0p, a1p) = ed.doc.segment_geom(a)?;
+    let (b0p, b1p) = ed.doc.segment_geom(b)?;
+    let (u_a, _) = dim_axes(a1p.x - a0p.x, a1p.y - a0p.y);
+    let (u_b, _) = dim_axes(b1p.x - b0p.x, b1p.y - b0p.y);
+    let v = line_intersection(a0p, u_a, b0p, u_b)?;
+    // Raw signed angle between the two ray directions (-PI, PI].
+    let full = (u_a.0 * u_b.1 - u_a.1 * u_b.0).atan2(u_a.0 * u_b.0 + u_a.1 * u_b.1);
+    if full.abs() < 1e-6 {
+        return None;
+    }
+    let a_ang = u_a.1.atan2(u_a.0);
+    let norm = |mut t: f64| {
+        while t < 0. {
+            t += TAU;
+        }
+        while t >= TAU {
+            t -= TAU;
+        }
+        t
+    };
+    let (sweep, r_doc, frac) = if let Some(cur) = cursor {
+        let dx = cur.x - v.x;
+        let dy = cur.y - v.y;
+        let r = (dx * dx + dy * dy).sqrt();
+        if r < 1e-9 {
+            return None;
+        }
+        let rel = norm(dy.atan2(dx) - a_ang);
+        // The two candidate sweeps between the rays: +|full| (CCW from
+        // ray A) and -(|full| + (TAU - |full|) - |full|)... simply: the
+        // CW complement (TAU - |full|), signed opposite to full.
+        let (sweep, frac) = if full >= 0. {
+            if rel <= full {
+                (full, (rel / full).clamp(0., 1.))
+            } else {
+                (full - TAU, ((TAU - rel) / (TAU - full)).clamp(0., 1.))
+            }
+        } else {
+            let span = TAU + full; // |full|
+            if rel >= span {
+                (full, ((rel - span) / -full).clamp(0., 1.))
+            } else {
+                (full + TAU, (rel / span).clamp(0., 1.))
+            }
+        };
+        if sweep.abs() < 1e-6 {
+            return None;
+        }
+        (sweep, r, frac)
+    } else {
+        let r = radius_doc.abs();
+        if r < 1e-9 {
+            return None;
+        }
+        (sweep_stored_rad, r, slide.clamp(0., 1.))
+    };
+    Some((v, u_a, sweep, frac, r_doc))
+}
+/// Intersection of two infinite lines p1 + t*d1 and p2 + s*d2.
+pub(crate) fn line_intersection(
+    p1: Point2,
+    d1: (f64, f64),
+    p2: Point2,
+    d2: (f64, f64),
+) -> Option<Point2> {
+    let denom = d1.0 * d2.1 - d1.1 * d2.0;
+    if denom.abs() < 1e-9 {
+        return None;
+    }
+    let t = ((p2.x - p1.x) * d2.1 - (p2.y - p1.y) * d2.0) / denom;
+    Some(Point2::new(p1.x + d1.0 * t, p1.y + d1.1 * t))
 }
 
 // Constraint chips. Positioning is deterministic per structural case:
@@ -567,6 +952,10 @@ fn linear_dim(doc: &Document, cam: &super::Camera, a: Point2, b: Point2, offset_
         label_cy: ((lay + lby) / 2.) as f32,
         text: crate::ui::canvas::fmt_dim(value),
         extra_ext: Vec::new(),
+        constraint: false,
+        dim_index: None,
+        hovered: false,
+        editing: false,
     }
 }
 

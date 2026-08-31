@@ -101,14 +101,33 @@ impl Database {
             );
             CREATE TABLE IF NOT EXISTS dimensions (
                 id INTEGER PRIMARY KEY,
-                p1_idx INTEGER NOT NULL,
-                p1_gen INTEGER NOT NULL,
-                p2_idx INTEGER NOT NULL,
-                p2_gen INTEGER NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'points',
+                p1_idx INTEGER,
+                p1_gen INTEGER,
+                p2_idx INTEGER,
+                p2_gen INTEGER,
+                sa_idx INTEGER,
+                sa_gen INTEGER,
+                sb_idx INTEGER,
+                sb_gen INTEGER,
                 value REAL,
-                offset REAL NOT NULL
+                offset REAL NOT NULL,
+                slide REAL NOT NULL DEFAULT 0
             );",
         )?;
+        // Migrations for documents created before dimension kinds existed.
+        // Best-effort: "duplicate column" errors mean it's already there.
+        for sql in [
+            "ALTER TABLE dimensions ADD COLUMN kind TEXT NOT NULL DEFAULT 'points'",
+            "ALTER TABLE dimensions ADD COLUMN slide REAL NOT NULL DEFAULT 0",
+            "ALTER TABLE dimensions ADD COLUMN sweep REAL NOT NULL DEFAULT 0",
+            "ALTER TABLE dimensions ADD COLUMN sa_idx INTEGER",
+            "ALTER TABLE dimensions ADD COLUMN sa_gen INTEGER",
+            "ALTER TABLE dimensions ADD COLUMN sb_idx INTEGER",
+            "ALTER TABLE dimensions ADD COLUMN sb_gen INTEGER",
+        ] {
+            let _ = self.conn.execute(sql, []);
+        }
         self.conn.execute(
             "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -225,16 +244,42 @@ impl Database {
                 )?;
             }
             for d in &doc.dimensions {
+                use crate::core::constraints::DimTarget;
+                let (kind, p1, p2, sa, sb) = match &d.target {
+                    DimTarget::Points { a, b } => ("points", Some(*a), Some(*b), None, None),
+                    DimTarget::PointLine { p, line } => {
+                        ("point_line", Some(*p), None, Some(*line), None)
+                    }
+                    DimTarget::Lines { a, b } => ("lines", None, None, Some(*a), Some(*b)),
+                    DimTarget::Radius { seg } => ("radius", None, None, Some(*seg), None),
+                    DimTarget::Angle { a, b } => ("angle", None, None, Some(*a), Some(*b)),
+                };
+                let pid = |id: Option<crate::core::ids::PointId>| {
+                    id.map(|id| (id.idx as i64, id.generation as i64))
+                };
+                let sid = |id: Option<crate::core::ids::SegmentId>| {
+                    id.map(|id| (id.idx as i64, id.generation as i64))
+                };
+                let (p1, p2) = (pid(p1), pid(p2));
+                let (sa, sb) = (sid(sa), sid(sb));
                 self.conn.execute(
-                    "INSERT INTO dimensions(p1_idx, p1_gen, p2_idx, p2_gen, value, offset)
-                     VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                    "INSERT INTO dimensions(kind, p1_idx, p1_gen, p2_idx, p2_gen,
+                        sa_idx, sa_gen, sb_idx, sb_gen, value, offset, slide, sweep)
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                     rusqlite::params![
-                        d.a.idx as i64,
-                        d.a.generation as i64,
-                        d.b.idx as i64,
-                        d.b.generation as i64,
+                        kind,
+                        p1.map(|p| p.0),
+                        p1.map(|p| p.1),
+                        p2.map(|p| p.0),
+                        p2.map(|p| p.1),
+                        sa.map(|s| s.0),
+                        sa.map(|s| s.1),
+                        sb.map(|s| s.0),
+                        sb.map(|s| s.1),
                         d.value,
-                        d.offset
+                        d.offset,
+                        d.slide,
+                        d.sweep,
                     ],
                 )?;
             }
@@ -396,25 +441,69 @@ impl Database {
         drop(stmt);
 
         let mut stmt = self.conn.prepare(
-            "SELECT p1_idx, p1_gen, p2_idx, p2_gen, value, offset FROM dimensions",
+            "SELECT kind, p1_idx, p1_gen, p2_idx, p2_gen,
+                    sa_idx, sa_gen, sb_idx, sb_gen, value, offset, slide, sweep
+             FROM dimensions",
         )?;
         let mut rows = stmt.query([])?;
+        use crate::core::constraints::DimTarget;
         while let Some(row) = rows.next()? {
-            add_dimension_raw(
-                &mut doc,
-                Dimension {
-                    a: PointId {
-                        idx: row.get::<_, i64>(0)? as u32,
-                        generation: row.get::<_, i64>(1)? as u32,
-                    },
-                    b: PointId {
-                        idx: row.get::<_, i64>(2)? as u32,
-                        generation: row.get::<_, i64>(3)? as u32,
-                    },
-                    value: row.get(4)?,
-                    offset: row.get(5)?,
-                },
-            );
+            let kind: String = row.get(0)?;
+            let point = |col: usize| -> Option<PointId> {
+                let idx: Option<i64> = row.get(col).ok()?;
+                let generation: Option<i64> = row.get(col + 1).ok()?;
+                Some(PointId {
+                    idx: idx? as u32,
+                    generation: generation? as u32,
+                })
+            };
+            let segment = |col: usize| -> Option<SegmentId> {
+                let idx: Option<i64> = row.get(col).ok()?;
+                let generation: Option<i64> = row.get(col + 1).ok()?;
+                Some(SegmentId {
+                    idx: idx? as u32,
+                    generation: generation? as u32,
+                })
+            };
+            let target = match kind.as_str() {
+                "point_line" => {
+                    let (Some(p), Some(line)) = (point(1), segment(5)) else {
+                        continue;
+                    };
+                    DimTarget::PointLine { p, line }
+                }
+                "lines" => {
+                    let (Some(a), Some(b)) = (segment(5), segment(7)) else {
+                        continue;
+                    };
+                    DimTarget::Lines { a, b }
+                }
+                "angle" => {
+                    let (Some(a), Some(b)) = (segment(5), segment(7)) else {
+                        continue;
+                    };
+                    DimTarget::Angle { a, b }
+                }
+                "radius" => {
+                    let Some(a) = segment(5) else {
+                        continue;
+                    };
+                    DimTarget::Radius { seg: a }
+                }
+                _ => {
+                    let (Some(a), Some(b)) = (point(1), point(3)) else {
+                        continue;
+                    };
+                    DimTarget::Points { a, b }
+                }
+            };
+            doc.dimensions.push(Dimension {
+                target,
+                value: row.get::<_, Option<f64>>(9)?.unwrap_or(0.),
+                offset: row.get(10)?,
+                slide: row.get(11)?,
+                sweep: row.get::<_, Option<f64>>(12)?.unwrap_or(0.),
+            });
         }
         drop(rows);
         drop(stmt);
@@ -504,10 +593,14 @@ mod tests {
         let fill = ed.create_rectangle(1, Point2::new(10., 20.), Point2::new(110., 120.));
         ed.selection = vec![ElementRef::Fill(fill)];
         ed.doc.dimensions.push(Dimension {
-            a: PointId { idx: 0, generation: 0 },
-            b: PointId { idx: 1, generation: 0 },
-            value: Some(100.),
+            target: crate::core::constraints::DimTarget::Points {
+                a: PointId { idx: 0, generation: 0 },
+                b: PointId { idx: 1, generation: 0 },
+            },
+            value: 100.,
             offset: 18.,
+            slide: 0.,
+            sweep: 0.,
         });
 
         db.save_document(&ed.doc).unwrap();

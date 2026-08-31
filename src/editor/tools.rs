@@ -1,4 +1,5 @@
 use crate::core::geometry::{Point2, Rect};
+use crate::core::ids::{PointId, SegmentId};
 
 // Tool definitions and per-tool pending drag state. Each tool owns a small
 // pending-geometry struct; the commit logic lives on Editor.
@@ -13,6 +14,7 @@ pub enum Tool {
     Rectangle,
     Circle,
     Ruler,
+    Dimension,
 }
 
 // In-progress rectangle being dragged out (tool-side preview only).
@@ -112,6 +114,28 @@ impl PendingRuler {
 
 // Half-inch length quantum for shift-constrained drags.
 pub const HALF_INCH: f64 = 48.0;
+
+// Dimension tool: picks accumulating toward a dimension (a point or a
+// whole line per click), then a placed value-input state.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DimPick {
+    Point(PointId),
+    Line(SegmentId),
+}
+
+// A placed dimension awaiting its value: Enter commits the measured value,
+// typing digits + Enter commits the typed one, Esc cancels. `existing`
+// marks an EDIT of an already-placed dimension (double-click) — Enter
+// updates that dimension instead of creating one.
+#[derive(Clone, Debug)]
+pub struct DimInput {
+    pub target: crate::core::constraints::DimTarget,
+    pub offset: f64,
+    pub slide: f64,
+    pub measured: f64,
+    pub buffer: String,
+    pub existing: Option<usize>,
+}
 
 /// Snaps the b end around anchor a to the nearest 45 degrees AND the
 /// length to half-inch steps, preserving intent of precise rulers.

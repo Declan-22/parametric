@@ -37,18 +37,40 @@ pub struct Constraint {
     pub b: PointId,
 }
 
-// One stored measurement between two points. Renders along whatever angle
-// the a->b axis implies (diagonal edges get diagonal dim lines). When
-// `value` is Some, the pair behaves as a locked distance during edits.
+// One stored dimension — the tool-created measurement constraint. Always
+// locked: `value` is the distance (doc units) or angle (degrees) the
+// geometry is held to (point-pair dims also feed the solver as Distance
+// equations; line/angle dims constrain nothing yet but render + persist).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Dimension {
-    pub a: PointId,
-    pub b: PointId,
-    // Locked length; None = measuring only, follows the geometry freely.
-    pub value: Option<f64>,
-    // Signed perpendicular offset from the midpoint along the LEFT normal
-    // of (b - a), in document units — controls which side the dim line sits on.
+    pub target: DimTarget,
+    pub value: f64,
+    // Placement: signed perpendicular offset of the dim line from the
+    // measured geometry, in doc units. For angles: the arc radius.
     pub offset: f64,
+    // Placement: slide of the container along the dim line (doc units).
+    // For angles: fractional position across the sweep (0..1).
+    pub slide: f64,
+    // ANGLE dims only: the SIGNED placed sweep in degrees (-360..360) —
+    // the rotation direction from the first line's ray to the second,
+    // captured at placement so the constraint and the drawn arc always
+    // agree (label vs geometry never invert).
+    pub sweep: f64,
+}
+
+/// What a dimension measures and between what.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DimTarget {
+    /// Straight-line distance between two points.
+    Points { a: PointId, b: PointId },
+    /// Perpendicular distance from a point to a line.
+    PointLine { p: PointId, line: SegmentId },
+    /// Perpendicular distance between two parallel lines.
+    Lines { a: SegmentId, b: SegmentId },
+    /// Angle between two lines, in degrees.
+    Angle { a: SegmentId, b: SegmentId },
+    /// Radius of an arc/circle: dashed line from its center to the bend.
+    Radius { seg: SegmentId },
 }
 
 // A reference to any first-class document element.

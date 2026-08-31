@@ -81,6 +81,15 @@ const ICON_CIRCLE: &[u8] =
 
 "#;
 
+const ICON_DIMENSION: &[u8] =
+    br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2">
+		<path d="M10 15v-3m4 3v-3m4 3v-3M2 8V4m20 2H2m20 2V4M6 15v-3" />
+		<rect width="20" height="8" x="2" y="12" rx="2" />
+	</g>
+</svg>"#;
+
 const ICON_RULER: &[u8] =
     br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
 	<path d="M0 0h24v24H0z" fill="none" />
@@ -129,6 +138,7 @@ impl RenderOnce for Toolbar {
             .child(self.tool_button(Tool::Move, ICON_MOVE, active_tool, t, cx))
             .child(self.tool_button(Tool::Pan, ICON_PAN, active_tool, t, cx))
             .child(divider(t))
+            .child(self.tool_button(Tool::Dimension, ICON_DIMENSION, active_tool, t, cx))
             .child(self.tool_button(Tool::Ruler, ICON_RULER, active_tool, t, cx))
             .child(divider(t))
             .child(self.tool_button(Tool::Line, ICON_LINE, active_tool, t, cx))
@@ -267,6 +277,7 @@ fn tool_debug_name(tool: Tool) -> &'static str {
         Tool::Rectangle => "tool-rectangle",
         Tool::Circle => "tool-circle",
         Tool::Ruler => "tool-ruler",
+        Tool::Dimension => "tool-dimension",
     }
 }
 
@@ -278,5 +289,6 @@ fn tool_tooltip(tool: Tool) -> (&'static str, &'static str) {
         Tool::Line => ("Line", "L"),
         Tool::Rectangle => ("Rectangle", "R"),
         Tool::Circle => ("Arc", "A"),
+        Tool::Dimension => ("Dimension", "D"),
     }
 }

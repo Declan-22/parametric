@@ -221,7 +221,13 @@ impl Document {
             self.remove_segment(sid);
         }
         self.constraints.retain(|c| c.a != id && c.b != id);
-        self.dimensions.retain(|d| d.a != id && d.b != id);
+        // Dimensions touching the deleted point die too; point references
+        // inside line/angle targets invalidate those dimensions as well.
+        self.dimensions.retain(|d| match d.target {
+            super::constraints::DimTarget::Points { a, b } => a != id && b != id,
+            super::constraints::DimTarget::PointLine { p, .. } => p != id,
+            _ => true,
+        });
         self.detach_from_layers(ElementRef::Point(id));
         self.points.remove(id.idx).is_some()
     }
@@ -456,21 +462,81 @@ impl Document {
             }
         }
         for d in &mut self.dimensions {
-            if d.a == drop {
-                d.a = keep;
-            }
-            if d.b == drop {
-                d.b = keep;
+            match &mut d.target {
+                super::constraints::DimTarget::Points { a, b } => {
+                    if *a == drop {
+                        *a = keep;
+                    }
+                    if *b == drop {
+                        *b = keep;
+                    }
+                }
+                super::constraints::DimTarget::PointLine { p, .. } => {
+                    if *p == drop {
+                        *p = keep;
+                    }
+                }
+                _ => {}
             }
         }
         self.constraints.retain(|c| c.a != c.b);
-        self.dimensions.retain(|d| d.a != d.b);
+        self.dimensions.retain(|d| match d.target {
+            super::constraints::DimTarget::Points { a, b } => a != b,
+            _ => true,
+        });
         self.detach_from_layers(ElementRef::Point(drop));
         self.points.remove(drop.idx);
     }
 
     pub fn add_dimension(&mut self, dim: Dimension) {
         self.dimensions.push(dim);
+    }
+
+    /// Removes dimensions whose referenced geometry no longer exists, then
+    /// points that nothing references anymore (no segment endpoints, no
+    /// constraint, no dimension). Called after deletions so a deleted shape
+    /// takes its dimensions and corner points with it.
+    pub fn sweep_orphans(&mut self) {
+        use super::constraints::DimTarget;
+        // Drop dims whose referenced geometry vanished.
+        let dims = self.dimensions.clone();
+        self.dimensions = dims
+            .into_iter()
+            .filter(|d| match &d.target {
+                DimTarget::Points { a, b } => {
+                    self.point(*a).is_some() && self.point(*b).is_some()
+                }
+                DimTarget::PointLine { p, line } => {
+                    self.point(*p).is_some() && self.segment(*line).is_some()
+                }
+                DimTarget::Lines { a, b } | DimTarget::Angle { a, b } => {
+                    self.segment(*a).is_some() && self.segment(*b).is_some()
+                }
+                DimTarget::Radius { seg } => self.segment(*seg).is_some(),
+            })
+            .collect();
+        let dims = self.dimensions.clone();
+        // A point survives only while something references it. Note a
+        // dimension counts as a reference: dims pin their geometry.
+        let referenced = |id: PointId| -> bool {
+            self.all_segments().any(|(_, s)| {
+                s.start == id || s.end == id || s.ctrl == Some(id) || s.center == Some(id)
+            }) || self.constraints.iter().any(|c| c.a == id || c.b == id)
+                || dims.iter().any(|d| match &d.target {
+                    DimTarget::Points { a, b } => *a == id || *b == id,
+                    DimTarget::PointLine { p, .. } => *p == id,
+                    _ => false,
+                })
+        };
+        let dead: Vec<PointId> = self
+            .all_points()
+            .filter(|(id, _)| !referenced(*id))
+            .map(|(id, _)| id)
+            .collect();
+        for id in dead {
+            self.points.remove(id.idx);
+            self.detach_from_layers(super::constraints::ElementRef::Point(id));
+        }
     }
 
     // -- raw inserts (persistence round-trips ids exactly) --

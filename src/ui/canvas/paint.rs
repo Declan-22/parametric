@@ -243,6 +243,9 @@ pub fn build_draw_list(
         dashed_line(&mut list, d.ax, d.ay, d.lax, d.lay, 1., ink);
         dashed_line(&mut list, d.bx, d.by, d.lbx, d.lby, 1., ink);
         dashed_line(&mut list, d.lax, d.lay, d.lbx, d.lby, 1., ink);
+        // Arrowheads at both ends of the dim container line.
+        dim_arrowhead(&mut list, d.lbx, d.lby, d.lax, d.lay, ink);
+        dim_arrowhead(&mut list, d.lax, d.lay, d.lbx, d.lby, ink);
         for e in &d.extra_ext {
             dashed_line(&mut list, e[0], e[1], e[2], e[3], 1., ink);
         }
@@ -806,13 +809,11 @@ fn push_grid(
 
     // Draw from coarsest to finest so finer (more transparent) is on top
     // Major (outer shell) full opacity
-    let major_color: gpui::Background = rgb(t.border_color).into();
+    let major_color: gpui::Background = rgb(t.component_border_color).into();
     // Minor 50% lower opacity than major
-    let minor_color: gpui::Background =
-        rgba((t.border_color << 8) | 0x80).into(); // 50%
+    let minor_color: gpui::Background = rgba((t.component_border_color << 8) | 0x80).into(); // 50%
     // Finer 50% lower than minor (25% of original)
-    let finer_color: gpui::Background =
-        rgba((t.border_color << 8) | 0x40).into(); // 25%
+    let finer_color: gpui::Background = rgba((t.component_border_color << 8) | 0x40).into(); // 25%
 
     // Only draw finer if it will be readable (not too dense)
     let finer_visible = lv.finer_visible;
@@ -825,7 +826,11 @@ fn push_grid(
     if minor_visible {
         // If major was drawn, minor is the 5x subdivision inside it at 50% opacity.
         // If major wasn't drawn (extreme zoom), minor becomes the outer shell at full opacity.
-        let c = if major_visible { minor_color } else { major_color };
+        let c = if major_visible {
+            minor_color
+        } else {
+            major_color
+        };
         draw_level(minor_step, minor_screen, c);
     }
     if finer_visible {
@@ -882,4 +887,49 @@ fn dashed_line(
         });
         t += DASH + GAP;
     }
+}
+
+/// Two short diagonal lines forming a V-shaped arrowhead at the end of
+/// a dim line, pointing outward.
+fn dim_arrowhead(
+    list: &mut Vec<Primitive>,
+    ax: f32,
+    ay: f32,
+    bx: f32,
+    by: f32,
+    color: gpui::Background,
+) {
+    const LEN: f32 = 6.;
+    const SPREAD: f32 = 4.;
+    let dx = bx - ax;
+    let dy = by - ay;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 1e-3 {
+        return;
+    }
+    let ux = dx / len;
+    let uy = dy / len;
+    let nx = -uy;
+    let ny = ux;
+    // Tip at end, two arms angled back and outward.
+    let lx = bx - ux * LEN + nx * SPREAD;
+    let ly = by - uy * LEN + ny * SPREAD;
+    let rx = bx - ux * LEN - nx * SPREAD;
+    let ry = by - uy * LEN - ny * SPREAD;
+    list.push(Primitive::Line {
+        ax: bx,
+        ay: by,
+        bx: lx,
+        by: ly,
+        width: 1.,
+        color,
+    });
+    list.push(Primitive::Line {
+        ax: bx,
+        ay: by,
+        bx: rx,
+        by: ry,
+        width: 1.,
+        color,
+    });
 }

@@ -187,6 +187,7 @@ impl Editor {
                         "coincident" => ConstraintKind::Coincident,
                         "horizontal" => ConstraintKind::Horizontal,
                         "vertical" => ConstraintKind::Vertical,
+                        "tangent" => ConstraintKind::Tangent,
                         _ => continue,
                     };
                     if let (Ok(a), Ok(b)) = (f[1].parse::<usize>(), f[2].parse::<usize>()) {

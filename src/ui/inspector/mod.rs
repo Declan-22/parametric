@@ -118,7 +118,7 @@ impl Inspector {
                         show_grid,
                         editor_show,
                         t,
-                        |ed| ed.show_grid = !ed.show_grid,
+                        |ed, cx| ed.set_show_grid(!ed.show_grid, cx),
                     )),
             )
             .child(
@@ -138,34 +138,32 @@ impl Inspector {
                         snap_to_grid,
                         editor_snap_grid,
                         t,
-                        |ed| ed.snap_to_grid = !ed.snap_to_grid,
+                        |ed, cx| ed.set_snap_to_grid(!ed.snap_to_grid, cx),
                     )),
             );
 
-        // Snap to Objects only visible when Snap to Grid is OFF — when Grid
-        // is on, object snaps are completely disabled (spec).
-        if !snap_to_grid {
-            section = section.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(8.))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(t.text_secondary))
-                            .child("Snap to Objects"),
-                    )
-                    .child(self.toggle(
-                        "snap-to-objects",
-                        snap_to_objects,
-                        editor_snap_obj,
-                        t,
-                        |ed| ed.snap_to_objects = !ed.snap_to_objects,
-                    )),
-            );
-        }
+        // Both snap modes coexist: object snaps take priority over the grid
+        // lattice while snapping, so neither toggle hides the other.
+        section = section.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(t.text_secondary))
+                        .child("Snap to Objects"),
+                )
+                .child(self.toggle(
+                    "snap-to-objects",
+                    snap_to_objects,
+                    editor_snap_obj,
+                    t,
+                    |ed, cx| ed.set_snap_to_objects(!ed.snap_to_objects, cx),
+                )),
+        );
 
         section
     }
@@ -179,7 +177,7 @@ impl Inspector {
         toggle_fn: F,
     ) -> impl IntoElement
     where
-        F: Fn(&mut crate::editor::Editor) + 'static,
+        F: Fn(&mut crate::editor::Editor, &mut gpui::Context<crate::editor::Editor>) + 'static,
     {
         // Pill track: 36x20, thumb 16, 2px inner padding.
         // On = accent (like toolbar active), Off = bg_tertiary so it reads
@@ -208,8 +206,7 @@ impl Inspector {
             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                 cx.stop_propagation();
                 let _ = editor.update(cx, |ed, cx| {
-                    toggle_fn(ed);
-                    cx.notify();
+                    toggle_fn(ed, cx);
                 });
             })
             .child(

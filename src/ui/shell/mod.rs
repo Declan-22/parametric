@@ -223,6 +223,11 @@ impl Shell {
             return;
         };
         let mut doc = Document::new();
+        // New designs start from the LAST-USED view/snap settings (global
+        // app prefs), not hard-coded values.
+        if let Some(s) = reg.default_doc_settings() {
+            doc.settings = s;
+        }
         doc.layers.push(Layer {
             id: 1,
             name: "Layer 1".into(),
@@ -247,7 +252,16 @@ impl Shell {
         let Ok(mut doc) = db.load_document() else {
             return;
         };
+        // Pre-settings files: seed from the app's last-used defaults so the
+        // design inherits the user's current snapping/grid preferences once.
+        let stored_settings = db.load_settings().ok().flatten();
         drop(db);
+        if stored_settings.is_none()
+            && let Some(reg) = cx.try_global::<Registry>()
+            && let Some(s) = reg.default_doc_settings()
+        {
+            doc.settings = s;
+        }
         if doc.layers.is_empty() {
             doc.layers.push(Layer {
                 id: 1,
@@ -895,14 +909,11 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|shell, _: &crate::ui::actions::BondCombinePoints, _, cx| {
-                    if shell.renaming.is_some()
-                        || shell
-                            .editor
-                            .as_ref()
-                            .is_some_and(|ed| ed.read(cx).dim_input.is_some())
-                    {
-                        return;
-                    }
+                    // While a dimension value input is active, digit keystrokes
+                    // feed the input (the binding would otherwise eat them).
+                    // This check MUST come before any early return — "2" is
+                    // bound to this action, so without it the digit never
+                    // reaches the input.
                     if let Some(ed) = shell.editor.as_ref() {
                         if ed.read(cx).dim_input.is_some() {
                             let _ = ed.update(cx, |ed, cx| {
@@ -912,6 +923,11 @@ impl Render for Shell {
                             });
                             return;
                         }
+                    }
+                    if shell.renaming.is_some() {
+                        return;
+                    }
+                    if let Some(ed) = shell.editor.as_ref() {
                         let changed = ed.update(cx, |ed, _| ed.trigger_context_shortcut(1));
                         if changed {
                             shell.invalidate_thumbs_all();

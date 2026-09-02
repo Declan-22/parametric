@@ -18,6 +18,8 @@ pub enum ConstraintKind {
     Horizontal,
     // The two points share an X coordinate.
     Vertical,
+    // A line and circular arc share a tangent direction at `point`.
+    Tangent,
 }
 
 impl ConstraintKind {
@@ -26,6 +28,7 @@ impl ConstraintKind {
             ConstraintKind::Coincident => "coincident",
             ConstraintKind::Horizontal => "horizontal",
             ConstraintKind::Vertical => "vertical",
+            ConstraintKind::Tangent => "tangent",
         }
     }
 }
@@ -35,6 +38,10 @@ pub struct Constraint {
     pub kind: ConstraintKind,
     pub a: PointId,
     pub b: PointId,
+    // Tangent constraints need the two owning segments and the contact
+    // point; the point pair above remains useful for chip ownership and for
+    // backwards-compatible persistence of the older constraints.
+    pub tangent_segments: Option<(SegmentId, SegmentId)>,
 }
 
 // One stored dimension — the tool-created measurement constraint. Always
@@ -58,11 +65,50 @@ pub struct Dimension {
     pub sweep: f64,
 }
 
+/// Orientation of a point-pair distance dimension. Fusion-style: the mouse
+/// position at placement picks which of the three the dim measures; Aligned
+/// is the straight displacement, X/Y the axis-projected spans.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DimMode {
+    Aligned,
+    X,
+    Y,
+}
+
+impl DimMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DimMode::Aligned => "",
+            DimMode::X => "_x",
+            DimMode::Y => "_y",
+        }
+    }
+
+    pub fn parse_suffix(kind: &str) -> (bool, DimMode) {
+        match kind {
+            "points_x" => (true, DimMode::X),
+            "points_y" => (true, DimMode::Y),
+            _ => (kind == "points", DimMode::Aligned),
+        }
+    }
+}
+
+impl DimTarget {
+    /// Returns the target with a point-pair mode applied (no-op for target
+    /// kinds that carry no mode).
+    pub fn with_mode(self, mode: DimMode) -> Self {
+        match self {
+            DimTarget::Points { a, b, .. } => DimTarget::Points { a, b, mode },
+            other => other,
+        }
+    }
+}
+
 /// What a dimension measures and between what.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DimTarget {
-    /// Straight-line distance between two points.
-    Points { a: PointId, b: PointId },
+    /// Distance between two points — straight (Aligned) or the X/Y span.
+    Points { a: PointId, b: PointId, mode: DimMode },
     /// Perpendicular distance from a point to a line.
     PointLine { p: PointId, line: SegmentId },
     /// Perpendicular distance between two parallel lines.

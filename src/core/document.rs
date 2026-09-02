@@ -11,8 +11,24 @@ use super::ids::{FillId, PointId, SegmentId};
 // horizontal/vertical constraints, and one fill over the loop, emitted by
 // the rectangle tool. Deleting any piece leaves the rest valid.
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DocSettings {
+    pub show_grid: bool,
+    pub snap_to_grid: bool,
+    pub snap_to_objects: bool,
+}
+
+impl Default for DocSettings {
+    fn default() -> Self {
+        Self { show_grid: true, snap_to_grid: false, snap_to_objects: true }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Document {
+    // View/snap toggles. Saved PER design; new designs seed from the
+    // app-level "last used" prefs (Registry) instead of hard-coded values.
+    pub settings: DocSettings,
     pub layers: Vec<Layer>,
     points: Arena<Point2>,
     segments: Arena<Segment>,
@@ -224,7 +240,7 @@ impl Document {
         // Dimensions touching the deleted point die too; point references
         // inside line/angle targets invalidate those dimensions as well.
         self.dimensions.retain(|d| match d.target {
-            super::constraints::DimTarget::Points { a, b } => a != id && b != id,
+            super::constraints::DimTarget::Points { a, b, .. } => a != id && b != id,
             super::constraints::DimTarget::PointLine { p, .. } => p != id,
             _ => true,
         });
@@ -423,7 +439,24 @@ impl Document {
     // -- constraints / dimensions --
 
     pub fn add_constraint(&mut self, kind: ConstraintKind, a: PointId, b: PointId) {
-        let c = Constraint { kind, a, b };
+        let c = Constraint { kind, a, b, tangent_segments: None };
+        if !self.constraints.contains(&c) {
+            self.constraints.push(c);
+        }
+    }
+
+    pub fn add_tangent_constraint(
+        &mut self,
+        line: SegmentId,
+        arc: SegmentId,
+        point: PointId,
+    ) {
+        let c = Constraint {
+            kind: ConstraintKind::Tangent,
+            a: point,
+            b: point,
+            tangent_segments: Some((line, arc)),
+        };
         if !self.constraints.contains(&c) {
             self.constraints.push(c);
         }
@@ -463,7 +496,7 @@ impl Document {
         }
         for d in &mut self.dimensions {
             match &mut d.target {
-                super::constraints::DimTarget::Points { a, b } => {
+                super::constraints::DimTarget::Points { a, b, .. } => {
                     if *a == drop {
                         *a = keep;
                     }
@@ -481,7 +514,7 @@ impl Document {
         }
         self.constraints.retain(|c| c.a != c.b);
         self.dimensions.retain(|d| match d.target {
-            super::constraints::DimTarget::Points { a, b } => a != b,
+            super::constraints::DimTarget::Points { a, b, .. } => a != b,
             _ => true,
         });
         self.detach_from_layers(ElementRef::Point(drop));
@@ -503,7 +536,7 @@ impl Document {
         self.dimensions = dims
             .into_iter()
             .filter(|d| match &d.target {
-                DimTarget::Points { a, b } => {
+                DimTarget::Points { a, b, .. } => {
                     self.point(*a).is_some() && self.point(*b).is_some()
                 }
                 DimTarget::PointLine { p, line } => {
@@ -523,7 +556,7 @@ impl Document {
                 s.start == id || s.end == id || s.ctrl == Some(id) || s.center == Some(id)
             }) || self.constraints.iter().any(|c| c.a == id || c.b == id)
                 || dims.iter().any(|d| match &d.target {
-                    DimTarget::Points { a, b } => *a == id || *b == id,
+                    DimTarget::Points { a, b, .. } => *a == id || *b == id,
                     DimTarget::PointLine { p, .. } => *p == id,
                     _ => false,
                 })

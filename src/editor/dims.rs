@@ -161,8 +161,19 @@ pub fn update(ed: &mut Editor) {
     if let Some(drag) = &ed.dragging {
         let dragged: std::collections::HashSet<_> =
             drag.points.iter().map(|(id, _)| *id).collect();
-        for (_, seg) in ed.doc.all_segments() {
+        for (seg_id, seg) in ed.doc.all_segments() {
             if seg.kind != crate::core::document::SegmentKind::Arc {
+                continue;
+            }
+            // A persisted radius dimension is the authoritative annotation;
+            // suppress the temporary resize accent so the two annotations do
+            // not overlap or disagree while the arc is dragged.
+            if ed.doc.dimensions.iter().any(|d| {
+                matches!(
+                    d.target,
+                    crate::core::constraints::DimTarget::Radius { seg: sid } if sid == seg_id
+                )
+            }) {
                 continue;
             }
             let is_dragged = seg.ctrl.is_some_and(|c| dragged.contains(&c))
@@ -230,7 +241,14 @@ pub fn update(ed: &mut Editor) {
             // Editing shows the current value highlighted; typing replaces it.
             let buffer = ed.dim_input.as_ref().map(|input| input.buffer.clone()).unwrap_or_default();
             Some(if buffer.is_empty() {
-                crate::ui::canvas::fmt_dim(d.value)
+                match &d.target {
+                    // Angles always read as positive 0..360 — the signed
+                    // sweep only encodes which sector the arc occupies.
+                    crate::core::constraints::DimTarget::Angle { .. } => {
+                        format!("{:.1}\u{00B0}", d.value.abs())
+                    }
+                    _ => crate::ui::canvas::fmt_dim(d.value),
+                }
             } else {
                 buffer
             })
@@ -260,8 +278,20 @@ pub fn update(ed: &mut Editor) {
             let doc_p = ed
                 .camera
                 .screen_to_unit(Point2::new(f64::from(cur.x), f64::from(cur.y)));
-            if let Some((offset, slide, measured)) = ed.dim_placement(target, doc_p) {
-                push_dim_target(ed, &target, offset, slide, measured, None, None, false, false);
+            if let Some((mode, offset, slide, measured)) = ed.dim_placement(target, doc_p) {
+                // The cursor-decided mode MUST ride into the render target —
+                // without it the X/Y preview would draw as an aligned dim.
+                push_dim_target(
+                    ed,
+                    &target.with_mode(mode),
+                    offset,
+                    slide,
+                    measured,
+                    None,
+                    None,
+                    false,
+                    false,
+                );
             }
         }
     }
@@ -288,26 +318,89 @@ fn push_dim_target(
     use crate::core::constraints::DimTarget;
     let zoom = ed.camera.zoom;
     match target {
-        DimTarget::Points { a, b } => {
+        DimTarget::Points { a, b, mode } => {
             let (Some(pa), Some(pb)) = (ed.doc.point(*a), ed.doc.point(*b)) else {
                 return;
             };
-            let mut r = linear_dim(&ed.doc, &ed.camera, pa, pb, offset * zoom, value);
-            // Container rides the dim line FROM ITS START (the first
-            // endpoint's foot) — anchoring it to the line's midpoint made
-            // it unreachable past halfway.
-            let (sa, sb) = (ed.camera.unit_to_screen(pa), ed.camera.unit_to_screen(pb));
-            let dx = sb.x - sa.x;
-            let dy = sb.y - sa.y;
-            let l = (dx * dx + dy * dy).sqrt().max(1e-9);
-            let s = slide.clamp(0., pick::distance(pa, pb));
-            r.label_cx = r.lax + (dx / l * s * zoom) as f32;
-            r.label_cy = r.lay + (dy / l * s * zoom) as f32;
+            let zoom = ed.camera.zoom;
+            let scr = |p: Point2| ed.camera.unit_to_screen(p);
+            use crate::core::constraints::DimMode;
+            let mut r = match mode {
+                DimMode::Aligned => {
+                    let mut r = linear_dim(&ed.doc, &ed.camera, pa, pb, offset * zoom, value);
+                    r.text = text.unwrap_or_else(|| crate::ui::canvas::fmt_dim(value));
+                    // Container rides the dim line FROM ITS START (the first
+                    // endpoint's foot) — anchoring it to the line's midpoint made
+                    // it unreachable past halfway.
+                    let (sa, sb) = (scr(pa), scr(pb));
+                    let dx = sb.x - sa.x;
+                    let dy = sb.y - sa.y;
+                    let l = (dx * dx + dy * dy).sqrt().max(1e-9);
+                    let s = slide.clamp(0., pick::distance(pa, pb));
+                    r.label_cx = r.lax + (dx / l * s * zoom) as f32;
+                    r.label_cy = r.lay + (dy / l * s * zoom) as f32;
+                    r
+                }
+                // X/Y modes: the dim line is an axis-aligned span measuring
+                // |dx| / |dy|, with vertical/horizontal extension stubs
+                // down to each measured point. `offset` is the signed
+                // distance of the dim line from the FIRST point along the
+                // other axis; `slide` positions the container along it.
+                DimMode::X => {
+                    let y_off = pa.y + offset;
+                    let (sa, sb) = (scr(pa), scr(pb));
+                    let ly = scr(Point2::new(pa.x, y_off)).y;
+                    let (lax, lbx) = (sa.x, sb.x);
+                    let t = (slide / (pb.x - pa.x).abs().max(1e-9)).clamp(0., 1.);
+                    DimRender {
+                        ax: sa.x as f32,
+                        ay: sa.y as f32,
+                        bx: sb.x as f32,
+                        by: sb.y as f32,
+                        lax: lax as f32,
+                        lay: ly as f32,
+                        lbx: lbx as f32,
+                        lby: ly as f32,
+                        label_cx: (lax + (lbx - lax) * t) as f32,
+                        label_cy: ly as f32,
+                        text: text.unwrap_or_else(|| crate::ui::canvas::fmt_dim(value)),
+                        extra_ext: Vec::new(),
+                        constraint: true,
+                        dim_index,
+                        hovered,
+                        editing,
+                    }
+                }
+                DimMode::Y => {
+                    let x_off = pa.x + offset;
+                    let (sa, sb) = (scr(pa), scr(pb));
+                    let lx = scr(Point2::new(x_off, pa.y)).x;
+                    let (lay, lby) = (sa.y, sb.y);
+                    let t = (slide / (pb.y - pa.y).abs().max(1e-9)).clamp(0., 1.);
+                    DimRender {
+                        ax: sa.x as f32,
+                        ay: sa.y as f32,
+                        bx: sb.x as f32,
+                        by: sb.y as f32,
+                        lax: lx as f32,
+                        lay: lay as f32,
+                        lbx: lx as f32,
+                        lby: lby as f32,
+                        label_cx: lx as f32,
+                        label_cy: (lay + (lby - lay) * t) as f32,
+                        text: text.unwrap_or_else(|| crate::ui::canvas::fmt_dim(value)),
+                        extra_ext: Vec::new(),
+                        constraint: true,
+                        dim_index,
+                        hovered,
+                        editing,
+                    }
+                }
+            };
             r.constraint = true;
             r.dim_index = dim_index;
             r.hovered = hovered;
             r.editing = editing;
-            r.text = text.unwrap_or_else(|| crate::ui::canvas::fmt_dim(value));
             ed.dim_renders.push(r);
         }
         DimTarget::PointLine { p, line } => {
@@ -427,7 +520,7 @@ fn push_dim_target(
                 sweep: sweep as f32,
                 label_cx: lp.x as f32,
                 label_cy: lp.y as f32,
-                text: text.unwrap_or_else(|| format!("{value:.1}\u{00B0}")),
+                text: text.unwrap_or_else(|| format!("{:.1}\u{00B0}", value.abs())),
                 constraint: true,
                 dim_index,
                 hovered,
@@ -520,9 +613,25 @@ pub(crate) fn dim_angle_geometry(
     const TAU: f64 = std::f64::consts::TAU;
     let (a0p, a1p) = ed.doc.segment_geom(a)?;
     let (b0p, b1p) = ed.doc.segment_geom(b)?;
-    let (u_a, _) = dim_axes(a1p.x - a0p.x, a1p.y - a0p.y);
-    let (u_b, _) = dim_axes(b1p.x - b0p.x, b1p.y - b0p.y);
+    let (mut u_a, _) = dim_axes(a1p.x - a0p.x, a1p.y - a0p.y);
+    let (mut u_b, _) = dim_axes(b1p.x - b0p.x, b1p.y - b0p.y);
     let v = line_intersection(a0p, u_a, b0p, u_b)?;
+    // VERTEX-ORIENTED rays: each ray points from the intersection TOWARD
+    // that segment's actual geometry (its midpoint). The raw start->end
+    // direction can point away from the corner (an edge emitted
+    // bottom-to-top at a top-left corner), which made rectangle corner
+    // dims report the reflex sector (270/-90) and draw the arc on the
+    // wrong side of the edges.
+    let orient = |u: (f64, f64), p0: Point2, p1: Point2| -> (f64, f64) {
+        let mid = Point2::new((p0.x + p1.x) / 2., (p0.y + p1.y) / 2.);
+        if (mid.x - v.x) * u.0 + (mid.y - v.y) * u.1 < 0. {
+            (-u.0, -u.1)
+        } else {
+            u
+        }
+    };
+    u_a = orient(u_a, a0p, a1p);
+    u_b = orient(u_b, b0p, b1p);
     // Raw signed angle between the two ray directions (-PI, PI].
     let full = (u_a.0 * u_b.1 - u_a.1 * u_b.0).atan2(u_a.0 * u_b.0 + u_a.1 * u_b.1);
     if full.abs() < 1e-6 {
@@ -716,6 +825,33 @@ fn update_constraint_markers(ed: &mut Editor) {
             guide,
             hovered: is_hovered,
         });
+    }
+    // Multiple constraints attached to one point share a single horizontal
+    // chip row. The previous placement gave every chip the same point-based
+    // anchor, so the overlay stacked vertically and obscured itself.
+    let mut groups: std::collections::HashMap<PointId, Vec<usize>> = std::collections::HashMap::new();
+    for (i, marker) in ed.constraint_markers.iter().enumerate() {
+        // Only point-attached chips share an anchor. Edge constraints such as
+        // horizontal/vertical use the center of their own edge and must not
+        // be pulled beside an unrelated chip at the first endpoint.
+        if marker.constraint.a == marker.constraint.b {
+            groups.entry(marker.constraint.a).or_default().push(i);
+        }
+    }
+    for indices in groups.values() {
+        if indices.len() < 2 { continue; }
+        let base_x = indices.iter().map(|&i| ed.constraint_markers[i].cx_out).sum::<f32>()
+            / indices.len() as f32;
+        let base_y = indices.iter().map(|&i| ed.constraint_markers[i].cy_out).sum::<f32>()
+            / indices.len() as f32;
+        let width = 22.0_f32;
+        let start = base_x - width * (indices.len() as f32 - 1.0) / 2.0;
+        for (row, &i) in indices.iter().enumerate() {
+            ed.constraint_markers[i].cx_out = start + row as f32 * width;
+            ed.constraint_markers[i].cy_out = base_y;
+            ed.constraint_markers[i].cx_in = ed.constraint_markers[i].cx_out;
+            ed.constraint_markers[i].cy_in = base_y;
+        }
     }
 }
 

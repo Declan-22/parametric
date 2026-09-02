@@ -1,7 +1,7 @@
 use rusqlite::Connection;
 
 use crate::core::constraints::{ConstraintKind, Dimension, ElementRef};
-use crate::core::document::{Document, Layer, SegmentKind};
+use crate::core::document::{DocSettings, Document, Layer, SegmentKind};
 use crate::core::geometry::Point2;
 use crate::core::ids::{FillId, PointId, SegmentId};
 
@@ -165,6 +165,19 @@ impl Database {
     pub fn save_document(&self, doc: &Document) -> rusqlite::Result<()> {
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
+            // View/snap settings live in `meta` so they travel with the
+            // design file and never touch other documents.
+            for (key, on) in [
+                ("settings.show_grid", doc.settings.show_grid),
+                ("settings.snap_grid", doc.settings.snap_to_grid),
+                ("settings.snap_objects", doc.settings.snap_to_objects),
+            ] {
+                let _ = self.conn.execute(
+                    "INSERT INTO meta(key, value) VALUES(?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    rusqlite::params![key, if on { "1" } else { "0" }],
+                );
+            }
             self.conn.execute_batch(
                 "DELETE FROM dimensions;
                  DELETE FROM constraints;
@@ -246,7 +259,17 @@ impl Database {
             for d in &doc.dimensions {
                 use crate::core::constraints::DimTarget;
                 let (kind, p1, p2, sa, sb) = match &d.target {
-                    DimTarget::Points { a, b } => ("points", Some(*a), Some(*b), None, None),
+                    DimTarget::Points { a, b, mode } => (
+                        match mode {
+                            crate::core::constraints::DimMode::X => "points_x",
+                            crate::core::constraints::DimMode::Y => "points_y",
+                            crate::core::constraints::DimMode::Aligned => "points",
+                        },
+                        Some(*a),
+                        Some(*b),
+                        None,
+                        None,
+                    ),
                     DimTarget::PointLine { p, line } => {
                         ("point_line", Some(*p), None, Some(*line), None)
                     }
@@ -319,8 +342,33 @@ impl Database {
         Ok(())
     }
 
+    /// Reads the per-design view/snap settings, or None when the file has
+    /// none yet (pre-settings documents — callers seed from the app's
+    /// last-used defaults instead).
+    pub fn load_settings(&self) -> rusqlite::Result<Option<DocSettings>> {
+        let read = |key: &str| -> Option<bool> {
+            self.conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    [key],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+                .map(|v| v == "1")
+        };
+        let (Some(show_grid), Some(snap_to_grid), Some(snap_to_objects)) = (
+            read("settings.show_grid"),
+            read("settings.snap_grid"),
+            read("settings.snap_objects"),
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some(DocSettings { show_grid, snap_to_grid, snap_to_objects }))
+    }
+
     pub fn load_document(&self) -> rusqlite::Result<Document> {
         let mut doc = Document::new();
+        doc.settings = self.load_settings()?.unwrap_or_default();
 
         let mut stmt = self.conn.prepare("SELECT idx, generation, x, y FROM points ORDER BY idx")?;
         let mut rows = stmt.query([])?;
@@ -422,6 +470,7 @@ impl Database {
                 "coincident" => ConstraintKind::Coincident,
                 "horizontal" => ConstraintKind::Horizontal,
                 "vertical" => ConstraintKind::Vertical,
+                "tangent" => ConstraintKind::Tangent,
                 _ => continue,
             };
             add_constraint_raw(
@@ -494,7 +543,11 @@ impl Database {
                     let (Some(a), Some(b)) = (point(1), point(3)) else {
                         continue;
                     };
-                    DimTarget::Points { a, b }
+                    // Legacy + current point dims; the kind suffix carries
+                    // the Fusion-style X/Y orientation.
+                    let (_, mode) =
+                        crate::core::constraints::DimMode::parse_suffix(&kind);
+                    DimTarget::Points { a, b, mode }
                 }
             };
             doc.dimensions.push(Dimension {
@@ -574,7 +627,7 @@ fn insert_fills_raw(doc: &mut Document, fills: Vec<(u32, u32, Vec<SegmentId>)>) 
 }
 
 fn add_constraint_raw(doc: &mut Document, kind: ConstraintKind, a: PointId, b: PointId) {
-    doc.constraints.push(crate::core::constraints::Constraint { kind, a, b });
+    doc.constraints.push(crate::core::constraints::Constraint { kind, a, b, tangent_segments: None });
 }
 
 fn add_dimension_raw(doc: &mut Document, dim: Dimension) {
@@ -596,6 +649,7 @@ mod tests {
             target: crate::core::constraints::DimTarget::Points {
                 a: PointId { idx: 0, generation: 0 },
                 b: PointId { idx: 1, generation: 0 },
+                mode: crate::core::constraints::DimMode::Aligned,
             },
             value: 100.,
             offset: 18.,

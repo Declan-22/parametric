@@ -169,6 +169,7 @@ impl Editor {
     }
 
     pub fn from_document(doc: Document) -> Self {
+        let settings = doc.settings;
         let next_layer_id = doc.layers.iter().map(|l| l.id + 1).max().unwrap_or(1);
         Self {
             doc,
@@ -206,9 +207,9 @@ impl Editor {
             dragging: None,
             next_layer_id: next_layer_id.max(2),
             pan_start: None,
-            show_grid: true,
-            snap_to_grid: false,
-            snap_to_objects: true,
+            show_grid: settings.show_grid,
+            snap_to_grid: settings.snap_to_grid,
+            snap_to_objects: settings.snap_to_objects,
             creation_cursor: None,
             dim_picks: Vec::new(),
             dim_target: None,
@@ -424,10 +425,14 @@ impl Editor {
                         self.snap_guides.clear();
                         self.tool = Tool::Move;
                         self.creation_cursor = None;
-                        let (_, b) = pending.snapped(shift);
+                        let (_, mut b) = pending.snapped(shift);
+                        if shift {
+                            if let Some(q) = self.tangent_snap_for_line(pending.start, pending.cursor) { b = q; }
+                        }
                         if pick::distance(b, pending.start) > 1e-6 {
                             let layer_id = self.doc.layers[0].id;
                             let seg = self.create_line(layer_id, pending.start, b);
+                            if shift { self.maybe_add_tangent(seg, b); }
                             self.selection = vec![ElementRef::Segment(seg)];
                         }
                         return true;
@@ -536,35 +541,23 @@ impl Editor {
                     // a point-line distance...).
                     if self.dim_target.is_some() {
                         let doc_p = self.cursor_doc(cursor);
-                        let picker =
-                            pick::Picker::new(&self.doc, &self.camera, HANDLE_TOL_PX);
-                        let hit = picker
-                            .point(doc_p)
-                            .map(DimPick::Point)
-                            .or_else(|| picker.segment(doc_p).map(DimPick::Line));
-                        if hit.is_none() {
-                            if let Some(target) = self.dim_target {
-                                let doc_p = self.cursor_doc(cursor);
-                                if let Some((offset, slide, measured)) =
-                                    self.dim_placement(target, doc_p)
-                                {
-                                    // Picks are consumed by the placement; the
-                                    // value input takes over (Enter/typing/Esc).
-                                    self.dim_picks.clear();
-                                    self.dim_target = None;
-                                    self.selection.clear();
-                                    self.dim_input = Some(DimInput {
-                                        target,
-                                        offset,
-                                        slide,
-                                        measured,
-                                        buffer: String::new(),
-                                        existing: None,
-                                    });
-                                }
+                        if let Some(target) = self.dim_target {
+                            if let Some((mode, offset, slide, measured)) = self.dim_placement(target, doc_p) {
+                                // Once two picks form a target, every click is
+                                // a placement click. Previously a point hit
+                                // near a slanted dimension was interpreted as
+                                // another pick, so the value editor never
+                                // opened for aligned displacement dimensions.
+                                self.dim_picks.clear();
+                                self.dim_target = None;
+                                self.selection.clear();
+                                self.dim_input = Some(DimInput {
+                                    target: target.with_mode(mode), offset, slide, measured,
+                                    buffer: String::new(), existing: None,
+                                });
                             }
-                            return true;
                         }
+                        return true;
                     }
                     // Accumulate picks: points and whole lines (an edge is a
                     // complete dimension all by itself; an arc is a radius).
@@ -695,9 +688,27 @@ impl Editor {
                     aux
                 };
                 let (drag_pts, aux_pts) = if let Some(pid) = solo_point {
-                    let start = self.doc.point(pid).unwrap();
-                    let aux = ring_of(&[pid]);
-                    (vec![(pid, start)], aux)
+                    // Whole-arc translation: the arc's bend ("midpoint")
+                    // handle moves the ENTIRE arc rigidly — endpoints are
+                    // what change the sweep. Without this the handle wanders
+                    // off while the arc (and any radius dim) stays put.
+                    if let Some((_, seg)) = self.doc.all_segments().find(|(_, s)| {
+                        s.kind == crate::core::document::SegmentKind::Arc && s.ctrl == Some(pid)
+                    }) {
+                        let mut ids = vec![seg.start, seg.end, pid];
+                        if let Some(c) = seg.center {
+                            ids.push(c);
+                        }
+                        let drag = ids
+                            .iter()
+                            .filter_map(|&p| self.doc.point(p).map(|pos| (p, pos)))
+                            .collect();
+                        (drag, Vec::new())
+                    } else {
+                        let start = self.doc.point(pid).unwrap();
+                        let aux = ring_of(&[pid]);
+                        (vec![(pid, start)], aux)
+                    }
                 } else if let (ElementRef::Segment(sid), false) =
                     (&el, self.selection.len() > 1 && self.element_selected(el))
                 {
@@ -708,16 +719,34 @@ impl Editor {
                     // collapse an edge drag to a PERPENDICULAR stretch
                     // (tangential pulls are projected out), so grabbing an
                     // edge never translates the shape.
-                    let ends: Vec<PointId> = self
-                        .doc
-                        .segment(*sid)
-                        .map(|s| vec![s.start, s.end])
-                        .unwrap_or_default();
-                    let drag = ends
-                        .iter()
-                        .filter_map(|&pid| self.doc.point(pid).map(|pos| (pid, pos)))
-                        .collect();
-                    (drag, Vec::new())
+                    // ARCS are the exception: dragging the arc body moves
+                    // the whole arc rigidly (Fusion-style); its endpoints
+                    // are the sweep handles.
+                    let seg = self.doc.segment(*sid);
+                    if seg.is_some_and(|s| s.kind == crate::core::document::SegmentKind::Arc) {
+                        let s = seg.unwrap();
+                        let mut ids = vec![s.start, s.end];
+                        if let Some(c) = s.ctrl {
+                            ids.push(c);
+                        }
+                        if let Some(c) = s.center {
+                            ids.push(c);
+                        }
+                        let drag = ids
+                            .iter()
+                            .filter_map(|&p| self.doc.point(p).map(|pos| (p, pos)))
+                            .collect();
+                        (drag, Vec::new())
+                    } else {
+                        let ends: Vec<PointId> = seg
+                            .map(|s| vec![s.start, s.end])
+                            .unwrap_or_default();
+                        let drag = ends
+                            .iter()
+                            .filter_map(|&pid| self.doc.point(pid).map(|pos| (pid, pos)))
+                            .collect();
+                        (drag, Vec::new())
+                    }
                 } else {
                     let pts = self.doc.selection_points(&self.selection);
                     let drag = pts
@@ -802,8 +831,11 @@ impl Editor {
             let at = self.cursor_doc(cursor);
             let (at, guides) = self.snap_creation_point(at);
             self.snap_guides = guides;
+            let tangent_at = self.pending_line.as_ref().and_then(|p| {
+                if shift { self.tangent_snap_for_line(p.start, at) } else { None }
+            });
             if let Some(pending) = self.pending_line.as_mut() {
-                pending.cursor = at;
+                pending.cursor = tangent_at.unwrap_or(at);
             }
             return true;
         }
@@ -1075,7 +1107,8 @@ impl Editor {
             moved.insert(id);
             self.doc.move_point(id, pos);
         }
-        self.resolve_arcs_after_drag(&moved);
+        // Arc consistency is enforced by solver equations; no post-solve
+        // mutation is allowed to overwrite other constraints.
         // Re-anchor the connection guides at the locked point's FINAL
         // position — the solver may project it off the raw proposal, and a
         // badge/stub that trails the cursor instead of sitting on the point
@@ -1194,13 +1227,13 @@ impl Editor {
     ///    defining points are projected back onto the circle around the
     ///    pinned center instead.
     fn resolve_arcs_after_drag(&mut self, moved: &std::collections::HashSet<PointId>) {
-        let arcs: Vec<crate::core::document::Segment> = self
+        let arcs: Vec<(crate::core::ids::SegmentId, crate::core::document::Segment)> = self
             .doc
             .all_segments()
             .filter(|(_, s)| s.kind == crate::core::document::SegmentKind::Arc)
-            .map(|(_, s)| s)
+            .map(|(id, s)| (id, s))
             .collect();
-        for seg in arcs {
+        for (seg_id, seg) in arcs {
             let (Some(center_id), Some(ctrl_id)) = (seg.center, seg.ctrl) else {
                 continue;
             };
@@ -1220,6 +1253,8 @@ impl Editor {
             let center_constrained = self.doc.constraints.iter().any(|c| {
                 c.kind == ConstraintKind::Coincident
                     && (c.a == center_id || c.b == center_id)
+            }) || self.doc.dimensions.iter().any(|d| {
+                matches!(d.target, DimTarget::Radius { seg: sid } if sid == seg_id)
             });
             if moved.contains(&center_id) {
                 // Center is authoritative: rigid-translate the defining
@@ -1238,10 +1273,24 @@ impl Editor {
                 continue;
             }
             if center_constrained {
+                // The solver positioned ALL defining points: its circumcircle
+                // is authoritative — re-projecting onto a circle around the
+                // pinned center would clobber the solve (radius dims set to
+                // 30 landing back at the old 35). Trust the solve; the
+                // pinned center only anchors when points were moved by hand.
+                let locked_radius = self.doc.dimensions.iter().find_map(|d| match d.target {
+                    DimTarget::Radius { seg } if seg == seg_id => Some(d.value),
+                    _ => None,
+                });
+                if locked_radius.is_none() && moved.contains(&seg.start) && moved.contains(&seg.end) && moved.contains(&ctrl_id) {
+                    continue;
+                }
                 // Center pinned by a constraint: keep all defining points on
                 // the circle around it. Radius anchors to whichever defining
                 // point the user did NOT move.
-                let radius = if !moved.contains(&seg.start) {
+                let radius = if let Some(radius) = locked_radius {
+                    radius.abs()
+                } else if !moved.contains(&seg.start) {
                     pick::distance(center_now, a)
                 } else if !moved.contains(&seg.end) {
                     pick::distance(center_now, b)
@@ -1444,6 +1493,17 @@ impl Editor {
             return false;
         }
         let (pos, guides) = self.snap_creation_point(self.cursor_doc(cursor));
+        if self.tool == Tool::Line && self.shift {
+            if let Some(pending) = self.pending_line {
+                if let Some(at) = self.tangent_snap_for_line(pending.start, pos) {
+                    self.snap_guides.clear();
+                    let next = Some((at.x, at.y, true));
+                    let changed = self.creation_cursor != next;
+                    self.creation_cursor = next;
+                    return changed;
+                }
+            }
+        }
         // Apply the arc-tool shift constraints so the crosshair matches the
         // pending preview exactly; a sweep transform invalidates the raw
         // cursor's alignment guides (the arc IS the constraint now).
@@ -1477,19 +1537,82 @@ impl Editor {
         changed
     }
 
+    // -- settings (per design + app-wide last-used defaults) --
+
+    /// Writes the current view/snap settings as the app-wide defaults used
+    /// to seed NEW designs. Existing design files are never touched by this.
+    fn save_default_settings(
+        cx: &gpui::App,
+        settings: &crate::core::document::DocSettings,
+    ) {
+        if let Some(reg) = cx.try_global::<crate::persistence::registry::Registry>() {
+            reg.set_default_doc_settings(settings);
+        }
+    }
+
+    /// Persists one toggle: live editor field, the document's own settings
+    /// (autosaved with the design), and the app-wide last-used defaults.
+    fn apply_setting(
+        &mut self,
+        which: u8,
+        on: bool,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let changed = match which {
+            0 => self.show_grid != on,
+            1 => self.snap_to_grid != on,
+            _ => self.snap_to_objects != on,
+        };
+        if !changed {
+            return;
+        }
+        match which {
+            0 => self.show_grid = on,
+            1 => self.snap_to_grid = on,
+            _ => self.snap_to_objects = on,
+        }
+        self.doc.settings = crate::core::document::DocSettings {
+            show_grid: self.show_grid,
+            snap_to_grid: self.snap_to_grid,
+            snap_to_objects: self.snap_to_objects,
+        };
+        self.doc_gen += 1;
+        Self::save_default_settings(cx, &self.doc.settings);
+        cx.notify();
+    }
+
+    pub fn set_show_grid(&mut self, on: bool, cx: &mut gpui::Context<Self>) {
+        self.apply_setting(0, on, cx);
+    }
+
+    pub fn set_snap_to_grid(&mut self, on: bool, cx: &mut gpui::Context<Self>) {
+        self.apply_setting(1, on, cx);
+    }
+
+    pub fn set_snap_to_objects(&mut self, on: bool, cx: &mut gpui::Context<Self>) {
+        self.apply_setting(2, on, cx);
+    }
+
     // -- dimension tool --
 
     /// Resolves a pick sequence into a dimension target. ONE straight edge
     /// is already a complete dimension (its own length); ONE arc is a
     /// radius; two picks pair up smartly (parallel lines -> distance,
-    /// crossing lines -> angle, point+line -> point-line distance).
+    /// crossing lines -> angle, point+line -> point-line distance). The
+    /// Aligned/X/Y mode for point-pair dims is decided live by the cursor
+    /// during placement (dim_placement), not here.
     fn resolve_dim_target(&self, picks: &[DimPick]) -> Option<crate::core::constraints::DimTarget> {
-        use crate::core::constraints::DimTarget;
+        use crate::core::constraints::{DimMode, DimTarget};
         use crate::core::document::SegmentKind;
         let is_arc = |l: crate::core::ids::SegmentId| {
             self.doc
                 .segment(l)
                 .is_some_and(|s| s.kind == SegmentKind::Arc)
+        };
+        // An arc's circumcenter is a REAL document point — distance dims
+        // to an arc run to its center (Fusion-style), not to a chord.
+        let arc_center = |l: crate::core::ids::SegmentId| -> Option<PointId> {
+            self.doc.segment(l)?.center
         };
         match picks {
             // A single pick already completes for lines/arcs: an edge
@@ -1499,63 +1622,117 @@ impl Editor {
                     Some(DimTarget::Radius { seg: *l })
                 } else {
                     let seg = self.doc.segment(*l)?;
-                    Some(DimTarget::Points { a: seg.start, b: seg.end })
+                    Some(DimTarget::Points { a: seg.start, b: seg.end, mode: DimMode::Aligned })
                 }
             }
             [DimPick::Point(a), DimPick::Point(b)] => {
-                Some(DimTarget::Points { a: *a, b: *b })
+                Some(DimTarget::Points { a: *a, b: *b, mode: DimMode::Aligned })
             }
             [DimPick::Point(p), DimPick::Line(l)]
             | [DimPick::Line(l), DimPick::Point(p)] => {
                 if is_arc(*l) {
-                    Some(DimTarget::Radius { seg: *l })
+                    // Point + arc: distance from the point to the arc's
+                    // center (a radius dim would ignore the point).
+                    match arc_center(*l) {
+                        Some(c) => Some(DimTarget::Points { a: *p, b: c, mode: DimMode::Aligned }),
+                        None => Some(DimTarget::Radius { seg: *l }),
+                    }
                 } else {
                     Some(DimTarget::PointLine { p: *p, line: *l })
                 }
             }
             [DimPick::Line(a), DimPick::Line(b)] => {
+                if is_arc(*a) && is_arc(*b) {
+                    return None;
+                }
                 if is_arc(*a) {
-                    Some(DimTarget::Radius { seg: *a })
-                } else if is_arc(*b) {
-                    Some(DimTarget::Radius { seg: *b })
-                } else {
-                    let (ga, gb) = (self.doc.segment_geom(*a)?, self.doc.segment_geom(*b)?);
-                    let (u1, _) = dims::dim_axes(ga.1.x - ga.0.x, ga.1.y - ga.0.y);
-                    let (u2, _) = dims::dim_axes(gb.1.x - gb.0.x, gb.1.y - gb.0.y);
-                    let sin = u1.0 * u2.1 - u1.1 * u2.0;
-                    if sin.abs() < 1e-3 {
-                        Some(DimTarget::Lines { a: *a, b: *b })
-                    } else {
-                        Some(DimTarget::Angle { a: *a, b: *b })
+                    // Line + arc: perpendicular distance from the arc's
+                    // center to the line.
+                    match arc_center(*a) {
+                        Some(c) => return Some(DimTarget::PointLine { p: c, line: *b }),
+                        None => return Some(DimTarget::Radius { seg: *a }),
                     }
+                }
+                if is_arc(*b) {
+                    match arc_center(*b) {
+                        Some(c) => return Some(DimTarget::PointLine { p: c, line: *a }),
+                        None => return Some(DimTarget::Radius { seg: *b }),
+                    }
+                }
+                let (ga, gb) = (self.doc.segment_geom(*a)?, self.doc.segment_geom(*b)?);
+                let (u1, _) = dims::dim_axes(ga.1.x - ga.0.x, ga.1.y - ga.0.y);
+                let (u2, _) = dims::dim_axes(gb.1.x - gb.0.x, gb.1.y - gb.0.y);
+                let sin = u1.0 * u2.1 - u1.1 * u2.0;
+                if sin.abs() < 1e-3 {
+                    Some(DimTarget::Lines { a: *a, b: *b })
+                } else {
+                    Some(DimTarget::Angle { a: *a, b: *b })
                 }
             }
             _ => None,
         }
     }
 
-    /// Placement geometry (offset, slide, measured value) for a dimension
-    /// target from the current cursor position, in doc units. For angles
-    /// the offset is SIGNED: its side picks which supplementary sweep the
-    /// arc occupies.
+    /// Placement geometry for a dimension target from the current cursor
+    /// position: (mode, offset, slide, measured value), all in doc units.
+    /// For angles the offset is SIGNED: its side picks which supplementary
+    /// sweep the arc occupies. For point-pair dims the CURSOR DECIDES THE
+    /// SEMANTICS (Fusion-style): offset roughly perpendicular to the pair
+    /// -> aligned displacement; mostly horizontal -> X span; mostly
+    /// vertical -> Y span. The mode is part of the result — callers must
+    /// apply it via DimTarget::with_mode or it never reaches the render.
     fn dim_placement(
         &self,
         target: crate::core::constraints::DimTarget,
         cursor: Point2,
-    ) -> Option<(f64, f64, f64)> {
-        use crate::core::constraints::DimTarget;
+    ) -> Option<(crate::core::constraints::DimMode, f64, f64, f64)> {
+        use crate::core::constraints::{DimMode, DimTarget};
         Some(match target {
-            DimTarget::Points { a, b } => {
+            DimTarget::Points { a, b, .. } => {
                 let (pa, pb) = (self.doc.point(a)?, self.doc.point(b)?);
                 let (u, n) = dims::dim_axes(pb.x - pa.x, pb.y - pa.y);
                 let rel = (cursor.x - pa.x, cursor.y - pa.y);
                 let len = pick::distance(pa, pb);
-                (
-                    rel.0 * n.0 + rel.1 * n.1,
-                    // Container stays ON the dim line, between its ends.
-                    (rel.0 * u.0 + rel.1 * u.1).clamp(0., len),
-                    pick::distance(pa, pb),
-                )
+                let dx = pb.x - pa.x;
+                let dy = pb.y - pa.y;
+                // Mode from where the cursor sits relative to the pair.
+                let along = rel.0 * u.0 + rel.1 * u.1;
+                let perp = rel.0 * n.0 + rel.1 * n.1;
+                // Keep the three intent zones mutually intuitive.  The
+                // aligned rail is selected when the cursor is above/below
+                // the measured segment.  For axis dimensions, Fusion's
+                // convention is that the cursor's dominant *other* axis
+                // selects the span: vertical cursor travel means X, and
+                // horizontal cursor travel means Y.  The old comparison used
+                // rel.x for X and rel.y for Y, which made slanted spans feel
+                // backwards and caused mode flicker near the diagonals.
+                let mode = if perp.abs() > along.abs() {
+                    DimMode::Aligned
+                } else if rel.1.abs() >= rel.0.abs() {
+                    DimMode::X
+                } else {
+                    DimMode::Y
+                };
+                let (offset, slide, measured) = match mode {
+                    DimMode::Aligned => (
+                        perp,
+                        along.clamp(0., len),
+                        len,
+                    ),
+                    DimMode::X => (
+                        // Dim line rides horizontally at the cursor's height
+                        // above the pair; slide along the X span.
+                        rel.1,
+                        (rel.0 * dx.signum()).clamp(0., dx.abs()),
+                        dx.abs(),
+                    ),
+                    DimMode::Y => (
+                        rel.0,
+                        (rel.1 * dy.signum()).clamp(0., dy.abs()),
+                        dy.abs(),
+                    ),
+                };
+                (mode, offset, slide, measured)
             }
             DimTarget::PointLine { p, line } => {
                 let sp = self.doc.point(p)?;
@@ -1569,6 +1746,7 @@ impl Editor {
                 let measured = prel.0 * n.0 + prel.1 * n.1;
                 let len = pick::distance(la, lb);
                 (
+                    DimMode::Aligned,
                     rel.0 * n.0 + rel.1 * n.1,
                     (rel.0 * u.0 + rel.1 * u.1).clamp(0., len),
                     measured.abs(),
@@ -1582,6 +1760,7 @@ impl Editor {
                 let gap = (lb0.x - la.x) * n.0 + (lb0.y - la.y) * n.1;
                 let len = pick::distance(la, lb0) + 0.;
                 (
+                    DimMode::Aligned,
                     rel.0 * n.0 + rel.1 * n.1,
                     (rel.0 * u.0 + rel.1 * u.1).clamp(0., len),
                     gap.abs(),
@@ -1592,7 +1771,12 @@ impl Editor {
                     dims::dim_angle_geometry(self, a, b, Some(cursor), 0., 0., 0.)?;
                 let _ = (v, _da);
                 // measured = SIGNED sweep in degrees; offset = plain radius.
-                (r, frac, sweep * 180.0 / std::f64::consts::PI)
+                (
+                    DimMode::Aligned,
+                    r,
+                    frac,
+                    sweep * 180.0 / std::f64::consts::PI,
+                )
             }
             DimTarget::Radius { seg } => {
                 let Some(seg_d) = self.doc.segment(seg) else {
@@ -1616,7 +1800,7 @@ impl Editor {
                 } else {
                     1.0
                 };
-                (r, frac, r)
+                (DimMode::Aligned, r, frac, r)
             }
         })
     }
@@ -1637,6 +1821,7 @@ impl Editor {
                 // Angle dims: value carries the SIGNED sweep (degrees) -
                 // typing replaces the magnitude, keeping the placed side.
                 let is_angle = matches!(input.target, DimTarget::Angle { .. });
+                let old_existing_value = input.existing.and_then(|idx| self.doc.dimensions.get(idx).map(|d| d.value));
                 let typed = input.buffer.parse::<f64>().ok();
                 let value = if is_angle {
                     let mag = typed.map(|t| t.abs()).unwrap_or(input.measured.abs());
@@ -1673,12 +1858,17 @@ impl Editor {
                 if applied {
                     return true;
                 }
-                // Over-constrained: the whole attempt cancels out - the
-                // modal explains why and nothing lingers on screen.
-                self.dim_picks.clear();
-                self.dim_target = None;
-                self.selection.clear();
-                self.set_tool(Tool::Move);
+                // Keep the editor alive when a typed value cannot be solved.
+                // Previously this branch cleared the pending input and
+                // switched to Move, making a failed typed slanted dimension
+                // look like the Enter key deleted it. Restore an existing
+                // value and leave the input visible so the user can correct
+                // the number or cancel explicitly with Esc.
+                if let (Some(idx), Some(old)) = (input.existing, old_existing_value) {
+                    if let Some(dim) = self.doc.dimensions.get_mut(idx) { dim.value = old; }
+                }
+                self.overconstrained = true;
+                self.dim_input = Some(input);
                 true
             }
             "escape" => {
@@ -1741,7 +1931,7 @@ impl Editor {
         // geometry through segments and constraints — soft-anchored at
         // their current positions so the deformation is minimal.
         let mut seeds: Vec<PointId> = match target {
-            crate::core::constraints::DimTarget::Points { a, b } => vec![a, b],
+            crate::core::constraints::DimTarget::Points { a, b, .. } => vec![a, b],
             crate::core::constraints::DimTarget::PointLine { p, line } => {
                 let mut v = vec![p];
                 if let Some(seg) = trial.segment(line) {
@@ -1766,6 +1956,9 @@ impl Editor {
                     v.push(seg.start);
                     v.push(seg.end);
                     if let Some(c) = seg.ctrl {
+                        v.push(c);
+                    }
+                    if let Some(c) = seg.center {
                         v.push(c);
                     }
                 }
@@ -1806,15 +1999,32 @@ impl Editor {
             .iter()
             .filter_map(|&pid| trial.point(pid).map(|p| (pid, p)))
             .collect();
+        // TOP-LEFT ANCHOR: the reshape pivots around the component's
+        // topmost-then-leftmost point, which stays HARD-FIXED. A rectangle
+        // height edit (100 -> 50) keeps the top edge where it is and pulls
+        // the bottom edge up the full 50, instead of both edges converging
+        // 25 apiece. "Everything shifts toward the top-left."
+        let pins: Vec<(PointId, Point2)> = aux
+            .iter()
+            .copied()
+            .min_by(|a, b| {
+                (a.1.y, a.1.x)
+                    .partial_cmp(&(b.1.y, b.1.x))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .into_iter()
+            .collect();
         // STRONG-but-soft anchors: the freed component deforms minimally.
         // The weight ratio vs DIM_WEIGHT (1e6) sets the equilibrium
         // residual: sqrt(2/1e6) * displacement — tiny at 2.0, but ~10% of
         // displacement at 1e4, which false-triggered the over-constrained
         // modal on ordinary rectangle dimensions.
         let solver =
-            crate::core::solver::Solver::build_with_anchor(&trial, &[], &aux, 2.0);
+            crate::core::solver::Solver::build_pinned(&trial, &[], &aux, &pins, 2.0);
         let solution = solver.solve();
-        if solution.max_lin_residual > 0.5 || solution.max_angle_residual > 0.02 {
+        let direct_distance = matches!(target,
+            crate::core::constraints::DimTarget::Points { mode: crate::core::constraints::DimMode::Aligned, .. });
+        if (!direct_distance && solution.max_lin_residual > 0.5) || solution.max_angle_residual > 0.02 {
             self.overconstrained = true;
             return false;
         }
@@ -1825,9 +2035,105 @@ impl Editor {
             moved.insert(id);
             self.doc.move_point(id, pos);
         }
-        self.resolve_arcs_after_drag(&moved);
+        // Arc consistency is part of the solve graph now.
+        if direct_distance {
+            self.enforce_point_distance_exact(target);
+        }
+        // The numerical radius equation is intentionally backed by an exact
+        // geometric pass.  A circumradius has a very shallow gradient near a
+        // semicircle, so least-squares can leave a visible 0.1px residue and
+        // let the stored center drift.  Scale the defining points about the
+        // arc center once the solve has chosen the deformation, then write
+        // the center back to the exact circumcenter.
+        if let crate::core::constraints::DimTarget::Radius { seg } = target {
+            self.enforce_arc_radius_exact(seg);
+        }
         self.flush_pending_history();
         true
+    }
+
+    fn enforce_point_distance_exact(&mut self, target: crate::core::constraints::DimTarget) {
+        let crate::core::constraints::DimTarget::Points { a, b, .. } = target else { return; };
+        let (Some(pa), Some(pb)) = (self.doc.point(a), self.doc.point(b)) else { return; };
+        let dx = pb.x - pa.x; let dy = pb.y - pa.y;
+        let len = (dx * dx + dy * dy).sqrt();
+        let (ux, uy) = if len > 1e-9 { (dx / len, dy / len) } else { (1.0, 0.0) };
+        let value = self.doc.dimensions.iter().rev().find_map(|d| match d.target {
+            crate::core::constraints::DimTarget::Points { a: da, b: db, mode: crate::core::constraints::DimMode::Aligned }
+                if da == a && db == b => Some(d.value.abs()),
+            _ => None,
+        }).unwrap_or(len);
+        self.doc.move_point(b, crate::core::geometry::Point2::new(pa.x + ux * value, pa.y + uy * value));
+    }
+
+    fn enforce_arc_radius_exact(&mut self, sid: crate::core::ids::SegmentId) {
+        let Some(seg) = self.doc.segment(sid) else { return };
+        let (Some(aid), Some(bid), Some(cid), Some(oid)) =
+            (Some(seg.start), Some(seg.end), seg.ctrl, seg.center) else { return };
+        let (Some(a), Some(b), Some(c), Some(center)) =
+            (self.doc.point(aid), self.doc.point(bid), self.doc.point(cid), self.doc.point(oid))
+        else { return };
+        let Some(dim) = self.doc.dimensions.iter().find(|d|
+            matches!(d.target, crate::core::constraints::DimTarget::Radius { seg: s } if s == sid))
+        else { return };
+        let Some((circumcenter, radius)) = crate::editor::arc::circumcircle(a, b, c) else { return };
+        if radius <= 1e-9 || dim.value <= 0. { return; }
+        let scale = dim.value / radius;
+        for (id, p) in [(aid, a), (bid, b), (cid, c)] {
+            self.doc.move_point(id, Point2::new(
+                circumcenter.x + (p.x - circumcenter.x) * scale,
+                circumcenter.y + (p.y - circumcenter.y) * scale,
+            ));
+        }
+        self.doc.move_point(oid, circumcenter);
+        // Recompute from the scaled points so the center is exact even when
+        // the original solver residual was large.
+        if let (Some(a), Some(b), Some(c)) =
+            (self.doc.point(aid), self.doc.point(bid), self.doc.point(cid))
+            && let Some((o, _)) = crate::editor::arc::circumcircle(a, b, c)
+        {
+            self.doc.move_point(oid, o);
+        }
+        let _ = center;
+    }
+
+    /// Projects the free end of each tangent line onto the exact tangent at
+    /// the stored arc contact. This keeps the relationship exact after
+    /// radius edits and ordinary point drags without asking the solver to
+    /// optimize a poorly conditioned circle/line equation.
+    fn enforce_tangencies(&mut self) {
+        let constraints = self.doc.constraints.clone();
+        for c in constraints {
+            if c.kind != ConstraintKind::Tangent { continue; }
+            let (line_id, arc_id) = c.tangent_segments.unwrap_or_else(|| {
+                let mut line = None;
+                let mut arc = None;
+                for (sid, s) in self.doc.all_segments() {
+                    if s.start != c.a && s.end != c.a { continue; }
+                    if s.kind == crate::core::document::SegmentKind::Line { line = Some(sid); }
+                    if s.kind == crate::core::document::SegmentKind::Arc { arc = Some(sid); }
+                }
+                (line.unwrap_or(crate::core::ids::SegmentId { idx: u32::MAX, generation: 0 }),
+                 arc.unwrap_or(crate::core::ids::SegmentId { idx: u32::MAX, generation: 0 }))
+            });
+            let (Some(line), Some(arc)) = (self.doc.segment(line_id), self.doc.segment(arc_id)) else { continue; };
+            let (Some(a), Some(b), Some(ctrl)) = (
+                self.doc.point(arc.start), self.doc.point(arc.end),
+                arc.ctrl.and_then(|id| self.doc.point(id))) else { continue; };
+            let Some((o, _)) = crate::editor::arc::circumcircle(a, b, ctrl) else { continue; };
+            let contact = if line.start == c.a { line.start } else if line.end == c.a { line.end } else { continue };
+            let Some(cp) = self.doc.point(contact) else { continue; };
+            let (other, Some(op)) = (if line.start == contact {
+                (line.end, self.doc.point(line.end))
+            } else { (line.start, self.doc.point(line.start)) }) else { continue };
+            let rx = cp.x - o.x; let ry = cp.y - o.y;
+            let rl = (rx * rx + ry * ry).sqrt();
+            let ll = ((op.x - cp.x).powi(2) + (op.y - cp.y).powi(2)).sqrt();
+            if rl < 1e-9 || ll < 1e-9 { continue; }
+            let tx = -ry / rl; let ty = rx / rl;
+            let sign = ((op.x - cp.x) * tx + (op.y - cp.y) * ty).signum();
+            self.doc.move_point(other, Point2::new(cp.x + tx * sign * ll, cp.y + ty * sign * ll));
+        }
     }
 
     /// Opens the value input for an already-placed dimension (second tap or
@@ -1868,16 +2174,33 @@ impl Editor {
             return;
         };
         match dim.target {
-            DimTarget::Points { a, b } => {
+            DimTarget::Points { a, b, mode } => {
                 let (Some(pa), Some(pb)) = (self.doc.point(a), self.doc.point(b)) else {
                     return;
                 };
                 let (u, n) = dims::dim_axes(pb.x - pa.x, pb.y - pa.y);
                 let rel = (cur.x - pa.x, cur.y - pa.y);
                 let len = pick::distance(pa, pb);
+                let dx = pb.x - pa.x;
+                let dy = pb.y - pa.y;
                 let dim = &mut self.doc.dimensions[idx];
-                dim.offset = rel.0 * n.0 + rel.1 * n.1;
-                dim.slide = (rel.0 * u.0 + rel.1 * u.1).clamp(0., len);
+                // The stored mode is kept on drag (flipping modes of a live
+                // constraint would re-solve the geometry mid-gesture); the
+                // placement follows the cursor within that mode's frame.
+                match mode {
+                    crate::core::constraints::DimMode::Aligned => {
+                        dim.offset = rel.0 * n.0 + rel.1 * n.1;
+                        dim.slide = (rel.0 * u.0 + rel.1 * u.1).clamp(0., len);
+                    }
+                    crate::core::constraints::DimMode::X => {
+                        dim.offset = rel.1;
+                        dim.slide = (rel.0 * dx.signum()).clamp(0., dx.abs());
+                    }
+                    crate::core::constraints::DimMode::Y => {
+                        dim.offset = rel.0;
+                        dim.slide = (rel.1 * dy.signum()).clamp(0., dy.abs());
+                    }
+                }
             }
             DimTarget::PointLine { line, .. } => {
                 let Some((la, lb)) = self.doc.segment_geom(line) else {
@@ -2029,7 +2352,10 @@ impl Editor {
         // cursor never moved (a true click); any real drag commits on
         // release. Only the no-motion case waits for the next click.
         if let Some(pending) = self.pending_line.take() {
-            let (_, b) = pending.snapped(shift);
+            let (_, mut b) = pending.snapped(shift);
+            if shift {
+                if let Some(q) = self.tangent_snap_for_line(pending.start, pending.cursor) { b = q; }
+            }
             if self.pending_via_click && pick::distance(b, pending.start) <= 1e-6 {
                 self.pending_line = Some(pending);
                 return true;
@@ -2040,6 +2366,9 @@ impl Editor {
             if pick::distance(b, pending.start) > 1e-6 {
                 let layer_id = self.doc.layers[0].id;
                 let seg = self.create_line(layer_id, pending.start, b);
+                if shift {
+                    self.maybe_add_tangent(seg, b);
+                }
                 self.selection = vec![ElementRef::Segment(seg)];
             }
             return true;
@@ -2085,6 +2414,96 @@ impl Editor {
             self.selection = vec![ElementRef::Fill(fill)];
         }
         true
+    }
+
+    fn maybe_add_tangent(&mut self, line: crate::core::ids::SegmentId, contact: Point2) {
+        let Some(line_seg) = self.doc.segment(line) else { return; };
+        let arcs: Vec<_> = self.doc.all_segments()
+            .filter(|(_, s)| s.kind == crate::core::document::SegmentKind::Arc)
+            .map(|(id, s)| (id, s))
+            .collect();
+        for (arc_id, arc) in arcs {
+            let (Some(a), Some(b), Some(ctrl), Some(lp_start), Some(lp_end)) = (
+                self.doc.point(arc.start), self.doc.point(arc.end),
+                arc.ctrl.and_then(|id| self.doc.point(id)),
+                self.doc.point(line_seg.start), self.doc.point(line_seg.end),
+            ) else { continue };
+            let Some((o, r)) = crate::editor::arc::circumcircle(a, b, ctrl) else { continue };
+            let on_circle = |p: Point2| {
+                let dx = p.x - o.x; let dy = p.y - o.y;
+                let d = (dx * dx + dy * dy).sqrt();
+                d > 1e-9 && (d - r).abs() <= self.snap_tol_doc() * 1.5
+            };
+            let point = if on_circle(lp_start) {
+                Some(line_seg.start)
+            } else if on_circle(lp_end) {
+                Some(line_seg.end)
+            } else { None };
+            if let Some(point) = point {
+                self.doc.add_tangent_constraint(line, arc_id, point);
+                // At an arc endpoint the new line has a separate point id;
+                // bond it to the arc endpoint so later radius edits carry
+                // the tangent contact along with the arc.
+                let endpoint = [arc.start, arc.end].into_iter()
+                    .min_by(|x, y| {
+                        let anchor = self.doc.point(point).unwrap_or(contact);
+                        let px = self.doc.point(*x).unwrap_or(anchor);
+                        let py = self.doc.point(*y).unwrap_or(anchor);
+                        pick::distance(px, anchor).partial_cmp(&pick::distance(py, anchor)).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                if let Some(endpoint) = endpoint
+                    && self.doc.point(point).zip(self.doc.point(endpoint)).is_some_and(|(p, e)| pick::distance(p, e) <= self.snap_tol_doc() * 1.5)
+                    && endpoint != point
+                {
+                    self.doc.add_constraint(ConstraintKind::Coincident, point, endpoint);
+                }
+                return;
+            }
+        }
+    }
+
+    pub(crate) fn tangent_snap_for_line(&self, start: Point2, cursor: Point2) -> Option<Point2> {
+        let mut best: Option<(f64, Point2)> = None;
+        for (_, arc) in self.doc.all_segments().filter(|(_, s)| s.kind == crate::core::document::SegmentKind::Arc) {
+            let (Some(a), Some(b), Some(ctrl)) = (self.doc.point(arc.start), self.doc.point(arc.end), arc.ctrl.and_then(|id| self.doc.point(id))) else { continue };
+            let Some((o, r)) = crate::editor::arc::circumcircle(a, b, ctrl) else { continue };
+            let wx = start.x - o.x; let wy = start.y - o.y;
+            let d = (wx * wx + wy * wy).sqrt();
+            // If the line starts on the arc, there is one tangent direction
+            // at that point. The old external-tangent construction rejected
+            // this exact endpoint case, which is the common CAD workflow.
+            if (d - r).abs() <= self.snap_tol_doc() {
+                let ux = -wy / d; let uy = wx / d;
+                let length = pick::distance(start, cursor).max(self.snap_tol_doc());
+                for side in [-1.0, 1.0] {
+                    let q = Point2::new(start.x + ux * length * side, start.y + uy * length * side);
+                    let score = pick::distance(q, cursor);
+                    // Once Shift is held on a point already on an arc, the
+                    // tangent is the primary direction lock—not the generic
+                    // 45-degree line snap. Pick the nearer of the two rays
+                    // without requiring pixel-perfect mouse placement.
+                    if best.map_or(true, |(s, _)| score < s) {
+                        best = Some((score, q));
+                    }
+                }
+                continue;
+            }
+            if d < r { continue; }
+            let ux = wx / d; let uy = wy / d;
+            let alpha = -r * r / d;
+            let beta = (r * r - alpha * alpha).sqrt();
+            for side in [-1.0, 1.0] {
+                let q = Point2::new(o.x + ux * alpha - uy * beta * side, o.y + uy * alpha + ux * beta * side);
+                let score = pick::distance(q, cursor);
+                let on_arc = crate::editor::arc::samples_through(a, b, ctrl, 96)
+                    .iter().map(|p| pick::distance(*p, q)).fold(f64::INFINITY, f64::min)
+                    <= (r / 96.0).max(self.snap_tol_doc());
+                if on_arc && score <= self.snap_tol_doc() * 2.0 && best.map_or(true, |(s, _)| score < s) {
+                    best = Some((score, q));
+                }
+            }
+        }
+        best.map(|(_, q)| q)
     }
 
     // -- object creation --
@@ -2212,8 +2631,6 @@ impl Editor {
                         _DT::Lines { a, b } | _DT::Angle { a, b } => *a != s && *b != s,
                         _DT::Points { .. } => true,
                     });
-                // Standalone endpoints die with their segment: once nothing
-                // else references an endpoint, remove it too.
                 let ends: Vec<PointId> = self
                     .doc
                     .segment(s)
@@ -2235,7 +2652,7 @@ impl Editor {
                         || self.doc.dimensions.iter().any(|d| {
                             matches!(
                                 d.target,
-                                crate::core::constraints::DimTarget::Points { a, b }
+                                crate::core::constraints::DimTarget::Points { a, b, .. }
                                     if a == pid || b == pid
                             ) || matches!(
                                 d.target,
@@ -2266,7 +2683,7 @@ impl Editor {
                     .map(|(pid, _)| pid)
                     .collect();
                 self.doc.dimensions.retain(|d| match &d.target {
-                    crate::core::constraints::DimTarget::Points { a, b } => {
+                    crate::core::constraints::DimTarget::Points { a, b, .. } => {
                         !(segless.contains(a) && segless.contains(b))
                     }
                     _ => true,

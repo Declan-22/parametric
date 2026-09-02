@@ -50,7 +50,7 @@ impl RenderOnce for HomeView {
             .h(px(32.))
             .rounded(px(8.))
             .cursor_pointer()
-            .border_1()
+            .border_2()
             .border_color(rgb(t.accent_border))
             .shadow(vec![t.shadow_sm()])
             // High-contrast action button; hover fades it to 80% opacity.

@@ -136,4 +136,23 @@ impl Registry {
             rusqlite::params![key, value],
         );
     }
+
+    // -- last-used view/snap defaults for NEW designs --
+
+    pub fn default_doc_settings(&self) -> Option<crate::core::document::DocSettings> {
+        let read = |key: &str| -> Option<bool> {
+            self.pref_get(key).map(|v| v == "1")
+        };
+        // Present only once the user has toggled something at least once.
+        let show_grid = read("settings.show_grid")?;
+        let snap_to_grid = read("settings.snap_grid")?;
+        let snap_to_objects = read("settings.snap_objects")?;
+        Some(crate::core::document::DocSettings { show_grid, snap_to_grid, snap_to_objects })
+    }
+
+    pub fn set_default_doc_settings(&self, s: &crate::core::document::DocSettings) {
+        self.pref_set("settings.show_grid", if s.show_grid { "1" } else { "0" });
+        self.pref_set("settings.snap_grid", if s.snap_to_grid { "1" } else { "0" });
+        self.pref_set("settings.snap_objects", if s.snap_to_objects { "1" } else { "0" });
+    }
 }

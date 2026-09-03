@@ -743,7 +743,15 @@ fn update_constraint_markers(ed: &mut Editor) {
         };
         let has_own_edge = ed.doc.all_segments().any(|(_, s)| is_edge_pair(s));
         let mid = (((ma.x + mb.x) / 2.) as f32, ((ma.y + mb.y) / 2.) as f32);
-        let (cx, cy) = if coincident_pt {
+        let (cx, cy) = if c.kind == crate::core::constraints::ConstraintKind::Parallel
+            && let Some((first, second)) = c.tangent_segments
+            && let (Some((fa, fb)), Some((sa, sb))) = (ed.doc.segment_geom(first), ed.doc.segment_geom(second))
+        {
+            let fm = ed.camera.unit_to_screen(Point2::new((fa.x + fb.x) / 2., (fa.y + fb.y) / 2.));
+            let sm = ed.camera.unit_to_screen(Point2::new((sa.x + sb.x) / 2., (sa.y + sb.y) / 2.));
+            guide = Some([fm.x as f32, fm.y as f32, sm.x as f32, sm.y as f32]);
+            (((fm.x + sm.x) / 2.) as f32, ((fm.y + sm.y) / 2.) as f32)
+        } else if coincident_pt {
             // Point constraint: hover above the junction, clear of the dot.
             (mid.0, mid.1 - HANDLE_R - 2. - CHIP_ABOVE_PX)
         } else if has_own_edge {
@@ -829,16 +837,34 @@ fn update_constraint_markers(ed: &mut Editor) {
     // Multiple constraints attached to one point share a single horizontal
     // chip row. The previous placement gave every chip the same point-based
     // anchor, so the overlay stacked vertically and obscured itself.
-    let mut groups: std::collections::HashMap<PointId, Vec<usize>> = std::collections::HashMap::new();
+    let mut groups: Vec<Vec<usize>> = Vec::new();
     for (i, marker) in ed.constraint_markers.iter().enumerate() {
-        // Only point-attached chips share an anchor. Edge constraints such as
-        // horizontal/vertical use the center of their own edge and must not
-        // be pulled beside an unrelated chip at the first endpoint.
-        if marker.constraint.a == marker.constraint.b {
-            groups.entry(marker.constraint.a).or_default().push(i);
+        // Group only chips that are physically attached to the same anchor.
+        // Sharing an endpoint is not sufficient: adjacent rectangle edges
+        // share corners but their H/V chips belong on their own edge. Point
+        // constraints use the same screen anchor; duplicate constraints on
+        // one exact edge may share its edge midpoint.
+        if let Some(group) = groups.iter_mut().find(|group| {
+            let first = &ed.constraint_markers[group[0]];
+            let first_point = first.constraint.a == first.constraint.b
+                || first.constraint.kind == crate::core::constraints::ConstraintKind::Coincident;
+            let marker_point = marker.constraint.a == marker.constraint.b
+                || marker.constraint.kind == crate::core::constraints::ConstraintKind::Coincident;
+            let same_point = first_point && marker_point
+                && (first.cx_out - marker.cx_out).abs() < 1.0
+                && (first.cy_out - marker.cy_out).abs() < 1.0;
+            let same_edge = first.constraint.tangent_segments.is_none()
+                && marker.constraint.tangent_segments.is_none()
+                && ((first.constraint.a == marker.constraint.a && first.constraint.b == marker.constraint.b)
+                    || (first.constraint.a == marker.constraint.b && first.constraint.b == marker.constraint.a));
+            same_point || same_edge
+        }) {
+            group.push(i);
+        } else {
+            groups.push(vec![i]);
         }
     }
-    for indices in groups.values() {
+    for indices in &groups {
         if indices.len() < 2 { continue; }
         let base_x = indices.iter().map(|&i| ed.constraint_markers[i].cx_out).sum::<f32>()
             / indices.len() as f32;

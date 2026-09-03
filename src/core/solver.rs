@@ -72,6 +72,8 @@ enum Eq {
     // fraction of a pixel.
     ArcSide { s: usize, e: usize, c: usize, side: f64 },
     Tangent { l1: usize, l2: usize, o: usize, p: usize },
+    CirclePoint { p: usize, o: usize, radius: f64 },
+    Parallel { a1: usize, a2: usize, b1: usize, b2: usize },
 }
 
 // A residual evaluated at one iterate: value plus sparse gradient over
@@ -148,6 +150,12 @@ impl Solver {
                 ConstraintKind::Coincident => {
                     eqs.push(Eq::Horizontal { a, b });
                     eqs.push(Eq::Vertical { a, b });
+                    if let Some(sid) = c.point_on_segment
+                        && let Some(seg) = doc.segment(sid)
+                        && let (Some(l1), Some(l2)) = (slot_of(seg.start), slot_of(seg.end))
+                    {
+                        eqs.push(Eq::PointLineDist { p: b, l1, l2, target: 0.0 });
+                    }
                 }
                 ConstraintKind::Tangent => {
                     let inferred = || {
@@ -164,6 +172,21 @@ impl Solver {
                     let (Some(l1), Some(l2), Some(o), Some(p)) = (
                         slot_of(line.start), slot_of(line.end), arc.center.and_then(|id| slot_of(id)), slot_of(c.a)) else { continue };
                     eqs.push(Eq::Tangent { l1, l2, o, p });
+                    if let (Some(center_id), Some(contact)) = (arc.center, doc.point(c.a))
+                        && let Some(center) = doc.point(center_id)
+                    {
+                        let radius = ((contact.x - center.x).powi(2) + (contact.y - center.y).powi(2)).sqrt();
+                        if radius > 1e-9 {
+                            eqs.push(Eq::CirclePoint { p, o, radius });
+                        }
+                    }
+                }
+                ConstraintKind::Parallel => {
+                    let Some((first, second)) = c.tangent_segments else { continue };
+                    let (Some(a_seg), Some(b_seg)) = (doc.segment(first), doc.segment(second)) else { continue };
+                    let (Some(a1), Some(a2), Some(b1), Some(b2)) = (
+                        slot_of(a_seg.start), slot_of(a_seg.end), slot_of(b_seg.start), slot_of(b_seg.end)) else { continue };
+                    eqs.push(Eq::Parallel { a1, a2, b1, b2 });
                 }
             }
         }
@@ -722,6 +745,33 @@ impl Solver {
                     if let Some(v) = self.free_of[p] { grad.push((v * 2, vx)); grad.push((v * 2 + 1, vy)); }
                     out.push(Residual { value: vx * rx + vy * ry, grad, weight: EQ_WEIGHT });
                 }
+                Eq::CirclePoint { p, o, radius } => {
+                    let (point, center) = (self.pos(p, x), self.pos(o, x));
+                    let dx = point.x - center.x;
+                    let dy = point.y - center.y;
+                    let length = (dx * dx + dy * dy).sqrt().max(1e-9);
+                    let mut grad = Vec::new();
+                    if let Some(v) = self.free_of[p] {
+                        grad.push((v * 2, dx / length));
+                        grad.push((v * 2 + 1, dy / length));
+                    }
+                    if let Some(v) = self.free_of[o] {
+                        grad.push((v * 2, -dx / length));
+                        grad.push((v * 2 + 1, -dy / length));
+                    }
+                    out.push(Residual { value: length - radius, grad, weight: EQ_WEIGHT });
+                }
+                Eq::Parallel { a1, a2, b1, b2 } => {
+                    let (a, b, c, d) = (self.pos(a1, x), self.pos(a2, x), self.pos(b1, x), self.pos(b2, x));
+                    let ux = b.x - a.x; let uy = b.y - a.y;
+                    let vx = d.x - c.x; let vy = d.y - c.y;
+                    let mut grad = Vec::new();
+                    if let Some(i) = self.free_of[a1] { grad.push((i * 2, vy)); grad.push((i * 2 + 1, -vx)); }
+                    if let Some(i) = self.free_of[a2] { grad.push((i * 2, -vy)); grad.push((i * 2 + 1, vx)); }
+                    if let Some(i) = self.free_of[b1] { grad.push((i * 2, -uy)); grad.push((i * 2 + 1, ux)); }
+                    if let Some(i) = self.free_of[b2] { grad.push((i * 2, uy)); grad.push((i * 2 + 1, -ux)); }
+                    out.push(Residual { value: ux * vy - uy * vx, grad, weight: EQ_WEIGHT });
+                }
                 Eq::ArcRadius { s, e, c, target } => {
                     let (ps, pe, pc) = (self.pos(s, x), self.pos(e, x), self.pos(c, x));
                     // Chord geometry: half-length m, bend height h (signed
@@ -976,6 +1026,17 @@ impl Solver {
                     let v = ((b.x - a.x) * (contact.x - center.x)
                         + (b.y - a.y) * (contact.y - center.y)).abs();
                     lin = lin.max(v);
+                    continue;
+                }
+                Eq::CirclePoint { p, o, radius } => {
+                    let point = self.pos(p, x);
+                    let center = self.pos(o, x);
+                    lin = lin.max((((point.x - center.x).powi(2) + (point.y - center.y).powi(2)).sqrt() - radius.abs()).abs());
+                    continue;
+                }
+                Eq::Parallel { a1, a2, b1, b2 } => {
+                    let (a, b, c, d) = (self.pos(a1, x), self.pos(a2, x), self.pos(b1, x), self.pos(b2, x));
+                    lin = lin.max(((b.x - a.x) * (d.y - c.y) - (b.y - a.y) * (d.x - c.x)).abs());
                     continue;
                 }
                 Eq::ArcRadius { s, e, c, target } => {

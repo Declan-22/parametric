@@ -20,6 +20,8 @@ pub enum ConstraintKind {
     Vertical,
     // A line and circular arc share a tangent direction at `point`.
     Tangent,
+    // Two straight line segments have parallel directions.
+    Parallel,
 }
 
 impl ConstraintKind {
@@ -29,6 +31,7 @@ impl ConstraintKind {
             ConstraintKind::Horizontal => "horizontal",
             ConstraintKind::Vertical => "vertical",
             ConstraintKind::Tangent => "tangent",
+            ConstraintKind::Parallel => "parallel",
         }
     }
 }
@@ -42,6 +45,9 @@ pub struct Constraint {
     // point; the point pair above remains useful for chip ownership and for
     // backwards-compatible persistence of the older constraints.
     pub tangent_segments: Option<(SegmentId, SegmentId)>,
+    // For a Coincident point-to-edge constraint, `a` is the point and this
+    // identifies the edge it must remain on.
+    pub point_on_segment: Option<SegmentId>,
 }
 
 // One stored dimension — the tool-created measurement constraint. Always

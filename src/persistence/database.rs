@@ -5,7 +5,7 @@ use crate::core::document::{DocSettings, Document, Layer, SegmentKind};
 use crate::core::geometry::Point2;
 use crate::core::ids::{FillId, PointId, SegmentId};
 
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 pub struct Database {
     conn: Connection,
@@ -39,7 +39,7 @@ impl Database {
         )?;
         // v3 was a full break from the shape-based model; v4 added segment
         // stroke widths. Old databases don't migrate — dropped and rebuilt.
-        if self.schema_version()? < 6 {
+        if self.schema_version()? < 7 {
             self.conn.execute_batch(
                 "DROP TABLE IF EXISTS shapes;
                  DROP TABLE IF EXISTS constraints;
@@ -97,7 +97,11 @@ impl Database {
                 p1_idx INTEGER NOT NULL,
                 p1_gen INTEGER NOT NULL,
                 p2_idx INTEGER NOT NULL,
-                p2_gen INTEGER NOT NULL
+                p2_gen INTEGER NOT NULL,
+                s1_idx INTEGER,
+                s1_gen INTEGER,
+                s2_idx INTEGER,
+                s2_gen INTEGER
             );
             CREATE TABLE IF NOT EXISTS dimensions (
                 id INTEGER PRIMARY KEY,
@@ -245,14 +249,18 @@ impl Database {
             }
             for c in &doc.constraints {
                 self.conn.execute(
-                    "INSERT INTO constraints(kind, p1_idx, p1_gen, p2_idx, p2_gen)
-                     VALUES(?1, ?2, ?3, ?4, ?5)",
+                    "INSERT INTO constraints(kind, p1_idx, p1_gen, p2_idx, p2_gen, s1_idx, s1_gen, s2_idx, s2_gen)
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     rusqlite::params![
                         c.kind.as_str(),
                         c.a.idx as i64,
                         c.a.generation as i64,
                         c.b.idx as i64,
-                        c.b.generation as i64
+                        c.b.generation as i64,
+                        c.tangent_segments.map(|s| s.0.idx as i64),
+                        c.tangent_segments.map(|s| s.0.generation as i64),
+                        c.tangent_segments.map(|s| s.1.idx as i64),
+                        c.tangent_segments.map(|s| s.1.generation as i64)
                     ],
                 )?;
             }
@@ -461,7 +469,7 @@ impl Database {
         insert_fills_raw(&mut doc, fills);
 
         let mut stmt = self.conn.prepare(
-            "SELECT kind, p1_idx, p1_gen, p2_idx, p2_gen FROM constraints",
+            "SELECT kind, p1_idx, p1_gen, p2_idx, p2_gen, s1_idx, s1_gen, s2_idx, s2_gen FROM constraints",
         )?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
@@ -471,7 +479,18 @@ impl Database {
                 "horizontal" => ConstraintKind::Horizontal,
                 "vertical" => ConstraintKind::Vertical,
                 "tangent" => ConstraintKind::Tangent,
+                "parallel" => ConstraintKind::Parallel,
                 _ => continue,
+            };
+            let segments = match (
+                row.get::<_, Option<i64>>(5)?, row.get::<_, Option<i64>>(6)?,
+                row.get::<_, Option<i64>>(7)?, row.get::<_, Option<i64>>(8)?,
+            ) {
+                (Some(i1), Some(g1), Some(i2), Some(g2)) => Some((
+                    SegmentId { idx: i1 as u32, generation: g1 as u32 },
+                    SegmentId { idx: i2 as u32, generation: g2 as u32 },
+                )),
+                _ => None,
             };
             add_constraint_raw(
                 &mut doc,
@@ -484,6 +503,7 @@ impl Database {
                     idx: row.get::<_, i64>(3)? as u32,
                     generation: row.get::<_, i64>(4)? as u32,
                 },
+                segments,
             );
         }
         drop(rows);
@@ -626,8 +646,8 @@ fn insert_fills_raw(doc: &mut Document, fills: Vec<(u32, u32, Vec<SegmentId>)>) 
     }
 }
 
-fn add_constraint_raw(doc: &mut Document, kind: ConstraintKind, a: PointId, b: PointId) {
-    doc.constraints.push(crate::core::constraints::Constraint { kind, a, b, tangent_segments: None });
+fn add_constraint_raw(doc: &mut Document, kind: ConstraintKind, a: PointId, b: PointId, segments: Option<(SegmentId, SegmentId)>) {
+    doc.constraints.push(crate::core::constraints::Constraint { kind, a, b, tangent_segments: segments, point_on_segment: None });
 }
 
 fn add_dimension_raw(doc: &mut Document, dim: Dimension) {

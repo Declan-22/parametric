@@ -5,6 +5,9 @@ use gpui::{
 use crate::editor::Tool;
 use crate::theme::Theme;
 
+const ICON_CONSTRAINT_HV: &[u8] = br#"<svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg"><g clip-path="url(#clip0_10_2)"><path d="M3.12729 0.858231V7.82697M1.75229 0.858231V8.92073M1.75229 2.92073L0.810216 1.97866M1.75229 5.37385L1.28125 4.90281L0.810211 4.43178M1.75229 7.82697L0.810216 6.8849M3.12729 10.1997H5.18979M10.096 10.1997H7.64291L5.18979 10.1997M5.18979 10.1997L4.24772 11.1418M7.64291 10.1997L7.17187 10.6707L6.70083 11.1418M10.096 10.1997H11.1898M10.096 10.1997L9.15396 11.1418M11.1898 8.9474H3.95312" stroke="black" stroke-width="0.75" stroke-linecap="round"/></g><defs><clipPath id="clip0_10_2"><rect width="12" height="12" fill="white"/></clipPath></defs></svg>"#;
+const ICON_CONSTRAINT_PARALLEL: &[u8] = br#"<svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M3.20312 6.72656L6.79688 3.13281M5.27344 8.79688L8.86719 5.20312" stroke="black" stroke-width="0.75" stroke-linecap="round"/><circle cx="2.29" cy="7.64" r="1.04" stroke="black" stroke-width="0.75"/><circle cx="7.64" cy="2.29" r="1.04" stroke="black" stroke-width="0.75"/><circle cx="4.36" cy="9.71" r="1.04" stroke="black" stroke-width="0.75"/><circle cx="9.71" cy="4.36" r="1.04" stroke="black" stroke-width="0.75"/></svg>"#;
+
 // Bottom toolbar: one centered row â€” mode tools (Move / Pan), a divider,
 // then shape tools (Rectangle).
 
@@ -84,11 +87,12 @@ const ICON_CIRCLE: &[u8] =
 const ICON_DIMENSION: &[u8] =
     br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
 	<path d="M0 0h24v24H0z" fill="none" />
-	<g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2">
-		<path d="M10 15v-3m4 3v-3m4 3v-3M2 8V4m20 2H2m20 2V4M6 15v-3" />
-		<rect width="20" height="8" x="2" y="12" rx="2" />
+	<g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5">
+		<path d="M15.5 7.5h-2c-2.828 0-4.243 0-5.121.879C7.5 9.257 7.5 10.672 7.5 13.5v2c0 2.828 0 4.243.879 5.121c.878.879 2.293.879 5.121.879h2c2.828 0 4.243 0 5.121-.879c.879-.878.879-2.293.879-5.121v-2c0-2.828 0-4.243-.879-5.121C19.743 7.5 18.328 7.5 15.5 7.5" />
+		<path d="M16 7.5h-3v3c0 .471 0 .707.146.854c.147.146.383.146.854.146h1c.471 0 .707 0 .854-.146c.146-.147.146-.383.146-.854zm-5.5 11h3m-6-15h14m-14 0v-1m0 1v1m14-1v-1m0 1v1m-18 3v14m0-14h1m-1 0h-1m1 14h1m-1 0h-1" />
 	</g>
-</svg>"#;
+</svg>
+"#;
 
 const ICON_RULER: &[u8] =
     br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
@@ -144,6 +148,11 @@ impl RenderOnce for Toolbar {
             .child(self.tool_button(Tool::Line, ICON_LINE, active_tool, t, cx))
             .child(self.tool_button(Tool::Rectangle, ICON_RECTANGLE, active_tool, t, cx))
             .child(self.tool_button(Tool::Circle, ICON_CIRCLE, active_tool, t, cx))
+            .child(divider(t))
+            .child(self.tool_button(Tool::ConstraintHorizontalVertical, ICON_CONSTRAINT_HV, active_tool, t, cx))
+            .child(self.tool_button(Tool::ConstraintTangent, crate::ui::canvas::ICON_CHIP_TANGENT, active_tool, t, cx))
+            .child(self.tool_button(Tool::ConstraintCoincident, crate::ui::canvas::ICON_CHIP_COINCIDENT, active_tool, t, cx))
+            .child(self.tool_button(Tool::ConstraintParallel, ICON_CONSTRAINT_PARALLEL, active_tool, t, cx))
     }
 }
 
@@ -278,6 +287,10 @@ fn tool_debug_name(tool: Tool) -> &'static str {
         Tool::Circle => "tool-circle",
         Tool::Ruler => "tool-ruler",
         Tool::Dimension => "tool-dimension",
+        Tool::ConstraintHorizontalVertical => "tool-constraint-hv",
+        Tool::ConstraintTangent => "tool-constraint-tangent",
+        Tool::ConstraintCoincident => "tool-constraint-coincident",
+        Tool::ConstraintParallel => "tool-constraint-parallel",
     }
 }
 
@@ -290,5 +303,9 @@ fn tool_tooltip(tool: Tool) -> (&'static str, &'static str) {
         Tool::Rectangle => ("Rectangle", "R"),
         Tool::Circle => ("Arc", "A"),
         Tool::Dimension => ("Dimension", "D"),
+        Tool::ConstraintHorizontalVertical => ("Horizontal / Vertical constraint", ""),
+        Tool::ConstraintTangent => ("Tangent constraint", ""),
+        Tool::ConstraintCoincident => ("Coincident constraint", ""),
+        Tool::ConstraintParallel => ("Parallel constraint", ""),
     }
 }

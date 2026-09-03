@@ -58,6 +58,10 @@ pub struct Editor {
     // Pending shape created by a single click (commit on next click).
     pub pending_via_click: bool,
     pub selection: Vec<ElementRef>,
+    // Elements picked by an active constraint tool before its constraint is
+    // committed.
+    pub constraint_picks: Vec<ElementRef>,
+    pub constraint_point_picks: Vec<PointId>,
     // Selected constraint chips (identity = the Constraint value).
     pub selected_constraints: Vec<crate::core::constraints::Constraint>,
     pub hover: Option<ElementRef>,
@@ -181,6 +185,8 @@ impl Editor {
             pending_circle: None,
             pending_via_click: false,
             selection: Vec::new(),
+            constraint_picks: Vec::new(),
+            constraint_point_picks: Vec::new(),
             selected_constraints: Vec::new(),
             hover: None,
             marquee: None,
@@ -239,6 +245,8 @@ impl Editor {
         self.pending_circle = None;
         self.pending_via_click = false;
         self.selection.clear();
+        self.constraint_picks.clear();
+        self.constraint_point_picks.clear();
         self.selected_constraints.clear();
         self.context_menu = None;
         self.pending_bonds = Vec::new();
@@ -366,6 +374,9 @@ impl Editor {
                         self.selected_constraints.push(c);
                     }
                     return true;
+                }
+                if self.is_constraint_tool() {
+                    return self.constraint_tool_click(cursor);
                 }
                 match self.tool {
                 Tool::Pan => {
@@ -594,6 +605,13 @@ impl Editor {
                         .collect();
                     true
                 }
+                // Constraint tools are handled before this mode match so
+                // their clicks never enter shape/dimension creation. Keep an
+                // explicit arm for exhaustive enum matching.
+                Tool::ConstraintHorizontalVertical
+                | Tool::ConstraintTangent
+                | Tool::ConstraintCoincident
+                | Tool::ConstraintParallel => false,
             }
             }
             _ => false,
@@ -687,7 +705,47 @@ impl Editor {
                     }
                     aux
                 };
+                let coincident_cluster = |seed: PointId| -> Vec<PointId> {
+                    let mut cluster = vec![seed];
+                    let mut i = 0;
+                    while i < cluster.len() {
+                        let pid = cluster[i];
+                        for c in &self.doc.constraints {
+                            if c.kind != ConstraintKind::Coincident || c.point_on_segment.is_some() {
+                                continue;
+                            }
+                            let other = if c.a == pid {
+                                Some(c.b)
+                            } else if c.b == pid {
+                                Some(c.a)
+                            } else {
+                                None
+                            };
+                            if let Some(other) = other
+                                && !cluster.contains(&other)
+                                && self.doc.point(other).is_some()
+                            {
+                                cluster.push(other);
+                            }
+                        }
+                        i += 1;
+                    }
+                    cluster
+                };
                 let (drag_pts, aux_pts) = if let Some(pid) = solo_point {
+                    let cluster = coincident_cluster(pid);
+                    if cluster.len() > 1 {
+                        // Explicit coincident points are separate entities in
+                        // the model, but a coincident stack is one temporary
+                        // drag handle. Drag every member as a primary target
+                        // so the stack cannot stretch apart while moving.
+                        let drag = cluster
+                            .iter()
+                            .filter_map(|&p| self.doc.point(p).map(|pos| (p, pos)))
+                            .collect();
+                        let aux = ring_of(&cluster);
+                        (drag, aux)
+                    } else {
                     // Whole-arc translation: the arc's bend ("midpoint")
                     // handle moves the ENTIRE arc rigidly — endpoints are
                     // what change the sweep. Without this the handle wanders
@@ -708,6 +766,7 @@ impl Editor {
                         let start = self.doc.point(pid).unwrap();
                         let aux = ring_of(&[pid]);
                         (vec![(pid, start)], aux)
+                    }
                     }
                 } else if let (ElementRef::Segment(sid), false) =
                     (&el, self.selection.len() > 1 && self.element_selected(el))
@@ -1383,6 +1442,14 @@ impl Editor {
             self.hovered_dim = hdim;
             return changed;
         }
+        if self.is_constraint_tool() {
+            let picked = pick::Picker::new(&self.doc, &self.camera, HANDLE_TOL_PX)
+                .element(self.cursor_doc(cursor))
+                .and_then(|element| self.normalize_constraint_hit(element));
+            let changed = self.hover != picked;
+            self.hover = picked;
+            return changed;
+        }
         if self.tool != Tool::Move || self.dragging.is_some() || self.pan_start.is_some() {
             return false;
         }
@@ -1404,6 +1471,43 @@ impl Editor {
             changed = true;
         }
         changed
+    }
+
+    fn constraint_hover_allowed(&self, element: ElementRef) -> bool {
+        match self.tool {
+            Tool::ConstraintHorizontalVertical => {
+                matches!(element, ElementRef::Segment(sid) if self.doc.segment(sid).is_some_and(|s| s.kind == crate::core::document::SegmentKind::Line))
+            }
+            Tool::ConstraintTangent => {
+                matches!(element, ElementRef::Segment(sid) if self.doc.segment(sid).is_some_and(|s| matches!(s.kind, crate::core::document::SegmentKind::Line | crate::core::document::SegmentKind::Arc)))
+            }
+            Tool::ConstraintCoincident => matches!(element, ElementRef::Point(_) | ElementRef::Segment(_)),
+            Tool::ConstraintParallel => matches!(element, ElementRef::Segment(sid) if self.doc.segment(sid).is_some_and(|s| s.kind == crate::core::document::SegmentKind::Line)),
+            _ => false,
+        }
+    }
+
+    fn normalize_constraint_hit(&self, element: ElementRef) -> Option<ElementRef> {
+        if self.constraint_hover_allowed(element) {
+            return Some(element);
+        }
+        let ElementRef::Point(point) = element else { return None };
+        match self.tool {
+            Tool::ConstraintHorizontalVertical | Tool::ConstraintTangent => self
+                .doc
+                .all_segments()
+                .filter(|(_, s)| {
+                    let allowed = match self.tool {
+                        Tool::ConstraintHorizontalVertical => s.kind == crate::core::document::SegmentKind::Line,
+                        Tool::ConstraintTangent => matches!(s.kind, crate::core::document::SegmentKind::Line | crate::core::document::SegmentKind::Arc),
+                        _ => false,
+                    };
+                    allowed && (s.start == point || s.end == point || s.ctrl == Some(point))
+                })
+                .map(|(sid, _)| ElementRef::Segment(sid))
+                .find(|candidate| !self.constraint_picks.contains(candidate)),
+            _ => None,
+        }
     }
 
     /// Tracks which chip (if any) is under the cursor for its own hover
@@ -2050,6 +2154,246 @@ impl Editor {
         }
         self.flush_pending_history();
         true
+    }
+
+    fn is_constraint_tool(&self) -> bool {
+        matches!(
+            self.tool,
+            Tool::ConstraintHorizontalVertical
+                | Tool::ConstraintTangent
+                | Tool::ConstraintCoincident
+                | Tool::ConstraintParallel
+        )
+    }
+
+    fn constraint_tool_click(&mut self, cursor: gpui::Point<gpui::Pixels>) -> bool {
+        let p = self.cursor_doc(cursor);
+        let picker = pick::Picker::new(&self.doc, &self.camera, HANDLE_TOL_PX);
+        // At a shared endpoint the generic picker intentionally prefers a
+        // point. Constraint tools need the underlying edge when the cursor
+        // is on that edge, otherwise a line endpoint can hide the arc (or
+        // vice versa) and tangent receives the same element twice.
+        let hit = if matches!(self.tool, Tool::ConstraintTangent | Tool::ConstraintHorizontalVertical) {
+            let edge = picker.segment(p).map(ElementRef::Segment);
+            if edge.as_ref().is_some_and(|element| self.constraint_picks.contains(element)) {
+                picker.element(p)
+            } else {
+                edge.or_else(|| picker.element(p))
+            }
+        } else {
+            picker.element(p)
+        }.and_then(|hit| self.normalize_constraint_hit(hit));
+        let Some(hit) = hit else { return true };
+        if !self.constraint_picks.contains(&hit) {
+            self.constraint_picks.push(hit);
+            self.selection = self.constraint_picks.clone();
+            if self.tool == Tool::ConstraintCoincident {
+                if let Some(point) = self.constraint_point_near(hit, p) {
+                    self.constraint_point_picks.push(point);
+                }
+            }
+        }
+
+        match self.tool {
+            Tool::ConstraintHorizontalVertical => {
+                if let ElementRef::Segment(sid) = hit
+                    && let Some(seg) = self.doc.segment(sid)
+                    && seg.kind == crate::core::document::SegmentKind::Line
+                {
+                    let (Some(a), Some(b)) = (self.doc.point(seg.start), self.doc.point(seg.end)) else { return true };
+                    let kind = if (a.y - b.y).abs() <= (a.x - b.x).abs() {
+                        ConstraintKind::Horizontal
+                    } else {
+                        ConstraintKind::Vertical
+                    };
+                    self.doc.add_constraint(kind, seg.start, seg.end);
+                    self.solve_constraint_now(&[ElementRef::Segment(sid)]);
+                    self.constraint_picks.clear();
+                    self.selection = vec![ElementRef::Segment(sid)];
+                }
+            }
+            Tool::ConstraintCoincident => {
+                if self.constraint_picks.len() == 2
+                    && self.constraint_point_picks.len() >= 1
+                    && let ElementRef::Segment(sid) = hit
+                    && let Some(seg) = self.doc.segment(sid)
+                    && seg.kind == crate::core::document::SegmentKind::Line
+                {
+                    let selected = self.constraint_point_picks[0];
+                    let Some((a, b)) = self.doc.segment_geom(sid) else { return true };
+                    let dx = b.x - a.x;
+                    let dy = b.y - a.y;
+                    let denom = dx * dx + dy * dy;
+                    let t = if denom > 1e-12 {
+                        ((p.x - a.x) * dx + (p.y - a.y) * dy) / denom
+                    } else { 0. };
+                    let edge_point = Point2::new(a.x + dx * t.clamp(0., 1.), a.y + dy * t.clamp(0., 1.));
+                    let created = self.doc.add_point(edge_point);
+                    if let Some(layer) = self.doc.layers.iter_mut().find(|l| l.elements.contains(&ElementRef::Segment(sid))) {
+                        layer.elements.push(ElementRef::Point(created));
+                    }
+                    self.doc.add_point_on_segment_constraint(selected, created, sid);
+                    self.solve_constraint_now(&[
+                        ElementRef::Point(selected), ElementRef::Point(created), ElementRef::Segment(sid),
+                    ]);
+                    self.selection.push(ElementRef::Point(created));
+                    self.constraint_picks.clear();
+                    self.constraint_point_picks.clear();
+                    self.update_dim_geom();
+                    return true;
+                }
+                if self.constraint_picks.len() >= 2 {
+                    if let [a, b] = self.constraint_point_picks.as_slice() {
+                        self.doc.add_constraint(ConstraintKind::Coincident, *a, *b);
+                        self.solve_constraint_now(&[ElementRef::Point(*a), ElementRef::Point(*b)]);
+                    }
+                    self.selection = self.constraint_picks.clone();
+                    self.constraint_picks.clear();
+                    self.constraint_point_picks.clear();
+                }
+            }
+            Tool::ConstraintTangent => {
+                let line = self.constraint_picks.iter().find_map(|e| e.as_segment()).and_then(|sid| {
+                    self.doc.segment(sid).filter(|s| s.kind == crate::core::document::SegmentKind::Line).map(|_| sid)
+                });
+                let arc = self.constraint_picks.iter().find_map(|e| e.as_segment()).and_then(|sid| {
+                    self.doc.segment(sid).filter(|s| s.kind == crate::core::document::SegmentKind::Arc).map(|_| sid)
+                });
+                if let (Some(line), Some(arc)) = (line, arc) {
+                    let point = self.tangent_contact_point(line, arc, p);
+                    if let Some((point, contact)) = point {
+                        // Put the selected line endpoint exactly on the
+                        // selected arc contact, then place the other endpoint
+                        // along the exact local tangent. Moving only one end
+                        // leaves the stored tangent equation referring to a
+                        // point that is not on the line, so the constraint
+                        // appears to do nothing on the next solve.
+                        if let (Some(ls), Some(le)) = (
+                            self.doc.segment(line).map(|s| s.start),
+                            self.doc.segment(line).map(|s| s.end),
+                        ) {
+                            if let (Some(center), Some(lp), Some(rp)) = (
+                                self.doc.segment(arc).and_then(|s| s.center).and_then(|id| self.doc.point(id)),
+                                self.doc.point(point), self.doc.point(if point == ls { le } else { ls }),
+                            ) {
+                                let radius = Point2::new(contact.x - center.x, contact.y - center.y);
+                                let rl = (radius.x * radius.x + radius.y * radius.y).sqrt().max(1e-9);
+                                let mut tangent = Point2::new(-radius.y / rl, radius.x / rl);
+                                let old = Point2::new(rp.x - lp.x, rp.y - lp.y);
+                                if tangent.x * old.x + tangent.y * old.y < 0. {
+                                    tangent = Point2::new(-tangent.x, -tangent.y);
+                                }
+                                let length = (old.x * old.x + old.y * old.y).sqrt().max(1e-9);
+                                self.doc.move_point(point, contact);
+                                self.doc.move_point(if point == ls { le } else { ls }, Point2::new(
+                                    contact.x + tangent.x * length,
+                                    contact.y + tangent.y * length,
+                                ));
+                            } else {
+                                self.doc.move_point(point, contact);
+                            }
+                        } else {
+                            self.doc.move_point(point, contact);
+                        }
+                        self.doc.add_tangent_constraint(line, arc, point);
+                        self.solve_constraint_now(&[ElementRef::Segment(line), ElementRef::Segment(arc)]);
+                    }
+                    self.selection = self.constraint_picks.clone();
+                    self.constraint_picks.clear();
+                }
+            }
+            Tool::ConstraintParallel => {
+                if let [ElementRef::Segment(first), ElementRef::Segment(second)] = self.constraint_picks.as_slice()
+                    && let (Some(a), Some(b)) = (self.doc.segment(*first), self.doc.segment(*second))
+                {
+                    let fixed = [b.start, b.end].iter().all(|&pid| {
+                        self.doc.constraints.iter().filter(|c| c.a == pid || c.b == pid).count() >= 2
+                            || self.doc.dimensions.iter().any(|d| match d.target {
+                                DimTarget::Points { a, b, .. } => a == pid || b == pid,
+                                DimTarget::PointLine { p, .. } => p == pid,
+                                _ => false,
+                            })
+                    });
+                    let (foundation, moving) = if fixed { (*second, *first) } else { (*first, *second) };
+                    self.make_line_parallel(moving, foundation);
+                    self.doc.add_parallel_constraint(foundation, moving);
+                    self.solve_constraint_now(&[ElementRef::Segment(foundation), ElementRef::Segment(moving)]);
+                    self.selection = self.constraint_picks.clone();
+                    self.constraint_picks.clear();
+                }
+            }
+            _ => {}
+        }
+        self.update_dim_geom();
+        true
+    }
+
+    fn solve_constraint_now(&mut self, elements: &[ElementRef]) {
+        let mut ids = Vec::new();
+        for &element in elements {
+            for id in self.doc.element_points(element) {
+                if !ids.contains(&id) { ids.push(id); }
+            }
+        }
+        let aux: Vec<_> = ids
+            .iter()
+            .filter_map(|&id| self.doc.point(id).map(|p| (id, p)))
+            .collect();
+        let solver = crate::core::solver::Solver::build_with_anchor(
+            &self.doc,
+            &[],
+            &aux,
+            1.0,
+        );
+        let solution = solver.solve();
+        if solution.max_lin_residual <= 0.5 && solution.max_angle_residual <= 0.02 {
+            for (id, pos) in solution.positions {
+                self.doc.move_point(id, pos);
+            }
+            self.doc_gen += 1;
+        }
+    }
+
+    fn make_line_parallel(&mut self, moving: crate::core::ids::SegmentId, foundation: crate::core::ids::SegmentId) {
+        let (Some(m), Some(f)) = (self.doc.segment(moving), self.doc.segment(foundation)) else { return };
+        let (Some(ma), Some(mb), Some(fa), Some(fb)) = (self.doc.point(m.start), self.doc.point(m.end), self.doc.point(f.start), self.doc.point(f.end)) else { return };
+        let (dx, dy) = (fb.x - fa.x, fb.y - fa.y);
+        let fl = (dx * dx + dy * dy).sqrt();
+        let ml = ((mb.x - ma.x).powi(2) + (mb.y - ma.y).powi(2)).sqrt();
+        if fl < 1e-9 || ml < 1e-9 { return; }
+        let mut ux = dx / fl;
+        let mut uy = dy / fl;
+        if ux * (mb.x - ma.x) + uy * (mb.y - ma.y) < 0. { ux = -ux; uy = -uy; }
+        let mid = Point2::new((ma.x + mb.x) / 2., (ma.y + mb.y) / 2.);
+        self.doc.move_point(m.start, Point2::new(mid.x - ux * ml / 2., mid.y - uy * ml / 2.));
+        self.doc.move_point(m.end, Point2::new(mid.x + ux * ml / 2., mid.y + uy * ml / 2.));
+    }
+
+    fn constraint_point_near(&self, el: ElementRef, near: Point2) -> Option<PointId> {
+        let points = self.doc.element_points(el);
+        points.into_iter().min_by(|a, b| {
+            let da = self.doc.point(*a).map(|p| pick::distance(p, near)).unwrap_or(f64::MAX);
+            let db = self.doc.point(*b).map(|p| pick::distance(p, near)).unwrap_or(f64::MAX);
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        })
+    }
+
+    fn tangent_contact_point(&self, line: crate::core::ids::SegmentId, arc: crate::core::ids::SegmentId, cursor: Point2) -> Option<(PointId, Point2)> {
+        let l = self.doc.segment(line)?;
+        let a = self.doc.segment(arc)?;
+        let (Some(sa), Some(sb), Some(ctrl)) = (
+            self.doc.point(a.start), self.doc.point(a.end), a.ctrl.and_then(|id| self.doc.point(id))
+        ) else { return None };
+        let (center, radius) = crate::editor::arc::circumcircle(sa, sb, ctrl)?;
+        let dx = cursor.x - center.x;
+        let dy = cursor.y - center.y;
+        let length = (dx * dx + dy * dy).sqrt().max(1e-9);
+        let contact = Point2::new(center.x + dx * radius / length, center.y + dy * radius / length);
+        let point = [l.start, l.end].into_iter().min_by(|x, y| {
+            let dx = |id: PointId| self.doc.point(id).map(|p| pick::distance(p, contact)).unwrap_or(f64::MAX);
+            dx(*x).partial_cmp(&dx(*y)).unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+        Some((point, contact))
     }
 
     fn enforce_point_distance_exact(&mut self, target: crate::core::constraints::DimTarget) {

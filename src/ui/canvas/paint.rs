@@ -268,10 +268,11 @@ pub fn build_draw_list(
         dashed_polyline(&mut list, &pts, ink);
     }
 
-    // 2b) Constraint guide lines (distant H/V pairs), under everything.
-    let guide_color: gpui::Background = rgba((t.accent << 8) | 0x66).into();
+    // 2b) Constraint guide lines (distant pairs), under everything. A guide
+    // belongs to its chip: hidden chips must not leave unexplained dashes.
+    let guide_color: gpui::Background = rgb(t.empty_text_secondary).into();
     for m in constraint_markers {
-        if let Some(g) = m.guide {
+        if m.visible && let Some(g) = m.guide {
             dashed_line(&mut list, g[0], g[1], g[2], g[3], 1., guide_color);
         }
     }

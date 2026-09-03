@@ -439,7 +439,7 @@ impl Document {
     // -- constraints / dimensions --
 
     pub fn add_constraint(&mut self, kind: ConstraintKind, a: PointId, b: PointId) {
-        let c = Constraint { kind, a, b, tangent_segments: None };
+        let c = Constraint { kind, a, b, tangent_segments: None, point_on_segment: None };
         if !self.constraints.contains(&c) {
             self.constraints.push(c);
         }
@@ -456,6 +456,44 @@ impl Document {
             a: point,
             b: point,
             tangent_segments: Some((line, arc)),
+            point_on_segment: None,
+        };
+        if !self.constraints.contains(&c) {
+            self.constraints.push(c);
+        }
+    }
+
+    pub fn add_parallel_constraint(&mut self, first: SegmentId, second: SegmentId) {
+        let (Some(a), Some(b)) = (self.segment(first), self.segment(second)) else { return };
+        let c = Constraint {
+            kind: ConstraintKind::Parallel,
+            a: a.start,
+            b: b.start,
+            // Reuse the owning-segment pair already carried by tangent
+            // constraints; the kind determines how the pair is interpreted.
+            tangent_segments: Some((first, second)),
+            point_on_segment: None,
+        };
+        if !self.constraints.contains(&c) {
+            self.constraints.push(c);
+        }
+    }
+
+    /// Constrains `point` to a new/selected point that lies on `segment`.
+    /// Keeping the edge point as a real point makes the relationship
+    /// persistent and lets the solver preserve it when either object moves.
+    pub fn add_point_on_segment_constraint(
+        &mut self,
+        point: PointId,
+        edge_point: PointId,
+        segment: SegmentId,
+    ) {
+        let c = Constraint {
+            kind: ConstraintKind::Coincident,
+            a: point,
+            b: edge_point,
+            tangent_segments: None,
+            point_on_segment: Some(segment),
         };
         if !self.constraints.contains(&c) {
             self.constraints.push(c);

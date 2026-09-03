@@ -15,6 +15,10 @@ pub enum Tool {
     Circle,
     Ruler,
     Dimension,
+    ConstraintHorizontalVertical,
+    ConstraintTangent,
+    ConstraintCoincident,
+    ConstraintParallel,
 }
 
 // In-progress rectangle being dragged out (tool-side preview only).

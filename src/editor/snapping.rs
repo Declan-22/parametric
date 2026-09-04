@@ -392,7 +392,9 @@ pub fn best(
     // Connection guide: a line between the two snapping pieces — the
     // feature (from) and the snapped point (to). An axis lock spans the
     // FULL distance between them (Fusion-style alignment line); edge spans
-    // anchor at their nearest end.
+    // anchor at their nearest end. Edge-body hits are NOT anchored at a
+    // real point, so they never earn a dashed stub (linked = true tells the
+    // paint pass to draw only the dot, never the line).
     let snapped = Point2::new(p.x + adj.x, p.y + adj.y);
     let mut guides = Vec::new();
     if hit_x {
@@ -402,17 +404,21 @@ pub fn best(
                 .clamp(tgt.span_lo.min(tgt.span_hi), tgt.span_lo.max(tgt.span_hi)),
             _ => tgt.y,
         };
-        guides.push(SnapGuide {
-            vertical: true,
-            from: Point2::new(tgt.x, anchor_y),
-            to: snapped,
-            kind: tgt.kind,
-            solid: hit_x && hit_y,
-            linked: false,
-            span_is_x: tgt.span_is_x,
-            span_lo: tgt.span_lo,
-            span_hi: tgt.span_hi,
-        });
+        let from = Point2::new(tgt.x, anchor_y);
+        // Zero-length stubs (feature == snapped point) carry no information.
+        if super::pick::distance(from, snapped) > 1e-9 {
+            guides.push(SnapGuide {
+                vertical: true,
+                from,
+                to: snapped,
+                kind: tgt.kind,
+                solid: hit_x && hit_y,
+                linked: tgt.kind == SnapKind::Edge,
+                span_is_x: tgt.span_is_x,
+                span_lo: tgt.span_lo,
+                span_hi: tgt.span_hi,
+            });
+        }
     }
     if hit_y {
         let anchor_x = match tgt.kind {
@@ -421,17 +427,20 @@ pub fn best(
                 .clamp(tgt.span_lo.min(tgt.span_hi), tgt.span_lo.max(tgt.span_hi)),
             _ => tgt.x,
         };
-        guides.push(SnapGuide {
-            vertical: false,
-            from: Point2::new(anchor_x, tgt.y),
-            to: snapped,
-            kind: tgt.kind,
-            solid: hit_x && hit_y,
-            linked: false,
-            span_is_x: tgt.span_is_x,
-            span_lo: tgt.span_lo,
-            span_hi: tgt.span_hi,
-        });
+        let from = Point2::new(anchor_x, tgt.y);
+        if super::pick::distance(from, snapped) > 1e-9 {
+            guides.push(SnapGuide {
+                vertical: false,
+                from,
+                to: snapped,
+                kind: tgt.kind,
+                solid: hit_x && hit_y,
+                linked: tgt.kind == SnapKind::Edge,
+                span_is_x: tgt.span_is_x,
+                span_lo: tgt.span_lo,
+                span_hi: tgt.span_hi,
+            });
+        }
     }
     (adj, guides)
 }
@@ -702,17 +711,20 @@ pub fn cursor_snap_combined(
             } else {
                 l.feature.y
             };
-            guides.push(SnapGuide {
-                vertical: true,
-                from: Point2::new(l.to, anchor_y),
-                to: snapped,
-                kind: l.kind,
-                solid: false,
-                linked: false,
-                span_is_x: false,
-                span_lo: l.span_lo,
-                span_hi: l.span_hi,
-            });
+            let from = Point2::new(l.to, anchor_y);
+            if super::pick::distance(from, snapped) > 1e-9 {
+                guides.push(SnapGuide {
+                    vertical: true,
+                    from,
+                    to: snapped,
+                    kind: l.kind,
+                    solid: false,
+                    linked: l.kind == SnapKind::Edge,
+                    span_is_x: false,
+                    span_lo: l.span_lo,
+                    span_hi: l.span_hi,
+                });
+            }
         }
     }
     if let Some(l) = &y_lock {
@@ -724,17 +736,20 @@ pub fn cursor_snap_combined(
             } else {
                 l.feature.x
             };
-            guides.push(SnapGuide {
-                vertical: false,
-                from: Point2::new(anchor_x, l.to),
-                to: snapped,
-                kind: l.kind,
-                solid: false,
-                linked: false,
-                span_is_x: false,
-                span_lo: l.span_lo,
-                span_hi: l.span_hi,
-            });
+            let from = Point2::new(anchor_x, l.to);
+            if super::pick::distance(from, snapped) > 1e-9 {
+                guides.push(SnapGuide {
+                    vertical: false,
+                    from,
+                    to: snapped,
+                    kind: l.kind,
+                    solid: false,
+                    linked: l.kind == SnapKind::Edge,
+                    span_is_x: false,
+                    span_lo: l.span_lo,
+                    span_hi: l.span_hi,
+                });
+            }
         }
     }
     (snapped, guides)
@@ -754,7 +769,8 @@ pub fn cursor_snap(
 ) -> (Point2, Option<SnapGuide>) {
     // Guide convention: `from` is the FEATURE (what locked), `to` is the
     // manipulated point — so the connection line always runs between the
-    // two snapping pieces.
+    // two snapping pieces. Edge-body hits float on the body, not on a real
+    // point, so they never earn a dashed stub.
     let guide = |feature: Point2, kind: SnapKind| {
         Some(SnapGuide {
             vertical: false,
@@ -762,7 +778,7 @@ pub fn cursor_snap(
             to: p,
             kind,
             solid: true,
-            linked: false,
+            linked: kind == SnapKind::Edge,
             span_is_x: false,
             span_lo: 0.,
             span_hi: 0.,

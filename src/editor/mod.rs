@@ -16,7 +16,7 @@ pub use tools::{DimInput, DimPick, PendingCircle, PendingLine, PendingRuler, Pen
 use crate::core::constraints::{ConstraintKind, DimTarget, ElementRef};
 use crate::core::document::{Document, Layer};
 use crate::core::geometry::{Point2, Rect};
-use crate::core::ids::{FillId, PointId};
+use crate::core::ids::{FillId, PointId, SegmentId};
 
 // The session: the permanent design plus view/editing state.
 // Owns nothing about GPUI widgets; the UI layer drives it.
@@ -45,6 +45,17 @@ pub(crate) struct DragState {
     pub points: Vec<(PointId, Point2)>,
     pub aux: Vec<(PointId, Point2)>,
     pub start_cursor: Point2,
+    // Arc body grab: the whole arc scales about its fixed center (see
+    // plan_arc_drag). None for every other gesture (solver path).
+    pub arc_body_scale: Option<SegmentId>,
+}
+
+/// Kinematic arc drag outcome: exact targets plus points to hard-pin for
+/// the follow-up solve, plus an optional exact center refit to apply first.
+struct ArcKin {
+    targets: Vec<(PointId, Point2)>,
+    pins: Vec<(PointId, Point2)>,
+    premove: Option<(PointId, Point2)>,
 }
 
 pub struct Editor {
@@ -143,6 +154,11 @@ pub struct Editor {
     pub dim_caret_visible: bool,
     // Over-constrained modal: set when a dimension placement is infeasible.
     pub overconstrained: bool,
+    // Arc centers currently revealed (cursor inside the arc's disk).
+    // Drives repaint detection: cursor moves that change nothing else must
+    // still repaint when the reveal set changes, or the dot sticks around
+    // after the mouse leaves the area.
+    pub arc_center_reveal: Vec<SegmentId>,
 }
 
 /// An in-progress drag of a placed dimension container: `down` is the
@@ -228,6 +244,7 @@ impl Editor {
             dim_drag: None,
             dim_caret_visible: true,
             overconstrained: false,
+            arc_center_reveal: Vec::new(),
         }
     }
 
@@ -268,9 +285,59 @@ impl Editor {
 
     // -- canvas input (called from the canvas view) --
 
-    fn cursor_doc(&self, cursor: gpui::Point<gpui::Pixels>) -> Point2 {
+    pub(crate) fn cursor_doc(&self, cursor: gpui::Point<gpui::Pixels>) -> Point2 {
         self.camera
             .screen_to_unit(Point2::new(f64::from(cursor.x), f64::from(cursor.y)))
+    }
+
+    /// Recomputes which arc centers are revealed (cursor inside the arc's
+    /// disk). Returns true when the set changed — the caller must repaint
+    /// even if nothing else changed, or the dot sticks around after the
+    /// mouse leaves the area.
+    pub fn update_arc_reveal(&mut self, cur: Point2) -> bool {
+        let mut inside: Vec<SegmentId> = Vec::new();
+        for (sid, seg) in self.doc.all_segments() {
+            if seg.kind != crate::core::document::SegmentKind::Arc {
+                continue;
+            }
+            let Some(sc) = seg.ctrl else { continue };
+            let (Some(a), Some(b), Some(c)) = (
+                self.doc.point(seg.start),
+                self.doc.point(seg.end),
+                self.doc.point(sc),
+            ) else {
+                continue;
+            };
+            let Some((center, r)) = crate::editor::arc::circumcircle(a, b, c) else {
+                continue;
+            };
+            if r < 1e-9 {
+                continue;
+            }
+            let dx = cur.x - center.x;
+            let dy = cur.y - center.y;
+            if (dx * dx + dy * dy).sqrt() <= r {
+                inside.push(sid);
+            }
+        }
+        inside.sort_by(|a, b| (a.idx, a.generation).cmp(&(b.idx, b.generation)));
+        if inside == self.arc_center_reveal {
+            false
+        } else {
+            self.arc_center_reveal = inside;
+            true
+        }
+    }
+
+    /// Clears the reveal set (mouse left the canvas). True when something
+    /// was showing.
+    pub fn clear_arc_reveal(&mut self) -> bool {
+        if self.arc_center_reveal.is_empty() {
+            false
+        } else {
+            self.arc_center_reveal.clear();
+            true
+        }
     }
 
     fn snap_tol_doc(&self) -> f64 {
@@ -346,19 +413,21 @@ impl Editor {
         shift: bool,
         click_count: usize,
     ) -> bool {
-        // Every gesture is one undo step; the snapshot commits lazily only
-        // if the document actually changed.
-        self.history_begin();
         // Any click dismisses the pending bond-choice menu first.
         if self.context_menu.take().is_some() {
             return true;
         }
         match button {
             gpui::MouseButton::Middle => {
+                // MMB always pans, whatever tool is active. No history: a
+                // pan never mutates the document.
                 self.begin_pan(cursor);
                 true
             }
             gpui::MouseButton::Left => {
+                // Every Left gesture is one undo step; the snapshot commits
+                // lazily only if the document actually changed.
+                self.history_begin();
                 // Keep the snap crosshair in sync with click placements
                 // (click-created shapes land exactly on the drawn crosshair).
                 let _ = self.update_creation_cursor(cursor);
@@ -430,22 +499,29 @@ impl Editor {
                     true
                 }
                 Tool::Line => {
-                    // Second click commits a click-created pending line.
+                    // Continuous mode: the tool stays active and each
+                    // commit chains the next line from its endpoint.
+                    // A click on a fresh (zero-length) link re-anchors
+                    // the start instead of committing.
                     if let Some(pending) = self.pending_line.take() {
-                        self.pending_via_click = false;
-                        self.snap_guides.clear();
-                        self.tool = Tool::Move;
-                        self.creation_cursor = None;
                         let (_, mut b) = pending.snapped(shift);
                         if shift {
                             if let Some(q) = self.tangent_snap_for_line(pending.start, pending.cursor) { b = q; }
                         }
                         if pick::distance(b, pending.start) > 1e-6 {
+                            self.snap_guides.clear();
                             let layer_id = self.doc.layers[0].id;
                             let seg = self.create_line(layer_id, pending.start, b);
                             if shift { self.maybe_add_tangent(seg, b); }
                             self.selection = vec![ElementRef::Segment(seg)];
+                            // Chain: the next line starts where this one ended.
+                            self.pending_line = Some(PendingLine { start: b, cursor: b });
+                        } else {
+                            let (at, guides) = self.snap_creation_point(self.cursor_doc(cursor));
+                            self.snap_guides = guides;
+                            self.pending_line = Some(PendingLine { start: at, cursor: at });
                         }
+                        self.pending_via_click = true;
                         return true;
                     }
                     let (at, guides) = self.snap_creation_point(self.cursor_doc(cursor));
@@ -684,6 +760,15 @@ impl Editor {
                 };
                 let ring_of = |pids: &[PointId]| -> Vec<(PointId, Point2)> {
                     let mut aux: Vec<(PointId, Point2)> = Vec::new();
+                    let mut push_aux = |o: PointId, aux: &mut Vec<(PointId, Point2)>| {
+                        if o != pids[0]
+                            && !pids.contains(&o)
+                            && !aux.iter().any(|&(id, _)| id == o)
+                            && self.doc.point(o).is_some()
+                        {
+                            aux.push((o, self.doc.point(o).unwrap()));
+                        }
+                    };
                     for &pid in pids {
                         for c in &self.doc.constraints {
                             let other = if c.a == pid {
@@ -700,6 +785,32 @@ impl Editor {
                                 && self.doc.point(o).is_some()
                             {
                                 aux.push((o, self.doc.point(o).unwrap()));
+                            }
+                            // Tangent stores a==b==contact, so the generic
+                            // pair above yields nothing — pull the owning
+                            // line's far endpoints explicitly so the line can
+                            // rotate instead of pinning the arc center.
+                            match c.kind {
+                                ConstraintKind::Tangent => {
+                                    let Some((line_id, _)) = c.tangent_segments else { continue };
+                                    let Some(line) = self.doc.segment(line_id) else { continue };
+                                    if c.a != pid && c.b != pid && line.start != pid && line.end != pid {
+                                        continue;
+                                    }
+                                    for o in [line.start, line.end] {
+                                        push_aux(o, &mut aux);
+                                    }
+                                }
+                                ConstraintKind::Parallel => {
+                                    let Some((first, second)) = c.tangent_segments else { continue };
+                                    let (Some(a_seg), Some(b_seg)) = (self.doc.segment(first), self.doc.segment(second)) else { continue };
+                                    let touches = [a_seg.start, a_seg.end, b_seg.start, b_seg.end].contains(&pid);
+                                    if !touches { continue; }
+                                    for o in [a_seg.start, a_seg.end, b_seg.start, b_seg.end] {
+                                        push_aux(o, &mut aux);
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -733,6 +844,42 @@ impl Editor {
                     cluster
                 };
                 let (drag_pts, aux_pts) = if let Some(pid) = solo_point {
+                    // Arc roles first — they override the generic cluster path:
+                    //  - CENTER drag translates the ENTIRE arc rigidly (plus
+                    //    any coincident partners glued to the center);
+                    //  - CTRL (on-curve point) drag reshapes: only the glued
+                    //    cluster moves and the solver re-seats the rest.
+                    let arc_as_center = self.doc.all_segments().find(|(_, s)| {
+                        s.kind == crate::core::document::SegmentKind::Arc && s.center == Some(pid)
+                    }).map(|(_, s)| s);
+                    let arc_as_ctrl = self.doc.all_segments().find(|(_, s)| {
+                        s.kind == crate::core::document::SegmentKind::Arc && s.ctrl == Some(pid)
+                    }).map(|(_, s)| s);
+                    if let Some(seg) = arc_as_center {
+                        let mut ids = vec![seg.start, seg.end, pid];
+                        if let Some(c) = seg.ctrl {
+                            ids.push(c);
+                        }
+                        for p in coincident_cluster(pid) {
+                            if !ids.contains(&p) {
+                                ids.push(p);
+                            }
+                        }
+                        let aux = ring_of(&ids);
+                        let drag = ids
+                            .iter()
+                            .filter_map(|&p| self.doc.point(p).map(|pos| (p, pos)))
+                            .collect();
+                        (drag, aux)
+                    } else if arc_as_ctrl.is_some() {
+                        let cluster = coincident_cluster(pid);
+                        let aux = ring_of(&cluster);
+                        let drag = cluster
+                            .iter()
+                            .filter_map(|&p| self.doc.point(p).map(|pos| (p, pos)))
+                            .collect();
+                        (drag, aux)
+                    } else {
                     let cluster = coincident_cluster(pid);
                     if cluster.len() > 1 {
                         // Explicit coincident points are separate entities in
@@ -745,23 +892,6 @@ impl Editor {
                             .collect();
                         let aux = ring_of(&cluster);
                         (drag, aux)
-                    } else {
-                    // Whole-arc translation: the arc's bend ("midpoint")
-                    // handle moves the ENTIRE arc rigidly — endpoints are
-                    // what change the sweep. Without this the handle wanders
-                    // off while the arc (and any radius dim) stays put.
-                    if let Some((_, seg)) = self.doc.all_segments().find(|(_, s)| {
-                        s.kind == crate::core::document::SegmentKind::Arc && s.ctrl == Some(pid)
-                    }) {
-                        let mut ids = vec![seg.start, seg.end, pid];
-                        if let Some(c) = seg.center {
-                            ids.push(c);
-                        }
-                        let drag = ids
-                            .iter()
-                            .filter_map(|&p| self.doc.point(p).map(|pos| (p, pos)))
-                            .collect();
-                        (drag, Vec::new())
                     } else {
                         let start = self.doc.point(pid).unwrap();
                         let aux = ring_of(&[pid]);
@@ -778,9 +908,9 @@ impl Editor {
                     // collapse an edge drag to a PERPENDICULAR stretch
                     // (tangential pulls are projected out), so grabbing an
                     // edge never translates the shape.
-                    // ARCS are the exception: dragging the arc body moves
-                    // the whole arc rigidly (Fusion-style); its endpoints
-                    // are the sweep handles.
+                    // ARCS are the exception: dragging the arc body scales
+                    // the arc about its fixed center (see plan_arc_drag);
+                    // its endpoints are the sweep handles.
                     let seg = self.doc.segment(*sid);
                     if seg.is_some_and(|s| s.kind == crate::core::document::SegmentKind::Arc) {
                         let s = seg.unwrap();
@@ -814,8 +944,26 @@ impl Editor {
                         .collect();
                     (drag, Vec::new())
                 };
-                self.dragging =
-                    Some(DragState { points: drag_pts, aux: aux_pts, start_cursor: p });
+                // Arc body grabs scale about the fixed center (kinematic);
+                // everything else takes the solver path.
+                let arc_body_scale = match el {
+                    ElementRef::Segment(sid)
+                        if !(self.selection.len() > 1 && self.element_selected(el))
+                            && self
+                                .doc
+                                .segment(sid)
+                                .is_some_and(|s| s.kind == crate::core::document::SegmentKind::Arc) =>
+                    {
+                        Some(sid)
+                    }
+                    _ => None,
+                };
+                self.dragging = Some(DragState {
+                    points: drag_pts,
+                    aux: aux_pts,
+                    start_cursor: p,
+                    arc_body_scale,
+                });
                 true
             }
             None => {
@@ -831,6 +979,12 @@ impl Editor {
     pub fn canvas_drag(&mut self, cursor: gpui::Point<gpui::Pixels>, shift: bool) -> bool {
         self.last_cursor = Some(cursor);
         self.shift = shift;
+        // MMB pan wins over EVERY tool (dimension preview, rubber bands,
+        // placed-dim drags): holding the middle button always pans.
+        if self.pan_delta(cursor) {
+            self.snap_guides.clear();
+            return true;
+        }
         // The snap crosshair tracks every move (idle or drag-out) so it's
         // always glued to the cursor when a creation tool is active.
         let mut changed = self.update_creation_cursor(cursor);
@@ -855,10 +1009,6 @@ impl Editor {
                     self.dim_drag_update(idx, cursor);
                 }
             }
-            return true;
-        }
-        if self.pan_delta(cursor) {
-            self.snap_guides.clear();
             return true;
         }
 
@@ -1159,7 +1309,25 @@ impl Editor {
             }
         }
 
-        let solver = crate::core::solver::Solver::build(&self.doc, &targets, &aux_all);
+        // Kinematic arc drags bypass the least-squares hunt entirely:
+        // endpoints slide on the circle, the bend refits it, the body
+        // scales about the center. Everything else takes the solver path.
+        let solver = match self.plan_arc_drag(drag, &targets) {
+            Some(kin) => {
+                if let Some((pid, pos)) = kin.premove {
+                    self.doc.move_point(pid, pos);
+                }
+                // 1.0 = the default live-drag anchor weight.
+                crate::core::solver::Solver::build_pinned(
+                    &self.doc,
+                    &kin.targets,
+                    &aux_all,
+                    &kin.pins,
+                    1.0,
+                )
+            }
+            None => crate::core::solver::Solver::build(&self.doc, &targets, &aux_all),
+        };
         let solution = solver.solve();
         let mut moved: std::collections::HashSet<PointId> = std::collections::HashSet::new();
         for (id, pos) in solution.positions {
@@ -1218,6 +1386,240 @@ impl Editor {
         false
     }
 
+    /// Kinematic arc drag plan: exact geometry instead of the least-squares
+    /// hunt, so an arc can never flip unless the cursor commands it.
+    ///  - endpoint (start/end): slides along the existing circle (center +
+    ///    radius frozen, other points pinned), clamped away from the other
+    ///    endpoint and the bend so the sweep can never invert;
+    ///  - ctrl (on-curve point): moves freely with a bend-height floor and
+    ///    the center refit exactly through the pinned endpoints;
+    ///  - body (DragState::arc_body_scale): uniform scale about the frozen
+    ///    center;
+    ///  - center: rigid translate, already exact — legacy solver path.
+    /// Pins are hard-fixed for the follow-up solve so tangent lines rotate
+    /// around the frozen arc instead of throwing it around. None = legacy
+    /// solver path (multi-arc drags, H/V locks, non-radius dimensions).
+    fn plan_arc_drag(&self, drag: &DragState, targets: &[(PointId, Point2)]) -> Option<ArcKin> {
+        use crate::core::document::SegmentKind;
+        const TAU: f64 = std::f64::consts::TAU;
+        const PI: f64 = std::f64::consts::PI;
+        let wrap = |mut d: f64| {
+            d = (d + PI).rem_euclid(TAU);
+            d - PI
+        };
+        let circ_dist = |x: f64, y: f64| wrap(x - y).abs();
+
+        let drag_ids: Vec<PointId> = drag.points.iter().map(|&(id, _)| id).collect();
+        // Any center dragged -> rigid translate, already exact. Legacy path.
+        for (_, s) in self.doc.all_segments() {
+            if s.kind == SegmentKind::Arc
+                && s.center.is_some_and(|c| drag_ids.contains(&c))
+            {
+                return None;
+            }
+        }
+        // Exactly one arc touched, else legacy (e.g. shared vertices).
+        let mut arc_sid = None;
+        for (sid, s) in self.doc.all_segments() {
+            if s.kind != SegmentKind::Arc {
+                continue;
+            }
+            let mut defs = vec![s.start, s.end];
+            if let Some(c) = s.ctrl {
+                defs.push(c);
+            }
+            if let Some(c) = s.center {
+                defs.push(c);
+            }
+            if drag_ids.iter().any(|id| defs.contains(id)) {
+                if arc_sid.is_some() {
+                    return None;
+                }
+                arc_sid = Some(sid);
+            }
+        }
+        let sid = arc_sid?;
+        let seg = self.doc.segment(sid)?;
+        let ctrl = seg.ctrl?;
+        let center_id = seg.center?;
+        let (Some(a), Some(b), Some(c), Some(_o)) = (
+            self.doc.point(seg.start),
+            self.doc.point(seg.end),
+            self.doc.point(ctrl),
+            self.doc.point(center_id),
+        ) else {
+            return None;
+        };
+        let Some((cc, r)) = crate::editor::arc::circumcircle(a, b, c) else {
+            return None;
+        };
+        if !(r > 1e-9) {
+            return None;
+        }
+        let chord = pick::distance(a, b);
+        if !(chord > 1e-9) {
+            return None;
+        }
+        let arc_ids = [seg.start, seg.end, ctrl, center_id];
+        // H/V locks on arc points need the solver. Legacy path.
+        for con in &self.doc.constraints {
+            match con.kind {
+                ConstraintKind::Horizontal | ConstraintKind::Vertical
+                    if arc_ids.contains(&con.a) || arc_ids.contains(&con.b) =>
+                {
+                    return None;
+                }
+                _ => {}
+            }
+        }
+        let radius_locked = self.doc.dimensions.iter().any(|d| {
+            matches!(
+                d.target,
+                crate::core::constraints::DimTarget::Radius { seg: s } if s == sid
+            )
+        });
+        // Any non-radius dimension touching the arc needs the solver.
+        for d in &self.doc.dimensions {
+            match &d.target {
+                crate::core::constraints::DimTarget::Radius { seg: s } if *s == sid => {}
+                crate::core::constraints::DimTarget::Points { a: da, b: db, .. }
+                    if arc_ids.contains(da) || arc_ids.contains(db) =>
+                {
+                    return None;
+                }
+                crate::core::constraints::DimTarget::PointLine { p, .. }
+                    if arc_ids.contains(p) =>
+                {
+                    return None;
+                }
+                _ => {}
+            }
+        }
+
+        let start_of = |pid: PointId| -> Option<Point2> {
+            drag.points.iter().find(|(id, _)| *id == pid).map(|&(_, s)| s)
+        };
+        let target_of = |pid: PointId| -> Option<Point2> {
+            targets.iter().find(|(id, _)| *id == pid).map(|&(_, t)| t)
+        };
+        let in_drag = |pid: PointId| drag_ids.contains(&pid);
+        let partners: Vec<PointId> = drag_ids
+            .iter()
+            .copied()
+            .filter(|id| *id != seg.start && *id != seg.end && *id != ctrl && *id != center_id)
+            .collect();
+
+        // Body: uniform scale about the frozen (healed) center. A locked
+        // radius can't scale — legacy translate preserves it exactly.
+        if drag.arc_body_scale == Some(sid) {
+            if radius_locked || !partners.is_empty() {
+                return None;
+            }
+            let Some(ct) = target_of(ctrl) else {
+                return None;
+            };
+            let f = (pick::distance(ct, cc) / r).clamp(0.2, 5.0);
+            let mut out = Vec::with_capacity(targets.len());
+            for &(pid, _) in targets {
+                let Some(s) = start_of(pid) else {
+                    return None;
+                };
+                out.push(if pid == center_id {
+                    (pid, cc)
+                } else {
+                    (
+                        pid,
+                        Point2::new(cc.x + (s.x - cc.x) * f, cc.y + (s.y - cc.y) * f),
+                    )
+                });
+            }
+            return Some(ArcKin {
+                targets: out,
+                pins: Vec::new(),
+                premove: Some((center_id, cc)),
+            });
+        }
+
+        let ctrl_d = in_drag(ctrl);
+        let start_d = in_drag(seg.start);
+        let end_d = in_drag(seg.end);
+
+        // Endpoint: slide along the existing circle, clamped away from the
+        // other endpoint and the bend so the sweep can never invert.
+        if (start_d ^ end_d) && !ctrl_d {
+            let (e_pid, f_cur) = if start_d {
+                (seg.start, b)
+            } else {
+                (seg.end, a)
+            };
+            let Some(t0) = target_of(e_pid) else {
+                return None;
+            };
+            let ang = |p: Point2| (p.y - cc.y).atan2(p.x - cc.x);
+            let e_cur = if start_d { a } else { b };
+            let th_prev = ang(e_cur);
+            let dth = wrap(ang(t0) - th_prev).clamp(-0.2, 0.2);
+            let mut th = th_prev + dth;
+            const MARGIN: f64 = 0.14;
+            if circ_dist(th, ang(f_cur)) < MARGIN || circ_dist(th, ang(c)) < MARGIN {
+                // Forbidden zone straddling the other endpoint or the bend:
+                // hold last frame instead of crossing (crossing inverts).
+                th = th_prev;
+            }
+            let t = Point2::new(cc.x + r * th.cos(), cc.y + r * th.sin());
+            let pins = vec![(seg.start, a), (seg.end, b), (ctrl, c), (center_id, cc)];
+            let pins = pins.into_iter().filter(|(id, _)| *id != e_pid).collect();
+            let mut out = Vec::with_capacity(targets.len());
+            for &(pid, _) in targets {
+                out.push((pid, t));
+            }
+            return Some(ArcKin {
+                targets: out,
+                pins,
+                premove: Some((center_id, cc)),
+            });
+        }
+
+        // Bend handle: free move with a bend-height floor; the center is
+        // refit exactly through the pinned endpoints. A locked radius can't
+        // refit — legacy path (which preserves it).
+        if ctrl_d && !start_d && !end_d {
+            if radius_locked {
+                return None;
+            }
+            let Some(t0) = target_of(ctrl) else {
+                return None;
+            };
+            let ux = (b.x - a.x) / chord;
+            let uy = (b.y - a.y) / chord;
+            let (nx, ny) = (-uy, ux);
+            let h_cur = (c.x - a.x) * nx + (c.y - a.y) * ny;
+            let mut h = (t0.x - a.x) * nx + (t0.y - a.y) * ny;
+            let floor = (0.025 * chord).clamp(1.0, 8.0);
+            if h.abs() < floor {
+                let s = if h_cur >= 0. { 1.0 } else { -1.0 };
+                h = s * floor;
+            }
+            // Bend slides freely along the chord direction; only the height
+            // off the chord is floored.
+            let t_along = (t0.x - a.x) * ux + (t0.y - a.y) * uy;
+            let t_pt = Point2::new(a.x + ux * t_along + nx * h, a.y + uy * t_along + ny * h);
+            let Some((cc2, _)) = crate::editor::arc::circumcircle(a, b, t_pt) else {
+                return None;
+            };
+            let mut out = Vec::with_capacity(targets.len());
+            for &(pid, _) in targets {
+                out.push((pid, t_pt));
+            }
+            return Some(ArcKin {
+                targets: out,
+                pins: vec![(seg.start, a), (seg.end, b), (center_id, cc2)],
+                premove: Some((center_id, cc2)),
+            });
+        }
+
+        None
+    }
     /// SHIFT constraint for single-point drags of ARC defining points:
     ///  - start/end point: ROTATE ON CIRCLE — the target is projected
     ///    radially onto the arc's original circle (the one at drag start),
@@ -1781,10 +2183,12 @@ impl Editor {
     /// position: (mode, offset, slide, measured value), all in doc units.
     /// For angles the offset is SIGNED: its side picks which supplementary
     /// sweep the arc occupies. For point-pair dims the CURSOR DECIDES THE
-    /// SEMANTICS (Fusion-style): offset roughly perpendicular to the pair
-    /// -> aligned displacement; mostly horizontal -> X span; mostly
-    /// vertical -> Y span. The mode is part of the result — callers must
-    /// apply it via DimTarget::with_mode or it never reaches the render.
+    /// SEMANTICS: axis-aligned edges never offer their zero span (vertical
+    /// -> Y, horizontal -> X); slanted pairs give Aligned inside the ±30°
+    /// perpendicular cone around the edge, Y when the cursor sits
+    /// left/right of center, X when above/below. The mode is part of the
+    /// result — callers must apply it via DimTarget::with_mode or it never
+    /// reaches the render.
     fn dim_placement(
         &self,
         target: crate::core::constraints::DimTarget,
@@ -1799,24 +2203,43 @@ impl Editor {
                 let len = pick::distance(pa, pb);
                 let dx = pb.x - pa.x;
                 let dy = pb.y - pa.y;
-                // Mode from where the cursor sits relative to the pair.
-                let along = rel.0 * u.0 + rel.1 * u.1;
-                let perp = rel.0 * n.0 + rel.1 * n.1;
-                // Keep the three intent zones mutually intuitive.  The
-                // aligned rail is selected when the cursor is above/below
-                // the measured segment.  For axis dimensions, Fusion's
-                // convention is that the cursor's dominant *other* axis
-                // selects the span: vertical cursor travel means X, and
-                // horizontal cursor travel means Y.  The old comparison used
-                // rel.x for X and rel.y for Y, which made slanted spans feel
-                // backwards and caused mode flicker near the diagonals.
-                let mode = if perp.abs() > along.abs() {
-                    DimMode::Aligned
-                } else if rel.1.abs() >= rel.0.abs() {
+                // Mode from where the cursor sits relative to the pair's
+                // midpoint (not its first endpoint — endpoint-relative zones
+                // slide around as the pair moves and feel arbitrary).
+                //  - axis-aligned edges never offer the zero span: a vertical
+                //    edge is ALWAYS Y (height), a horizontal edge ALWAYS X
+                //    (width), wherever the cursor is;
+                //  - slanted pairs: the perpendicular cone around the edge
+                //    (±30° of the normal) gives the Aligned displacement;
+                //  - elsewhere left/right of center means height (Y) and
+                //    above/below means width (X).
+                let mid = Point2::new((pa.x + pb.x) / 2., (pa.y + pb.y) / 2.);
+                let vm = (cursor.x - mid.x, cursor.y - mid.y);
+                let is_vertical =
+                    dy.abs() > 1e-9 && dx.abs() <= dy.abs() * 0.0875;
+                let is_horizontal =
+                    dx.abs() > 1e-9 && dy.abs() <= dx.abs() * 0.0875;
+                let mode = if is_vertical {
+                    DimMode::Y
+                } else if is_horizontal {
                     DimMode::X
                 } else {
-                    DimMode::Y
+                    let vm_len = (vm.0 * vm.0 + vm.1 * vm.1).sqrt();
+                    let cos_perp = if vm_len < 1e-9 {
+                        1.0
+                    } else {
+                        ((vm.0 * n.0 + vm.1 * n.1).abs()) / vm_len
+                    };
+                    if cos_perp > 0.866 {
+                        DimMode::Aligned
+                    } else if vm.0.abs() >= vm.1.abs() {
+                        DimMode::Y
+                    } else {
+                        DimMode::X
+                    }
                 };
+                let along = rel.0 * u.0 + rel.1 * u.1;
+                let perp = rel.0 * n.0 + rel.1 * n.1;
                 let (offset, slide, measured) = match mode {
                     DimMode::Aligned => (
                         perp,
@@ -2704,9 +3127,10 @@ impl Editor {
                 self.pending_line = Some(pending);
                 return true;
             }
-            self.pending_via_click = false;
-            self.tool = Tool::Move;
-            self.creation_cursor = None;
+            // Drag-release commit: chain the next line from this endpoint,
+            // staying in line mode for continuous drawing.
+            self.pending_via_click = true;
+            self.snap_guides.clear();
             if pick::distance(b, pending.start) > 1e-6 {
                 let layer_id = self.doc.layers[0].id;
                 let seg = self.create_line(layer_id, pending.start, b);
@@ -2714,6 +3138,9 @@ impl Editor {
                     self.maybe_add_tangent(seg, b);
                 }
                 self.selection = vec![ElementRef::Segment(seg)];
+                self.pending_line = Some(PendingLine { start: b, cursor: b });
+            } else {
+                self.pending_line = Some(pending);
             }
             return true;
         }
@@ -3283,6 +3710,7 @@ impl Editor {
         self.marquee = None;
         self.deferred_pick = None;
         self.group_drag_last = None;
+        self.arc_center_reveal.clear();
     }
 
     // True when the element itself, or anything SELECTED that contains it,

@@ -39,9 +39,23 @@ const ANCHOR_WEIGHT: f64 = 1.0;
 const DIM_WEIGHT: f64 = 1e6;
 const EQ_WEIGHT: f64 = 1e6;
 const DRAG_WEIGHT: f64 = 1e3;
+// Implicit arc followers, per role (see build): left-behind endpoints stay
+// (stretch pivots), the center is middle ground, and the bend follows an
+// endpoint drag loosely so the shape survives instead of collapsing flat
+// and flipping sides.
+const ARC_ANCHOR_FACTOR: f64 = 8.0;
+const ENDPOINT_ANCHOR_FACTOR: f64 = 10.0;
+const CENTER_ANCHOR_FACTOR: f64 = 7.0;
+const CTRL_FOLLOW_FACTOR: f64 = 2.5;
+// Line endpoints freed so a tangent/parallel line can rotate instead of
+// forcing the arc center to do all the work. Weak: rotation stays easy.
+const TANGENT_ANCHOR_FACTOR: f64 = 4.0;
 const MAX_ITER: usize = 60;
 const TOL: f64 = 1e-10;
 const LAMBDA_INIT: f64 = 1e-3;
+// Per-iteration step cap (doc units). Halved from the old 100-unit cap
+// that let one LM step teleport arc centers across the canvas.
+const STEP_CAP: f64 = 50.0;
 
 // One equation over point positions.
 #[derive(Clone, Copy, Debug)]
@@ -66,11 +80,13 @@ enum Eq {
     // Expresses an arc radius constraint through its three defining points.
     ArcRadius { s: usize, e: usize, c: usize, target: f64 },
     EqualRadius { o: usize, a: usize, b: usize },
-    // Keeps the control point on the same side of the chord during a drag.
-    // Without this one-sided equation, a least-squares step can take the
-    // mathematically equivalent mirrored arc when the cursor moves only a
-    // fraction of a pixel.
-    ArcSide { s: usize, e: usize, c: usize, side: f64 },
+    // Minimum-bend barrier for live drags: keeps |bend height| above a small
+    // floor so micro-drags can't push the arc through flat (the instant it
+    // goes flat, the sweep representation flips sides and the whole arc
+    // strobes). Memory-free — it resists crossing from whichever side the
+    // iterate is on, so unlike a stored-side hinge it can never lock in a
+    // flip that already happened. Deliberate large drags can still invert.
+    ArcBend { s: usize, e: usize, c: usize },
     Tangent { l1: usize, l2: usize, o: usize, p: usize },
     CirclePoint { p: usize, o: usize, radius: f64 },
     Parallel { a1: usize, a2: usize, b1: usize, b2: usize },
@@ -99,9 +115,10 @@ pub struct Solver {
     eqs: Vec<Eq>,
     // Dragged slots and cursor targets.
     drag: Vec<(usize, Point2)>,
-    // Auxiliary slots: free followers with a strong anchor toward
-    // `aux_anchor` (their gesture-start position).
-    aux: Vec<(usize, Point2)>,
+    // Auxiliary slots: free followers with an anchor toward their position.
+    // The f64 is a multiplier over `anchor_weight` (1.0 = normal follower,
+    // ARC_ANCHOR_FACTOR = implicitly-freed arc points that must stay put).
+    aux: Vec<(usize, Point2, f64)>,
     // Map slot index -> free variable index (None when fixed).
     free_of: Vec<Option<usize>>,
     n_free: usize,
@@ -192,6 +209,10 @@ impl Solver {
         }
         // Arc centers are part of the constraint graph. These equations keep
         // the stored center equidistant from all three arc-defining points.
+        // The bend barrier is drag-only (live drags pass non-empty `drag`;
+        // dimension/constraint applies pass empty): a shallow-but-valid
+        // radius dimension must never fight it.
+        let live_drag = !drag.is_empty();
         for (_, seg) in doc.all_segments() {
             if seg.kind != crate::core::document::SegmentKind::Arc { continue; }
             let (Some(o), Some(a), Some(b), Some(c)) = (
@@ -199,19 +220,8 @@ impl Solver {
                 slot_of(seg.end), seg.ctrl.and_then(|id| slot_of(id))) else { continue };
             eqs.push(Eq::EqualRadius { o, a, b });
             eqs.push(Eq::EqualRadius { o, a, b: c });
-            if let (Some(ps), Some(pe), Some(pc)) = (
-                doc.point(seg.start), doc.point(seg.end), seg.ctrl.and_then(|id| doc.point(id))
-            ) {
-                let cross = (pe.x - ps.x) * (pc.y - ps.y)
-                    - (pe.y - ps.y) * (pc.x - ps.x);
-                if cross.abs() > 1e-9 {
-                    eqs.push(Eq::ArcSide {
-                        s: a,
-                        e: b,
-                        c,
-                        side: cross.signum(),
-                    });
-                }
+            if live_drag {
+                eqs.push(Eq::ArcBend { s: a, e: b, c });
             }
         }
 
@@ -401,31 +411,100 @@ impl Solver {
             }
         }
 
-        let mut aux_idx: Vec<(usize, Point2)> = Vec::new();
+        let mut aux_idx: Vec<(usize, Point2, f64)> = Vec::new();
         for &(pid, anchor) in aux {
             if let Some(&i) = index.get(&pid) {
-                aux_idx.push((i, anchor));
                 if free_of[i].is_none() {
                     free_of[i] = Some(n_free);
                     n_free += 1;
                     fixed[i] = false;
                 }
+                // Refresh to current position if already free (e.g. an arc
+                // point that is both a ring follower and arc-implicit): the
+                // anchor must track the live geometry, not gesture start.
+                if let Some(entry) = aux_idx.iter_mut().find(|(s, _, _)| *s == i) {
+                    entry.1 = fixed_pos[i];
+                } else {
+                    aux_idx.push((i, anchor, 1.0));
+                }
             }
         }
 
         // An arc is one solver component during a drag. Free all defining
-        // points and its center together when any one is dragged.
+        // points and its center together when any one is dragged, anchored
+        // at the CURRENT position. Roles get different strengths: a left-
+        // behind endpoint should stay (stretch pivot), the bend follows an
+        // endpoint drag loosely so the shape survives instead of collapsing
+        // flat and flipping, and the center is in the middle.
         for (_, seg) in doc.all_segments() {
             if seg.kind != crate::core::document::SegmentKind::Arc { continue; }
             let mut ids = vec![seg.start, seg.end];
             if let Some(id) = seg.ctrl { ids.push(id); }
             if let Some(id) = seg.center { ids.push(id); }
             if !drag.iter().any(|(id, _)| ids.contains(id)) { continue; }
+            let dragged_center = seg.center.is_some_and(|id| drag.iter().any(|(d, _)| *d == id));
+            let dragged_ctrl = seg.ctrl.is_some_and(|id| drag.iter().any(|(d, _)| *d == id));
+            let dragged_endpoint =
+                drag.iter().any(|(d, _)| *d == seg.start || *d == seg.end);
             for pid in ids {
+                // Per-role anchor strength (see comment above).
+                let factor = if Some(pid) == seg.center {
+                    CENTER_ANCHOR_FACTOR
+                } else if Some(pid) == seg.ctrl {
+                    if dragged_endpoint { CTRL_FOLLOW_FACTOR } else { ARC_ANCHOR_FACTOR }
+                } else if dragged_ctrl || dragged_center {
+                    ARC_ANCHOR_FACTOR
+                } else {
+                    // A left-behind endpoint while its partner is dragged.
+                    ENDPOINT_ANCHOR_FACTOR
+                };
                 let Some(&i) = index.get(&pid) else { continue };
                 if free_of[i].is_none() {
                     free_of[i] = Some(n_free); n_free += 1; fixed[i] = false;
-                    aux_idx.push((i, fixed_pos[i]));
+                    aux_idx.push((i, fixed_pos[i], factor));
+                } else if let Some(entry) = aux_idx.iter_mut().find(|(s, _, _)| *s == i) {
+                    // Already a follower (e.g. dragged directly): keep its
+                    // target but promote the anchor strength.
+                    entry.2 = entry.2.max(factor);
+                }
+            }
+        }
+
+        // Tangent/parallel lines must be able to ROTATE when their contact
+        // is dragged. Their constraints store a==b==contact, so the generic
+        // ring-follower logic never frees the line's far endpoint — it stays
+        // hard-fixed and the solver has to satisfy tangency by throwing the
+        // arc center around (the bounce). Free those far endpoints here as
+        // weak followers anchored at their current positions.
+        for c in &doc.constraints {
+            let (ids, touched) = match c.kind {
+                crate::core::constraints::ConstraintKind::Tangent => {
+                    let Some((line_id, arc_id)) = c.tangent_segments else { continue };
+                    let (Some(line), Some(arc)) = (doc.segment(line_id), doc.segment(arc_id)) else { continue };
+                    let mut v = vec![line.start, line.end, c.a, c.b];
+                    v.push(arc.start);
+                    v.push(arc.end);
+                    if let Some(id) = arc.ctrl { v.push(id); }
+                    if let Some(id) = arc.center { v.push(id); }
+                    let touched = drag.iter().any(|(id, _)| v.contains(id));
+                    (vec![line.start, line.end], touched)
+                }
+                crate::core::constraints::ConstraintKind::Parallel => {
+                    let Some((first, second)) = c.tangent_segments else { continue };
+                    let (Some(a_seg), Some(b_seg)) = (doc.segment(first), doc.segment(second)) else { continue };
+                    let v = vec![a_seg.start, a_seg.end, b_seg.start, b_seg.end];
+                    let touched = drag.iter().any(|(id, _)| v.contains(id));
+                    (v, touched)
+                }
+                _ => continue,
+            };
+            if !touched { continue; }
+            for pid in ids {
+                let Some(&i) = index.get(&pid) else { continue };
+                if drag.iter().any(|(id, _)| *id == pid) { continue; }
+                if free_of[i].is_none() {
+                    free_of[i] = Some(n_free); n_free += 1; fixed[i] = false;
+                    aux_idx.push((i, fixed_pos[i], TANGENT_ANCHOR_FACTOR));
                 }
             }
         }
@@ -687,63 +766,96 @@ impl Solver {
                     });
                 }
                 Eq::EqualRadius { o, a, b } => {
+                    // Normalized: |pa-po| - |pb-po| in doc units. The old
+                    // squared-distance form scaled with radius^2, so a large
+                    // arc dominated the system and micro-drags slingshot the
+                    // center.
                     let (po, pa, pb) = (self.pos(o, x), self.pos(a, x), self.pos(b, x));
-                    let value = (pa.x - po.x).powi(2) + (pa.y - po.y).powi(2)
-                        - (pb.x - po.x).powi(2) - (pb.y - po.y).powi(2);
+                    let dax = pa.x - po.x;
+                    let day = pa.y - po.y;
+                    let dbx = pb.x - po.x;
+                    let dby = pb.y - po.y;
+                    let da = (dax * dax + day * day).sqrt().max(1e-9);
+                    let db = (dbx * dbx + dby * dby).sqrt().max(1e-9);
+                    let (uax, uay) = (dax / da, day / da);
+                    let (ubx, uby) = (dbx / db, dby / db);
                     let mut grad = Vec::new();
                     if let Some(v) = self.free_of[o] {
-                        grad.push((v * 2, 2.0 * (pb.x - pa.x)));
-                        grad.push((v * 2 + 1, 2.0 * (pb.y - pa.y)));
+                        grad.push((v * 2, ubx - uax));
+                        grad.push((v * 2 + 1, uby - uay));
                     }
                     if let Some(v) = self.free_of[a] {
-                        grad.push((v * 2, 2.0 * (pa.x - po.x)));
-                        grad.push((v * 2 + 1, 2.0 * (pa.y - po.y)));
+                        grad.push((v * 2, uax));
+                        grad.push((v * 2 + 1, uay));
                     }
                     if let Some(v) = self.free_of[b] {
-                        grad.push((v * 2, -2.0 * (pb.x - po.x)));
-                        grad.push((v * 2 + 1, -2.0 * (pb.y - po.y)));
+                        grad.push((v * 2, -ubx));
+                        grad.push((v * 2 + 1, -uby));
                     }
-                    out.push(Residual { value, grad, weight: EQ_WEIGHT });
+                    out.push(Residual { value: da - db, grad, weight: EQ_WEIGHT });
                 }
-                Eq::ArcSide { s, e, c, side } => {
+                Eq::ArcBend { s, e, c } => {
+                    // Minimum-bend barrier in doc units: keeps the bend
+                    // height off the chord above a small floor. Zero when
+                    // satisfied; pushing back toward the current side when
+                    // violated (gradient follows sign(h), so no stored side
+                    // is needed and a flip can never get locked in).
                     let (ps, pe, pc) = (self.pos(s, x), self.pos(e, x), self.pos(c, x));
                     let ux = pe.x - ps.x;
                     let uy = pe.y - ps.y;
                     let vx = pc.x - ps.x;
                     let vy = pc.y - ps.y;
-                    let cross = ux * vy - uy * vx;
-                    let signed = side * cross;
+                    let chord = (ux * ux + uy * uy).sqrt().max(1e-9);
+                    let h = (ux * vy - uy * vx) / chord;
+                    let min_h = (0.025 * chord).clamp(1.0, 8.0);
+                    let h_abs = h.abs();
                     let mut grad = Vec::new();
-                    if signed < 0. {
+                    if h_abs < min_h {
+                        // d(h_abs) = sign(h) * dh; residual = min_h - h_abs.
+                        let sgn = if h >= 0. { 1.0 } else { -1.0 };
                         if let Some(v) = self.free_of[s] {
-                            grad.push((v * 2, side * (-vy + uy)));
-                            grad.push((v * 2 + 1, side * (-ux + vx)));
+                            grad.push((v * 2, -sgn * (-vy + uy) / chord));
+                            grad.push((v * 2 + 1, -sgn * (-ux + vx) / chord));
                         }
                         if let Some(v) = self.free_of[e] {
-                            grad.push((v * 2, side * vy));
-                            grad.push((v * 2 + 1, side * -vx));
+                            grad.push((v * 2, -sgn * vy / chord));
+                            grad.push((v * 2 + 1, -sgn * -vx / chord));
                         }
                         if let Some(v) = self.free_of[c] {
-                            grad.push((v * 2, side * -uy));
-                            grad.push((v * 2 + 1, side * ux));
+                            grad.push((v * 2, -sgn * -uy / chord));
+                            grad.push((v * 2 + 1, -sgn * ux / chord));
                         }
                     }
                     out.push(Residual {
-                        value: signed.min(0.),
+                        value: (min_h - h_abs).max(0.),
                         grad,
                         weight: EQ_WEIGHT,
                     });
                 }
                 Eq::Tangent { l1, l2, o, p } => {
+                    // Transverse distance in doc units: dot/mean_len, 0 when
+                    // perpendicular. Raw dot scaled with length*radius so
+                    // long lines yanked arcs on micro-drags; pure cosine was
+                    // too soft next to distance constraints. Mean-length
+                    // scaling keeps units consistent with the rest.
                     let (a, b, center, contact) = (self.pos(l1, x), self.pos(l2, x), self.pos(o, x), self.pos(p, x));
                     let vx = b.x - a.x; let vy = b.y - a.y;
                     let rx = contact.x - center.x; let ry = contact.y - center.y;
+                    let lv = (vx * vx + vy * vy).sqrt().max(1e-9);
+                    let lr = (rx * rx + ry * ry).sqrt().max(1e-9);
+                    let m = ((lv + lr) / 2.).max(1e-9);
+                    let dot = vx * rx + vy * ry;
+                    let value = dot / m;
+                    let dvx = rx / m - dot * vx / (2. * lv * m * m);
+                    let dvy = ry / m - dot * vy / (2. * lv * m * m);
+                    let drx = vx / m - dot * rx / (2. * lr * m * m);
+                    let dry = vy / m - dot * ry / (2. * lr * m * m);
                     let mut grad = Vec::new();
-                    if let Some(v) = self.free_of[l1] { grad.push((v * 2, -rx)); grad.push((v * 2 + 1, -ry)); }
-                    if let Some(v) = self.free_of[l2] { grad.push((v * 2, rx)); grad.push((v * 2 + 1, ry)); }
-                    if let Some(v) = self.free_of[o] { grad.push((v * 2, -vx)); grad.push((v * 2 + 1, -vy)); }
-                    if let Some(v) = self.free_of[p] { grad.push((v * 2, vx)); grad.push((v * 2 + 1, vy)); }
-                    out.push(Residual { value: vx * rx + vy * ry, grad, weight: EQ_WEIGHT });
+                    if let Some(v) = self.free_of[l1] { grad.push((v * 2, -dvx)); grad.push((v * 2 + 1, -dvy)); }
+                    if let Some(v) = self.free_of[l2] { grad.push((v * 2, dvx)); grad.push((v * 2 + 1, dvy)); }
+                    if let Some(v) = self.free_of[o] { grad.push((v * 2, -drx)); grad.push((v * 2 + 1, -dry)); }
+                    if let Some(v) = self.free_of[p] { grad.push((v * 2, drx)); grad.push((v * 2 + 1, dry)); }
+                    out.push(Residual { value, grad, weight: EQ_WEIGHT });
                 }
                 Eq::CirclePoint { p, o, radius } => {
                     let (point, center) = (self.pos(p, x), self.pos(o, x));
@@ -762,15 +874,25 @@ impl Solver {
                     out.push(Residual { value: length - radius, grad, weight: EQ_WEIGHT });
                 }
                 Eq::Parallel { a1, a2, b1, b2 } => {
+                    // Transverse distance in doc units: cross/mean_len.
                     let (a, b, c, d) = (self.pos(a1, x), self.pos(a2, x), self.pos(b1, x), self.pos(b2, x));
                     let ux = b.x - a.x; let uy = b.y - a.y;
                     let vx = d.x - c.x; let vy = d.y - c.y;
+                    let lu = (ux * ux + uy * uy).sqrt().max(1e-9);
+                    let lv = (vx * vx + vy * vy).sqrt().max(1e-9);
+                    let m = ((lu + lv) / 2.).max(1e-9);
+                    let cross = ux * vy - uy * vx;
+                    let value = cross / m;
+                    let dux = vy / m - cross * ux / (2. * lu * m * m);
+                    let duy = -vx / m - cross * uy / (2. * lu * m * m);
+                    let dvx = -uy / m - cross * vx / (2. * lv * m * m);
+                    let dvy = ux / m - cross * vy / (2. * lv * m * m);
                     let mut grad = Vec::new();
-                    if let Some(i) = self.free_of[a1] { grad.push((i * 2, vy)); grad.push((i * 2 + 1, -vx)); }
-                    if let Some(i) = self.free_of[a2] { grad.push((i * 2, -vy)); grad.push((i * 2 + 1, vx)); }
-                    if let Some(i) = self.free_of[b1] { grad.push((i * 2, -uy)); grad.push((i * 2 + 1, ux)); }
-                    if let Some(i) = self.free_of[b2] { grad.push((i * 2, uy)); grad.push((i * 2 + 1, -ux)); }
-                    out.push(Residual { value: ux * vy - uy * vx, grad, weight: EQ_WEIGHT });
+                    if let Some(i) = self.free_of[a1] { grad.push((i * 2, -dux)); grad.push((i * 2 + 1, -duy)); }
+                    if let Some(i) = self.free_of[a2] { grad.push((i * 2, dux)); grad.push((i * 2 + 1, duy)); }
+                    if let Some(i) = self.free_of[b1] { grad.push((i * 2, -dvx)); grad.push((i * 2 + 1, -dvy)); }
+                    if let Some(i) = self.free_of[b2] { grad.push((i * 2, dvx)); grad.push((i * 2 + 1, dvy)); }
+                    out.push(Residual { value, grad, weight: EQ_WEIGHT });
                 }
                 Eq::ArcRadius { s, e, c, target } => {
                     let (ps, pe, pc) = (self.pos(s, x), self.pos(e, x), self.pos(c, x));
@@ -831,17 +953,18 @@ impl Solver {
                 });
             }
         }
-        for &(i, anchor) in &self.aux {
+        for &(i, anchor, factor) in &self.aux {
             if let Some(v) = self.free_of[i] {
+                let w = self.anchor_weight * factor;
                 out.push(Residual {
                     value: x[v].x - anchor.x,
                     grad: vec![(v * 2, 1.0)],
-                    weight: self.anchor_weight,
+                    weight: w,
                 });
                 out.push(Residual {
                     value: x[v].y - anchor.y,
                     grad: vec![(v * 2 + 1, 1.0)],
-                    weight: self.anchor_weight,
+                    weight: w,
                 });
             }
         }
@@ -903,9 +1026,11 @@ impl Solver {
                         .iter()
                         .zip(dx.chunks_exact(2))
                         .map(|(p, d)| {
-                            let cap = 100.0;
-                            Point2::new(p.x + d[0].clamp(-cap, cap), p.y + d[1].clamp(-cap, cap))
-                                .clamped()
+                            Point2::new(
+                                p.x + d[0].clamp(-STEP_CAP, STEP_CAP),
+                                p.y + d[1].clamp(-STEP_CAP, STEP_CAP),
+                            )
+                            .clamped()
                         })
                         .collect();
                     let new_cost = Self::cost(&self.residuals(&trial));
@@ -1009,22 +1134,31 @@ impl Solver {
                 }
                 Eq::EqualRadius { o, a, b } => {
                     let (po, pa, pb) = (self.pos(o, x), self.pos(a, x), self.pos(b, x));
-                    let v = ((pa.x - po.x).powi(2) + (pa.y - po.y).powi(2)
-                        - (pb.x - po.x).powi(2) - (pb.y - po.y).powi(2)).abs();
-                    lin = lin.max(v);
+                    let da = ((pa.x - po.x).powi(2) + (pa.y - po.y).powi(2)).sqrt();
+                    let db = ((pb.x - po.x).powi(2) + (pb.y - po.y).powi(2)).sqrt();
+                    lin = lin.max((da - db).abs());
                     continue;
                 }
-                Eq::ArcSide { s, e, c, side } => {
+                Eq::ArcBend { s, e, c } => {
                     let (ps, pe, pc) = (self.pos(s, x), self.pos(e, x), self.pos(c, x));
-                    let cross = (pe.x - ps.x) * (pc.y - ps.y)
-                        - (pe.y - ps.y) * (pc.x - ps.x);
-                    lin = lin.max((-side * cross).max(0.));
+                    let ux = pe.x - ps.x;
+                    let uy = pe.y - ps.y;
+                    let chord = (ux * ux + uy * uy).sqrt().max(1e-9);
+                    let h = (ux * (pc.y - ps.y) - uy * (pc.x - ps.x)) / chord;
+                    let min_h = (0.025 * chord).clamp(1.0, 8.0);
+                    lin = lin.max((min_h - h.abs()).max(0.));
                     continue;
                 }
                 Eq::Tangent { l1, l2, o, p } => {
                     let (a, b, center, contact) = (self.pos(l1, x), self.pos(l2, x), self.pos(o, x), self.pos(p, x));
-                    let v = ((b.x - a.x) * (contact.x - center.x)
-                        + (b.y - a.y) * (contact.y - center.y)).abs();
+                    let vx = b.x - a.x;
+                    let vy = b.y - a.y;
+                    let rx = contact.x - center.x;
+                    let ry = contact.y - center.y;
+                    let lv = (vx * vx + vy * vy).sqrt().max(1e-9);
+                    let lr = (rx * rx + ry * ry).sqrt().max(1e-9);
+                    let m = ((lv + lr) / 2.).max(1e-9);
+                    let v = (vx * rx + vy * ry).abs() / m;
                     lin = lin.max(v);
                     continue;
                 }
@@ -1036,7 +1170,15 @@ impl Solver {
                 }
                 Eq::Parallel { a1, a2, b1, b2 } => {
                     let (a, b, c, d) = (self.pos(a1, x), self.pos(a2, x), self.pos(b1, x), self.pos(b2, x));
-                    lin = lin.max(((b.x - a.x) * (d.y - c.y) - (b.y - a.y) * (d.x - c.x)).abs());
+                    let ux = b.x - a.x;
+                    let uy = b.y - a.y;
+                    let vx = d.x - c.x;
+                    let vy = d.y - c.y;
+                    let lu = (ux * ux + uy * uy).sqrt().max(1e-9);
+                    let lv = (vx * vx + vy * vy).sqrt().max(1e-9);
+                    let m = ((lu + lv) / 2.).max(1e-9);
+                    let v = (ux * vy - uy * vx).abs() / m;
+                    lin = lin.max(v);
                     continue;
                 }
                 Eq::ArcRadius { s, e, c, target } => {

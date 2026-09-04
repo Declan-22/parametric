@@ -77,6 +77,7 @@ pub fn build_draw_list(
     pending_circle: Option<crate::editor::PendingCircle>,
     show_grid: bool,
     tool: crate::editor::Tool,
+    cursor_doc: Option<Point2>,
 ) -> Vec<Primitive> {
     let min = camera.screen_to_unit(Point2::new(0., 0.));
     let max = camera.screen_to_unit(Point2::new(
@@ -224,6 +225,46 @@ pub fn build_draw_list(
         }
     }
 
+    // 1b) Arc CENTER reveal: when the cursor sits inside an arc's full
+    // circle (the disk, not just near the curve), draw its center — the
+    // middle of the whole sweep's circle — so it is discoverable without
+    // pixel-hunting hover. (Not the on-curve third point; the centerpoint.)
+    if let Some(cur) = cursor_doc {
+        for (_sid, seg) in doc.all_segments() {
+            if seg.kind != SegmentKind::Arc {
+                continue;
+            }
+            let Some(sc) = seg.ctrl else { continue };
+            let (Some(sa), Some(sb), Some(scp)) =
+                (doc.point(seg.start), doc.point(seg.end), doc.point(sc))
+            else {
+                continue;
+            };
+            let Some((center, r)) = crate::editor::arc::circumcircle(sa, sb, scp) else {
+                continue;
+            };
+            if r < 1e-9 {
+                continue;
+            }
+            let dx = cur.x - center.x;
+            let dy = cur.y - center.y;
+            if (dx * dx + dy * dy).sqrt() > r {
+                continue;
+            }
+            // Prefer the stored center point; fall back to the computed one.
+            let c = seg.center.and_then(|id| doc.point(id)).unwrap_or(center);
+            if !visible.contains(c) {
+                continue;
+            }
+            let (mx, my) = scr(c);
+            list.push(Primitive::Circle {
+                cx: mx,
+                cy: my,
+                radius: 4.,
+            });
+        }
+    }
+
     // 2) Dimension lines: extension stubs + parallel dashed dim line,
     // any angle. Drawn UNDER points/selection so corner dots always sit
     // on top. Tool-created dimension constraints render in the muted
@@ -294,17 +335,24 @@ pub fn build_draw_list(
         let from = camera.unit_to_screen(g.from);
         let to = camera.unit_to_screen(g.to);
         // Linked features are already joined by the shape's own geometry —
-        // the dashed stub would double-draw an existing edge.
+        // the dashed stub would double-draw an existing edge. Edge-body hits
+        // (no real point anchor) never earn a stub either. Sub-4px stubs are
+        // cursor jitter, not alignment information — skip them so guides
+        // stop popping in and out for no apparent reason.
         if !g.linked {
-            dashed_line(
-                &mut list,
-                from.x as f32,
-                from.y as f32,
-                to.x as f32,
-                to.y as f32,
-                2.,
-                accent,
-            );
+            let dx = to.x - from.x;
+            let dy = to.y - from.y;
+            if (dx * dx + dy * dy).sqrt() >= 4.0 {
+                dashed_line(
+                    &mut list,
+                    from.x as f32,
+                    from.y as f32,
+                    to.x as f32,
+                    to.y as f32,
+                    2.,
+                    accent,
+                );
+            }
         }
         if !is_creation {
             list.push(Primitive::Circle {

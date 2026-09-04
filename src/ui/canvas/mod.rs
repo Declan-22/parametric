@@ -34,6 +34,7 @@ impl RenderOnce for CanvasView {
         let editor_up_l = self.editor.clone();
         let editor_up_m = self.editor.clone();
         let editor_scroll = self.editor.clone();
+        let editor_hover_out = self.editor.clone();
         let focus_l = self.focus.clone();
         let focus_m = self.focus.clone();
 
@@ -84,6 +85,23 @@ impl RenderOnce for CanvasView {
                     });
                 },
             )
+            .on_hover(move |hovered, _, cx| {
+                if !*hovered {
+                    let _ = editor_hover_out.update(cx, |ed, cx| {
+                        let mut changed = ed.clear_arc_reveal();
+                        if ed.hover.take().is_some() {
+                            changed = true;
+                        }
+                        if !ed.snap_guides.is_empty() {
+                            ed.snap_guides.clear();
+                            changed = true;
+                        }
+                        if changed {
+                            cx.notify();
+                        }
+                    });
+                }
+            })
             .on_mouse_move(move |e: &MouseMoveEvent, _, cx| {
                 let shift = e.modifiers.shift;
                 let _ = editor_move.update(cx, |ed, cx| {
@@ -96,6 +114,10 @@ impl RenderOnce for CanvasView {
                         changed |= ed.canvas_hover(canvas_pos(e.position));
                     }
                     changed |= ed.canvas_drag(canvas_pos(e.position), shift);
+                    // Arc center reveal follows the raw cursor even when
+                    // nothing else changed — otherwise the dot sticks
+                    // around after the mouse leaves the disk.
+                    changed |= ed.update_arc_reveal(ed.cursor_doc(canvas_pos(e.position)));
                     if changed {
                         cx.notify();
                     }
@@ -544,6 +566,12 @@ impl CanvasView {
                 }
                 p.snapped(ed.shift)
             });
+            let cursor_doc = ed.last_cursor.map(|c| {
+                ed.camera.screen_to_unit(crate::core::geometry::Point2::new(
+                    f64::from(c.x),
+                    f64::from(c.y),
+                ))
+            });
             let list = paint::build_draw_list(
                 &ed.doc,
                 &ed.camera,
@@ -562,6 +590,7 @@ impl CanvasView {
                 ed.pending_circle,
                 ed.show_grid,
                 ed.tool,
+                cursor_doc,
             );
             (list, hitbox)
         };
@@ -672,6 +701,7 @@ impl CanvasView {
                         cy: mcy,
                         radius,
                     } => {
+                        // Points render as rounded squares (2px corners).
                         let r = px(radius);
                         window.paint_quad(gpui::quad(
                             Bounds {
@@ -684,7 +714,7 @@ impl CanvasView {
                                     height: r * 2.,
                                 },
                             },
-                            r,
+                            px(3.),
                             rgb(0xFFFFFF),
                             gpui::Edges::all(px(1.)),
                             rgb(crate::theme::active(cx).accent),

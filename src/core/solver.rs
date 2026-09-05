@@ -1005,22 +1005,26 @@ impl Solver {
                 break;
             }
 
-            let mut jtj = vec![vec![0.0; n]; n];
+            // Keep the dense system in one contiguous buffer. The previous
+            // Vec<Vec<_>> representation allocated one row per solve and
+            // gauss_solve cloned every row on every iteration, which made
+            // live drags disproportionately expensive.
+            let mut jtj = vec![0.0; n * n];
             let mut jtr = vec![0.0; n];
             for r in &self.residuals(&x) {
                 let w = r.weight;
                 for &(vi, gi) in &r.grad {
                     for &(vj, gj) in &r.grad {
-                        jtj[vi][vj] += w * gi * gj;
+                        jtj[vi * n + vj] += w * gi * gj;
                     }
                     jtr[vi] -= w * gi * r.value;
                 }
             }
             for i in 0..n {
-                jtj[i][i] += lambda + 1e-12;
+                jtj[i * n + i] += lambda + 1e-12;
             }
 
-            match gauss_solve(&jtj, &jtr) {
+            match gauss_solve(&jtj, n, &jtr) {
                 Some(dx) => {
                     let trial: Vec<Point2> = x
                         .iter()
@@ -1225,36 +1229,49 @@ fn signed_angle(a1: Point2, a2: Point2, b1: Point2, b2: Point2) -> f64 {
 }
 
 /// Gaussian elimination with partial pivoting; None when singular.
-fn gauss_solve(a: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
+fn gauss_solve(a: &[f64], n: usize, b: &[f64]) -> Option<Vec<f64>> {
+    debug_assert_eq!(a.len(), n * n);
+    debug_assert_eq!(b.len(), n);
     let n = b.len();
-    let mut m: Vec<Vec<f64>> = a.iter().cloned().collect();
-    for i in 0..n {
-        m[i].push(b[i]);
+    // Augment in-place so solving does not first clone a row-vector matrix.
+    let mut m = vec![0.0; n * (n + 1)];
+    for row in 0..n {
+        m[row * (n + 1)..row * (n + 1) + n]
+            .copy_from_slice(&a[row * n..row * n + n]);
+        m[row * (n + 1) + n] = b[row];
     }
-    for col in 0..n {
-        let pivot = (col..n)
-            .max_by(|r1, r2| m[*r1][col].abs().partial_cmp(&m[*r2][col].abs()).unwrap())?;
-        if m[pivot][col].abs() < 1e-14 {
+    for i in 0..n {
+        let pivot = (i..n).max_by(|r1, r2| {
+            m[*r1 * (n + 1) + i]
+                .abs()
+                .partial_cmp(&m[*r2 * (n + 1) + i].abs())
+                .unwrap()
+        })?;
+        if m[pivot * (n + 1) + i].abs() < 1e-14 {
             return None;
         }
-        m.swap(col, pivot);
-        let inv = 1.0 / m[col][col];
-        for r in col + 1..n {
-            let factor = m[r][col] * inv;
+        if pivot != i {
+            for col in i..=n {
+                m.swap(i * (n + 1) + col, pivot * (n + 1) + col);
+            }
+        }
+        let inv = 1.0 / m[i * (n + 1) + i];
+        for row in i + 1..n {
+            let factor = m[row * (n + 1) + i] * inv;
             if factor != 0.0 {
-                for c in col..=n {
-                    m[r][c] -= factor * m[col][c];
+                for col in i..=n {
+                    m[row * (n + 1) + col] -= factor * m[i * (n + 1) + col];
                 }
             }
         }
     }
     let mut out = vec![0.0; n];
-    for r in (0..n).rev() {
-        let mut sum = m[r][n];
-        for c in r + 1..n {
-            sum -= m[r][c] * out[c];
+    for row in (0..n).rev() {
+        let mut sum = m[row * (n + 1) + n];
+        for col in row + 1..n {
+            sum -= m[row * (n + 1) + col] * out[col];
         }
-        out[r] = sum / m[r][r];
+        out[row] = sum / m[row * (n + 1) + row];
     }
     Some(out)
 }

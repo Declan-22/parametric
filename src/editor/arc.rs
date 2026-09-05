@@ -238,7 +238,10 @@ pub fn adaptive_samples(a: Point2, b: Point2, c: Point2, zoom: f64) -> usize {
     // Sagitta per segment ≈ R·(θ/2)²/2; keeping it < 0.5px gives
     // N > |sweep|·sqrt(R)/2.
     let n = ((sweep.abs() * rs.sqrt()) / 2.0).ceil() as usize;
-    n.clamp(16, 4096)
+    // Keep tessellation bounded during extreme zoom or near-collinear arcs.
+    // Beyond this point the curve is visually sub-pixel in practice, while
+    // the allocation and paint cost continues to grow linearly.
+    n.clamp(16, 1024)
 }
 
 /// Sampled polyline of an arc segment for rendering/hit-testing.

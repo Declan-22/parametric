@@ -1,4 +1,5 @@
 use gpui::{Pixels, Size, rgb, rgba};
+use std::collections::HashMap;
 
 use crate::core::constraints::ElementRef;
 use crate::core::document::{Document, SegmentKind};
@@ -90,6 +91,10 @@ pub fn build_draw_list(
     let color: gpui::Background = rgb(0x808080).into();
     let accent: gpui::Background = rgb(t.accent).into();
     let mut list = Vec::new();
+    // Arc tessellation is reused by the base pass and selection overlays.
+    // Keep it frame-local for now; the next step can promote this to a
+    // revision-keyed cache owned by the editor.
+    let mut arc_cache: HashMap<crate::core::ids::SegmentId, Vec<Point2>> = HashMap::new();
 
     // 0) Infinite grid — viewport-culled, LOD-clamped, pan-aware. This is the
     // "genius" part: cost is O(viewport) not O(world). We never allocate
@@ -180,7 +185,9 @@ pub fn build_draw_list(
                             continue;
                         };
                         let n = crate::editor::arc::adaptive_samples(sa, sb, scp, camera.zoom);
-                        let Some(samples) = crate::editor::arc::segment_samples(doc, sid, n) else {
+                        let Some(samples) = cached_arc_samples(
+                            doc, sid, camera.zoom, &mut arc_cache,
+                        ) else {
                             continue;
                         };
                         if samples.iter().any(|p| visible.contains(*p)) {
@@ -380,13 +387,13 @@ pub fn build_draw_list(
     if let Some(h) = hover
         && !selection.contains(&h)
     {
-        element_outline(doc, h, &scr, accent, &mut list, camera.zoom);
+        element_outline(doc, h, &scr, accent, &mut list, camera.zoom, &mut arc_cache);
     }
 
     // 5) Selection highlights + point handles drawn after everything —
     // points are the topmost affordance in the entire stack.
     for &sel in selection {
-        element_outline(doc, sel, &scr, accent, &mut list, camera.zoom);
+        element_outline(doc, sel, &scr, accent, &mut list, camera.zoom, &mut arc_cache);
     }
     for &sel in selection {
         for pid in doc.element_points(sel) {
@@ -646,6 +653,7 @@ fn element_outline(
     accent: gpui::Background,
     list: &mut Vec<Primitive>,
     zoom: f64,
+    arc_cache: &mut HashMap<crate::core::ids::SegmentId, Vec<Point2>>,
 ) {
     match el {
         // Points use the SAME styling everywhere: one clean small dot.
@@ -662,14 +670,7 @@ fn element_outline(
         ElementRef::Segment(sid) => {
             if let Some(seg) = doc.segment(sid)
                 && seg.kind == SegmentKind::Arc
-                && let Some(sc) = seg.ctrl
-                && let (Some(a), Some(b), Some(c)) =
-                    (doc.point(seg.start), doc.point(seg.end), doc.point(sc))
-                && let Some(samples) = crate::editor::arc::segment_samples(
-                    doc,
-                    sid,
-                    crate::editor::arc::adaptive_samples(a, b, c, zoom),
-                )
+                && let Some(samples) = cached_arc_samples(doc, sid, zoom, arc_cache)
             {
                 let pts: Vec<(f32, f32)> = samples.iter().map(|p| scr(*p)).collect();
                 push_polyline(list, &pts, 2.5, accent);
@@ -901,6 +902,22 @@ fn push_grid(
             major_color,
         );
     }
+}
+
+fn cached_arc_samples<'a>(
+    doc: &Document,
+    sid: crate::core::ids::SegmentId,
+    zoom: f64,
+    cache: &'a mut HashMap<crate::core::ids::SegmentId, Vec<Point2>>,
+) -> Option<&'a Vec<Point2>> {
+    if !cache.contains_key(&sid) {
+        let seg = doc.segment(sid)?;
+        let ctrl = seg.ctrl?;
+        let (a, b, c) = (doc.point(seg.start)?, doc.point(seg.end)?, doc.point(ctrl)?);
+        let n = crate::editor::arc::adaptive_samples(a, b, c, zoom);
+        cache.insert(sid, crate::editor::arc::segment_samples(doc, sid, n)?);
+    }
+    cache.get(&sid)
 }
 
 // Dashed straight line between two screen points, any angle.

@@ -1084,9 +1084,19 @@ impl Solver {
             self.residuals_into(&x, &mut residuals);
             for r in &residuals {
                 let w = r.weight;
-                for &(vi, gi) in &r.grad {
-                    for &(vj, gj) in &r.grad {
-                        jtj[vi * n + vj] += w * gi * gj;
+                // JᵀJ is symmetric. Assemble each gradient pair once and
+                // mirror it instead of doing the same multiplication twice.
+                for (i, &(vi, gi)) in r.grad.iter().enumerate() {
+                    for (j, &(vj, gj)) in r.grad.iter().enumerate().skip(i) {
+                        let value = w * gi * gj;
+                        jtj[vi * n + vj] += value;
+                        if vi != vj {
+                            jtj[vj * n + vi] += value;
+                        } else if j != i {
+                            // Two distinct gradient entries can refer to the
+                            // same variable; retain both cross terms.
+                            jtj[vi * n + vj] += value;
+                        }
                     }
                     jtr[vi] -= w * gi * r.value;
                 }

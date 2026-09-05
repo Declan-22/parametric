@@ -113,6 +113,9 @@ pub struct Solver {
     fixed_pos: Vec<Point2>,
     start: Vec<Point2>,
     eqs: Vec<Eq>,
+    // Subset of eqs that touches at least one free variable. Kept separate
+    // so diagnostics can still report the full document constraint state.
+    active_eqs: Vec<Eq>,
     // Dragged slots and cursor targets.
     drag: Vec<(usize, Point2)>,
     // Auxiliary slots: free followers with an anchor toward their position.
@@ -509,6 +512,32 @@ impl Solver {
             }
         }
 
+        let active_eqs = eqs
+            .iter()
+            .copied()
+            .filter(|&eq| {
+                let slots = match eq {
+                    Eq::Horizontal { a, b }
+                    | Eq::Vertical { a, b }
+                    | Eq::Distance { a, b, .. }
+                    | Eq::DistanceX { a, b, .. }
+                    | Eq::DistanceY { a, b, .. } => [a, b, usize::MAX, usize::MAX],
+                    Eq::PointLineDist { p, l1, l2, .. } => [p, l1, l2, usize::MAX],
+                    Eq::LineDist { a1, a2, b1, .. } => [a1, a2, b1, usize::MAX],
+                    Eq::Angle { a1, a2, b1, b2, .. }
+                    | Eq::Parallel { a1, a2, b1, b2 } => [a1, a2, b1, b2],
+                    Eq::ArcRadius { s, e, c, .. }
+                    | Eq::ArcBend { s, e, c } => [s, e, c, usize::MAX],
+                    Eq::EqualRadius { o, a, b } => [o, a, b, usize::MAX],
+                    Eq::Tangent { l1, l2, o, p } => [l1, l2, o, p],
+                    Eq::CirclePoint { p, o, .. } => [p, o, usize::MAX, usize::MAX],
+                };
+                slots.iter().any(|&slot| {
+                    slot != usize::MAX && free_of[slot].is_some()
+                })
+            })
+            .collect();
+
         Solver {
             slots,
             index,
@@ -516,6 +545,7 @@ impl Solver {
             fixed_pos,
             start,
             eqs,
+            active_eqs,
             drag: drag_idx,
             aux: aux_idx,
             free_of,
@@ -575,6 +605,12 @@ impl Solver {
             }
         }
         solver.n_free = next;
+        solver.active_eqs = solver
+            .eqs
+            .iter()
+            .copied()
+            .filter(|&eq| solver.eq_touches_free(eq))
+            .collect();
         solver.anchor_weight = anchor_weight;
         solver
     }
@@ -626,11 +662,8 @@ impl Solver {
     /// Evaluates all weighted residuals (geometric + soft anchors).
     /// Variables are SCALARS: free slot v owns variables (2v, 2v+1).
     fn residuals(&self, x: &[Point2]) -> Vec<Residual> {
-        let mut out = Vec::with_capacity(self.eqs.len() * 2 + self.n_free * 2);
-        for eq in &self.eqs {
-            if !self.eq_touches_free(*eq) {
-                continue;
-            }
+        let mut out = Vec::with_capacity(self.active_eqs.len() * 2 + self.n_free * 2);
+        for eq in &self.active_eqs {
             match *eq {
                 Eq::Horizontal { a, b } => {
                     let (pa, pb) = (self.pos(a, x), self.pos(b, x));

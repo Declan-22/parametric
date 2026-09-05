@@ -1331,6 +1331,16 @@ impl Editor {
             None => crate::core::solver::Solver::build(&self.doc, &targets, &aux_all),
         };
         let solution = solver.solve();
+        // A live drag may request an impossible step, but applying a partial
+        // LM iterate would visibly break a locked constraint. Keep the last
+        // valid geometry until a later cursor position becomes solvable.
+        if !solution.is_valid()
+            || solution.max_lin_residual > 0.5
+            || solution.max_angle_residual > 0.02
+        {
+            self.snap_guides.clear();
+            return true;
+        }
         let mut moved: std::collections::HashSet<PointId> = std::collections::HashSet::new();
         for (id, pos) in solution.positions {
             moved.insert(id);
@@ -2580,7 +2590,10 @@ impl Editor {
         let solution = solver.solve();
         let direct_distance = matches!(target,
             crate::core::constraints::DimTarget::Points { mode: crate::core::constraints::DimMode::Aligned, .. });
-        if (!direct_distance && solution.max_lin_residual > 0.5) || solution.max_angle_residual > 0.02 {
+        if !solution.is_valid()
+            || (!direct_distance && solution.max_lin_residual > 0.5)
+            || solution.max_angle_residual > 0.02
+        {
             self.overconstrained = true;
             return false;
         }
@@ -2798,7 +2811,10 @@ impl Editor {
             1.0,
         );
         let solution = solver.solve();
-        if solution.max_lin_residual <= 0.5 && solution.max_angle_residual <= 0.02 {
+        if solution.is_valid()
+            && solution.max_lin_residual <= 0.5
+            && solution.max_angle_residual <= 0.02
+        {
             for (id, pos) in solution.positions {
                 self.doc.move_point(id, pos);
             }

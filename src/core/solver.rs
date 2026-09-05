@@ -35,6 +35,17 @@ pub struct Solution {
     pub max_angle_residual: f64,
 }
 
+impl Solution {
+    /// A candidate is safe to write into the document only when every
+    /// position and diagnostic is finite.  Numerical failure must preserve
+    /// the last valid geometry rather than leak NaNs into the model.
+    pub fn is_valid(&self) -> bool {
+        self.positions.iter().all(|(_, p)| p.x.is_finite() && p.y.is_finite())
+            && self.max_lin_residual.is_finite()
+            && self.max_angle_residual.is_finite()
+    }
+}
+
 const ANCHOR_WEIGHT: f64 = 1.0;
 const DIM_WEIGHT: f64 = 1e6;
 const EQ_WEIGHT: f64 = 1e6;
@@ -391,6 +402,65 @@ impl Solver {
             let _ = slot_of(pid);
         }
 
+        // A drag is solved over the whole geometric component, not just the
+        // cursor point.  Keeping the rest of a connected chain hard-fixed is
+        // the source of most apparent "over-constrained" angle failures: the
+        // only point allowed to move cannot rotate an edge whose other end is
+        // frozen.  Build the closure once here so segments, arcs, and
+        // explicit coincident links all share the same kinematic component.
+        let mut component = Vec::new();
+        for &(pid, _) in drag {
+            if !component.contains(&pid) {
+                component.push(pid);
+            }
+        }
+        let mut component_cursor = 0;
+        while component_cursor < component.len() {
+            let pid = component[component_cursor];
+            for (_, seg) in doc.all_segments() {
+                let mut linked = false;
+                if seg.start == pid || seg.end == pid || seg.ctrl == Some(pid) || seg.center == Some(pid) {
+                    linked = true;
+                }
+                if linked {
+                    for linked_pid in [Some(seg.start), Some(seg.end), seg.ctrl, seg.center].into_iter().flatten() {
+                        if doc.point(linked_pid).is_some() && !component.contains(&linked_pid) {
+                            component.push(linked_pid);
+                        }
+                    }
+                }
+            }
+            for c in &doc.constraints {
+                let mut linked = c.a == pid || c.b == pid;
+                if let Some(segment_id) = c.point_on_segment
+                    && let Some(seg) = doc.segment(segment_id)
+                    && (seg.start == pid || seg.end == pid || seg.ctrl == Some(pid) || seg.center == Some(pid))
+                {
+                    linked = true;
+                }
+                if linked {
+                    for linked_pid in [c.a, c.b] {
+                        if doc.point(linked_pid).is_some() && !component.contains(&linked_pid) {
+                            component.push(linked_pid);
+                        }
+                    }
+                    if let Some(segment_id) = c.point_on_segment
+                        && let Some(seg) = doc.segment(segment_id)
+                    {
+                        for linked_pid in [Some(seg.start), Some(seg.end), seg.ctrl, seg.center].into_iter().flatten() {
+                            if doc.point(linked_pid).is_some() && !component.contains(&linked_pid) {
+                                component.push(linked_pid);
+                            }
+                        }
+                    }
+                }
+            }
+            component_cursor += 1;
+        }
+        for pid in component {
+            let _ = slot_of(pid);
+        }
+
         let mut fixed = vec![true; slots.len()];
         let mut fixed_pos = vec![Point2::new(0., 0.); slots.len()];
         for (i, &pid) in slots.iter().enumerate() {
@@ -430,6 +500,23 @@ impl Solver {
                 } else {
                     aux_idx.push((i, anchor, 1.0));
                 }
+            }
+        }
+
+        // Component followers are soft anchored at their drag-start
+        // positions. Geometric equations dominate these anchors, allowing a
+        // connected edge to rotate or translate while the anchors select the
+        // nearby solution branch and suppress null-space drift.
+        for pid in component_points(doc, drag) {
+            if drag.iter().any(|(dragged, _)| *dragged == pid) {
+                continue;
+            }
+            let Some(&i) = index.get(&pid) else { continue };
+            if free_of[i].is_none() {
+                free_of[i] = Some(n_free);
+                n_free += 1;
+                fixed[i] = false;
+                aux_idx.push((i, fixed_pos[i], 1.0));
             }
         }
 
@@ -1068,10 +1155,20 @@ impl Solver {
         // These are hot-path scratch values, not solver state: keeping them
         // here avoids allocating several large vectors for every iteration
         // of every live drag.
-        let mut jtj = vec![0.0; n * n];
+        // Sparse normal equations: each geometric residual touches only a
+        // handful of scalar variables. Keeping rows sparse avoids allocating
+        // an n² matrix for a large document when the active component is
+        // small, and lets the iterative solve scale with actual connectivity.
+        let mut jtj: Vec<HashMap<usize, f64>> =
+            (0..n).map(|_| HashMap::with_capacity(8)).collect();
         let mut jtr = vec![0.0; n];
         let mut dx = vec![0.0; n];
         let mut trial = vec![Point2::new(0., 0.); self.n_free];
+        let mut dense = if n <= 128 { Some(vec![0.0; n * n]) } else { None };
+        let mut cg_residual = vec![0.0; n];
+        let mut cg_direction = vec![0.0; n];
+        let mut cg_product = vec![0.0; n];
+        let mut cg_preconditioned = vec![0.0; n];
 
         for _iter in 0..MAX_ITER {
             if cost < TOL {
@@ -1079,7 +1176,9 @@ impl Solver {
                 break;
             }
 
-            jtj.fill(0.0);
+            for row in &mut jtj {
+                row.clear();
+            }
             jtr.fill(0.0);
             for r in &residuals {
                 let w = r.weight;
@@ -1088,23 +1187,43 @@ impl Solver {
                 for (i, &(vi, gi)) in r.grad.iter().enumerate() {
                     for (j, &(vj, gj)) in r.grad.iter().enumerate().skip(i) {
                         let value = w * gi * gj;
-                        jtj[vi * n + vj] += value;
+                        *jtj[vi].entry(vj).or_insert(0.) += value;
                         if vi != vj {
-                            jtj[vj * n + vi] += value;
+                            *jtj[vj].entry(vi).or_insert(0.) += value;
                         } else if j != i {
                             // Two distinct gradient entries can refer to the
                             // same variable; retain both cross terms.
-                            jtj[vi * n + vj] += value;
+                            *jtj[vi].entry(vj).or_insert(0.) += value;
                         }
                     }
                     jtr[vi] -= w * gi * r.value;
                 }
             }
             for i in 0..n {
-                jtj[i * n + i] += lambda + 1e-12;
+                *jtj[i].entry(i).or_insert(0.) += lambda + 1e-12;
             }
 
-            if !gauss_solve_in_place(&mut jtj, n, &mut jtr, &mut dx) {
+            let solved = if n <= 128 {
+                let dense_matrix = dense.as_mut().expect("small systems have dense scratch");
+                dense_matrix.fill(0.);
+                for (row, entries) in jtj.iter().enumerate() {
+                    for (&column, &value) in entries {
+                        dense_matrix[row * n + column] = value;
+                    }
+                }
+                gauss_solve_in_place(dense_matrix, n, &mut jtr, &mut dx)
+            } else {
+                conjugate_gradient(
+                    &jtj,
+                    &jtr,
+                    &mut dx,
+                    &mut cg_residual,
+                    &mut cg_direction,
+                    &mut cg_product,
+                    &mut cg_preconditioned,
+                )
+            };
+            if !solved {
                 lambda *= 10.0;
                 if lambda > 1e8 {
                     break;
@@ -1171,7 +1290,10 @@ impl Solver {
     fn eq_residual_max(&self, x: &[Point2]) -> (f64, f64) {
         let mut lin = 0.0f64;
         let mut ang = 0.0f64;
-        for eq in &self.eqs {
+        // Only equations in the active component can be affected by this
+        // solve.  Unrelated pre-existing geometry must not make a local drag
+        // fail validation or force a full-document solve.
+        for eq in &self.active_eqs {
             let v = match *eq {
                 Eq::Horizontal { a, b } => (self.pos(a, x).y - self.pos(b, x).y).abs(),
                 Eq::Vertical { a, b } => (self.pos(a, x).x - self.pos(b, x).x).abs(),
@@ -1285,6 +1407,51 @@ impl Solver {
     }
 }
 
+/// Returns the geometric point component touched by a drag seed.  Segment
+/// topology is the primary graph; constraint pairs and point-on-segment
+/// references bridge otherwise separate records (including merged points).
+fn component_points(doc: &Document, drag: &[(PointId, Point2)]) -> Vec<PointId> {
+    let mut points: Vec<PointId> = drag.iter().map(|(id, _)| *id).collect();
+    let mut cursor = 0;
+    while cursor < points.len() {
+        let pid = points[cursor];
+        for (_, seg) in doc.all_segments() {
+            if seg.start != pid && seg.end != pid && seg.ctrl != Some(pid) && seg.center != Some(pid) {
+                continue;
+            }
+            for linked in [Some(seg.start), Some(seg.end), seg.ctrl, seg.center].into_iter().flatten() {
+                if doc.point(linked).is_some() && !points.contains(&linked) {
+                    points.push(linked);
+                }
+            }
+        }
+        for constraint in &doc.constraints {
+            let mut linked = constraint.a == pid || constraint.b == pid;
+            if let Some(segment_id) = constraint.point_on_segment
+                && let Some(seg) = doc.segment(segment_id)
+            {
+                linked |= seg.start == pid || seg.end == pid || seg.ctrl == Some(pid) || seg.center == Some(pid);
+                if linked {
+                    for point in [Some(seg.start), Some(seg.end), seg.ctrl, seg.center].into_iter().flatten() {
+                        if doc.point(point).is_some() && !points.contains(&point) {
+                            points.push(point);
+                        }
+                    }
+                }
+            }
+            if linked {
+                for point in [constraint.a, constraint.b] {
+                    if doc.point(point).is_some() && !points.contains(&point) {
+                        points.push(point);
+                    }
+                }
+            }
+        }
+        cursor += 1;
+    }
+    points
+}
+
 /// Intersection of two infinite lines (p0->p1) and (q0->q1). Used to find
 /// the vertex for vertex-oriented angle targets.
 fn line_intersection(p0: Point2, p1: Point2, q0: Point2, q1: Point2) -> Option<Point2> {
@@ -1323,16 +1490,17 @@ fn gauss_solve_in_place(a: &mut [f64], n: usize, b: &mut [f64], out: &mut [f64])
         if a[pivot * n + col].abs() < 1e-14 {
             return false;
         }
+
         if pivot != col {
             for j in col..n {
                 a.swap(col * n + j, pivot * n + j);
             }
             b.swap(col, pivot);
         }
-        let inv = 1.0 / a[col * n + col];
+        let inv = 1. / a[col * n + col];
         for row in col + 1..n {
             let factor = a[row * n + col] * inv;
-            if factor != 0.0 {
+            if factor != 0. {
                 for j in col..n {
                     a[row * n + j] -= factor * a[col * n + j];
                 }
@@ -1348,6 +1516,84 @@ fn gauss_solve_in_place(a: &mut [f64], n: usize, b: &mut [f64], out: &mut [f64])
         out[row] = sum / a[row * n + row];
     }
     true
+}
+
+fn conjugate_gradient(
+    matrix: &[HashMap<usize, f64>],
+    b: &[f64],
+    out: &mut [f64],
+    residual: &mut [f64],
+    direction: &mut [f64],
+    product: &mut [f64],
+    preconditioned: &mut [f64],
+) -> bool {
+    let n = b.len();
+    debug_assert_eq!(matrix.len(), n);
+    debug_assert_eq!(out.len(), n);
+    debug_assert_eq!(residual.len(), n);
+    debug_assert_eq!(direction.len(), n);
+    debug_assert_eq!(product.len(), n);
+    debug_assert_eq!(preconditioned.len(), n);
+    if n == 0 {
+        return true;
+    }
+    out.fill(0.);
+    residual.copy_from_slice(b);
+    // Jacobi preconditioning normalizes mixed coordinate/angle residual
+    // scales without building a second matrix or allocating per iteration.
+    for i in 0..n {
+        let diagonal = matrix[i].get(&i).copied().unwrap_or(1.).max(1e-12);
+        preconditioned[i] = residual[i] / diagonal;
+        direction[i] = preconditioned[i];
+    }
+    let mut rr = dot(residual, preconditioned);
+    if !rr.is_finite() {
+        return false;
+    }
+    if rr <= 1e-24 {
+        return true;
+    }
+    let initial_rr = rr;
+    let max_iter = (n * 2).max(24);
+    for _ in 0..max_iter {
+        product.fill(0.);
+        for (row, entries) in matrix.iter().enumerate() {
+            product[row] = entries
+                .iter()
+                .map(|(&column, &value)| value * direction[column])
+                .sum();
+        }
+        let denom = dot(direction, product);
+        if !denom.is_finite() || denom <= 1e-24 {
+            return false;
+        }
+        let alpha = rr / denom;
+        for i in 0..n {
+            out[i] += alpha * direction[i];
+            residual[i] -= alpha * product[i];
+        }
+        for i in 0..n {
+            let diagonal = matrix[i].get(&i).copied().unwrap_or(1.).max(1e-12);
+            preconditioned[i] = residual[i] / diagonal;
+        }
+        let next_rr = dot(residual, preconditioned);
+        if !next_rr.is_finite() {
+            return false;
+        }
+        if next_rr <= initial_rr * 1e-12 || next_rr <= 1e-24 {
+            return true;
+        }
+        let beta = next_rr / rr;
+        for i in 0..n {
+            direction[i] = residual[i] + beta * direction[i];
+        }
+        rr = next_rr;
+    }
+    rr <= initial_rr * 1e-8
+}
+
+fn dot(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
 #[cfg(test)]
@@ -1469,4 +1715,25 @@ mod tests {
         assert!(solution.max_angle_residual <= 0.02);
         assert!(solution.max_lin_residual <= 0.5);
     }
+
+    #[test]
+    fn large_connected_component_uses_sparse_backend() {
+        let mut doc = Document::new();
+        let mut points = Vec::new();
+        for i in 0.. eighty() {
+            points.push(doc.add_point(Point2::new(i as f64 * 10., 0.)));
+        }
+        for pair in points.windows(2) {
+            doc.add_segment(pair[0], pair[1]);
+            doc.add_constraint(ConstraintKind::Horizontal, pair[0], pair[1]);
+        }
+        let target = Point2::new(25., 40.);
+        let solution = Solver::build(&doc, &[(points[0], target)], &[]).solve();
+
+        assert!(solution.positions.iter().all(|(_, p)| p.x.is_finite() && p.y.is_finite()));
+        assert!(solution.max_lin_residual <= 0.5);
+        assert!(solution.max_angle_residual <= 0.02);
+    }
+
+    fn eighty() -> usize { 80 }
 }

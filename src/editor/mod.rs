@@ -1,4 +1,5 @@
 pub mod arc;
+pub mod bezier;
 mod clipboard;
 mod camera;
 pub mod dims;
@@ -11,12 +12,14 @@ mod tools;
 pub use camera::Camera;
 
 pub use snapping::SnapGuide;
-pub use tools::{DimInput, DimPick, PendingCircle, PendingLine, PendingRuler, PendingShape, Tool};
+pub use tools::{DimInput, DimPick, PendingCircle, PendingLine, PendingPen, PendingRuler, PendingShape, Tool};
 
 use crate::core::constraints::{ConstraintKind, DimTarget, ElementRef};
 use crate::core::document::{Document, Layer};
 use crate::core::geometry::{Point2, Rect};
-use crate::core::ids::{FillId, PointId, SegmentId};
+use crate::core::ids::{FillId, PathId, PointId, SegmentId};
+use std::collections::HashSet;
+use std::time::Instant;
 
 // The session: the permanent design plus view/editing state.
 // Owns nothing about GPUI widgets; the UI layer drives it.
@@ -48,6 +51,20 @@ pub(crate) struct DragState {
     // Arc body grab: the whole arc scales about its fixed center (see
     // plan_arc_drag). None for every other gesture (solver path).
     pub arc_body_scale: Option<SegmentId>,
+    // A cubic edge grab edits its handles directly. Keeping the grab
+    // parameter and original controls makes the operation stable across
+    // mouse-move events and avoids routing a simple curve edit through the
+    // global constraint solver.
+    pub bezier_edge: Option<BezierEdgeDrag>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct BezierEdgeDrag {
+    pub sid: SegmentId,
+    pub t: f64,
+    pub start_cursor: Point2,
+    pub handle_out: Point2,
+    pub handle_in: Point2,
 }
 
 /// Kinematic arc drag outcome: exact targets plus points to hard-pin for
@@ -66,6 +83,8 @@ pub struct Editor {
     pub pending_ruler: Option<PendingRuler>,
     pub pending_line: Option<PendingLine>,
     pub pending_circle: Option<PendingCircle>,
+    // In-progress pen chain (docs/pen-tool.md): live path in the doc.
+    pub pending_pen: Option<PendingPen>,
     // Pending shape created by a single click (commit on next click).
     pub pending_via_click: bool,
     pub selection: Vec<ElementRef>,
@@ -159,6 +178,34 @@ pub struct Editor {
     // still repaint when the reveal set changes, or the dot sticks around
     // after the mouse leaves the area.
     pub arc_center_reveal: Vec<SegmentId>,
+    // Paint-only diagnostics; deliberately not part of Document or undo
+    // snapshots.
+    pub(crate) fps_counter: FpsCounter,
+}
+
+pub(crate) struct FpsCounter {
+    last_sample: Instant,
+    frames: u32,
+    fps: f32,
+}
+
+impl Default for FpsCounter {
+    fn default() -> Self {
+        Self { last_sample: Instant::now(), frames: 0, fps: 0.0 }
+    }
+}
+
+impl FpsCounter {
+    pub(crate) fn tick(&mut self) -> f32 {
+        self.frames = self.frames.saturating_add(1);
+        let elapsed = self.last_sample.elapsed();
+        if elapsed.as_millis() >= 250 {
+            self.fps = self.frames as f32 / elapsed.as_secs_f32().max(1e-6);
+            self.frames = 0;
+            self.last_sample = Instant::now();
+        }
+        self.fps
+    }
 }
 
 /// An in-progress drag of a placed dimension container: `down` is the
@@ -199,6 +246,7 @@ impl Editor {
             pending_ruler: None,
             pending_line: None,
             pending_circle: None,
+            pending_pen: None,
             pending_via_click: false,
             selection: Vec::new(),
             constraint_picks: Vec::new(),
@@ -245,6 +293,7 @@ impl Editor {
             dim_caret_visible: true,
             overconstrained: false,
             arc_center_reveal: Vec::new(),
+            fps_counter: FpsCounter::default(),
         }
     }
 
@@ -256,6 +305,7 @@ impl Editor {
         // The snap crosshair belongs to creation tools only; it reappears
         // (freshly positioned) on the first mouse move over the canvas.
         self.creation_cursor = None;
+        self.abort_pending_pen();
         self.pending_shape = None;
         self.pending_ruler = None;
         self.pending_line = None;
@@ -498,6 +548,49 @@ impl Editor {
                     self.pending_via_click = true;
                     true
                 }
+                Tool::Pen => {
+                    let p = self.cursor_doc(cursor);
+                    let exact =
+                        pick::Picker::new(&self.doc, &self.camera, EXACT_TOL_PX);
+                    // Double-click an anchor toggles smooth/corner.
+                    if click_count >= 2
+                        && let Some(pid) = exact.point(p)
+                        && self.path_anchor_index(pid).is_some()
+                    {
+                        self.toggle_anchor_continuity(pid);
+                        return true;
+                    }
+                    // Clicking a pathed curve splits it exactly; the open
+                    // chain (if any) continues from its live tip.
+                    if exact.point(p).is_none()
+                        && let Some(sid) = pick::Picker::new(
+                            &self.doc,
+                            &self.camera,
+                            HANDLE_TOL_PX,
+                        )
+                        .segment(p)
+                        && self.path_containing(sid).is_some()
+                    {
+                        self.insert_pen_anchor(sid, p);
+                        return true;
+                    }
+                    // Otherwise commit an anchor at the snapped cursor and
+                    // arm the handle pull (click-drag bends it this gesture).
+                    let (mut at, guides) = self.snap_creation_point(p);
+                    if shift
+                        && let Some(pending) = &self.pending_pen
+                        && let Some(start) = self.doc.point(pending.last)
+                    {
+                        at = tools::snap_angle(start, at);
+                    }
+                    self.snap_guides = guides;
+                    self.commit_pen_anchor(at);
+                    if let Some(pending) = self.pending_pen.as_mut() {
+                        pending.pulling = true;
+                        pending.cursor = at;
+                    }
+                    true
+                }
                 Tool::Line => {
                     // Continuous mode: the tool stays active and each
                     // commit chains the next line from its endpoint.
@@ -515,18 +608,18 @@ impl Editor {
                             if shift { self.maybe_add_tangent(seg, b); }
                             self.selection = vec![ElementRef::Segment(seg)];
                             // Chain: the next line starts where this one ended.
-                            self.pending_line = Some(PendingLine { start: b, cursor: b });
+                            self.pending_line = Some(PendingLine { start: b, cursor: b, anchor: None });
                         } else {
                             let (at, guides) = self.snap_creation_point(self.cursor_doc(cursor));
                             self.snap_guides = guides;
-                            self.pending_line = Some(PendingLine { start: at, cursor: at });
+                            self.pending_line = Some(PendingLine { start: at, cursor: at, anchor: None });
                         }
                         self.pending_via_click = true;
                         return true;
                     }
                     let (at, guides) = self.snap_creation_point(self.cursor_doc(cursor));
                     self.snap_guides = guides;
-                    self.pending_line = Some(PendingLine { start: at, cursor: at });
+                    self.pending_line = Some(PendingLine { start: at, cursor: at, anchor: None });
                     self.pending_via_click = true;
                     true
                 }
@@ -958,11 +1051,34 @@ impl Editor {
                     }
                     _ => None,
                 };
+                let bezier_edge = match el {
+                    ElementRef::Segment(sid)
+                        if !(self.selection.len() > 1 && self.element_selected(el)) =>
+                    {
+                        let seg = self.doc.segment(sid);
+                        if seg.is_some_and(|s| s.kind == crate::core::document::SegmentKind::Bezier) {
+                            self.doc.bezier_geom(sid).map(|(p0, p1, p2, p3)| {
+                                let (t, _) = crate::editor::bezier::param_of_closest(p, p0, p1, p2, p3);
+                                BezierEdgeDrag {
+                                    sid,
+                                    t: t.clamp(0.05, 0.95),
+                                    start_cursor: p,
+                                    handle_out: p1,
+                                    handle_in: p2,
+                                }
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
                 self.dragging = Some(DragState {
                     points: drag_pts,
                     aux: aux_pts,
                     start_cursor: p,
                     arc_body_scale,
+                    bezier_edge,
                 });
                 true
             }
@@ -1009,6 +1125,27 @@ impl Editor {
                     self.dim_drag_update(idx, cursor);
                 }
             }
+            return true;
+        }
+
+        // Pen chain: rubber band from the live tip, or the fresh anchor's
+        // handle pull while its commit gesture is still held.
+        if self.tool == Tool::Pen && self.pending_pen.is_some() {
+            let mut at = self.cursor_doc(cursor);
+            let pulling = self.pending_pen.as_ref().is_some_and(|p| p.pulling);
+            if pulling {
+                self.update_pen_pull(at, shift);
+                return true;
+            }
+            let (snapped, guides) = self.snap_creation_point(at);
+            at = snapped;
+            self.snap_guides = guides;
+            if let Some(pending) = self.pending_pen.as_mut() {
+                // The tip IS the live anchor id (no position snapshot),
+                // so mid-chain edits to it move the rubber band for free.
+                pending.cursor = at;
+            }
+            changed = true;
             return true;
         }
 
@@ -1077,7 +1214,10 @@ impl Editor {
             // clearing them wiped the crosshair highlight every move.
             // (update_creation_cursor refreshes them above; non-creation
             // tools still clear stale drag leftovers.)
-            if !matches!(self.tool, Tool::Line | Tool::Rectangle | Tool::Ruler | Tool::Circle) {
+            if !matches!(
+                self.tool,
+                Tool::Line | Tool::Rectangle | Tool::Ruler | Tool::Circle | Tool::Pen
+            ) {
                 self.snap_guides.clear();
             }
             return changed;
@@ -1099,6 +1239,9 @@ impl Editor {
         if delta.x == 0. && delta.y == 0. {
             return false;
         }
+        if let Some(edge) = drag.bezier_edge {
+            return self.update_bezier_edge_drag(edge, p);
+        }
 
         // Snap exclusion, two flavors:
         //  - exclude_pts: everything belonging to the dragged system
@@ -1108,18 +1251,14 @@ impl Editor {
         //  - exclude_segs: only the actually-dragged segments. Edge-span
         //    ALIGNMENTS from the rest of the component remain live, so a
         //    fully-connected drawing still snaps to axis alignments.
-        let mut exclude_pts: Vec<PointId> = drag.points.iter().map(|(id, _)| *id).collect();
+        let mut exclude_pts: HashSet<PointId> = drag.points.iter().map(|(id, _)| *id).collect();
         let mut exclude_segs: Vec<crate::core::ids::SegmentId> = Vec::new();
         for &(pid, _) in &drag.aux {
-            if !exclude_pts.contains(&pid) {
-                exclude_pts.push(pid);
-            }
+            exclude_pts.insert(pid);
         }
         let selected_pt_ids = self.doc.selection_points(&self.selection);
         for pid in &selected_pt_ids {
-            if !exclude_pts.contains(pid) {
-                exclude_pts.push(*pid);
-            }
+            exclude_pts.insert(*pid);
         }
         // Segments with BOTH ends in the dragged set are the ones being
         // manipulated; their spans are dead.
@@ -1136,9 +1275,10 @@ impl Editor {
         // dragged system is part of the dragged object(s). A partially
         // selected rectangle must never snap back onto its own unselected
         // far corner — NOTHING ever snaps to its own geometry.
+        let mut frontier: Vec<PointId> = exclude_pts.iter().copied().collect();
         let mut i = 0;
-        while i < exclude_pts.len() {
-            let pid = exclude_pts[i];
+        while i < frontier.len() {
+            let pid = frontier[i];
             for (_, s) in self.doc.all_segments() {
                 let other = if s.start == pid {
                     Some(s.end)
@@ -1151,7 +1291,8 @@ impl Editor {
                     && !exclude_pts.contains(&o)
                     && self.doc.point(o).is_some()
                 {
-                    exclude_pts.push(o);
+                    exclude_pts.insert(o);
+                    frontier.push(o);
                 }
             }
             i += 1;
@@ -1159,22 +1300,35 @@ impl Editor {
         // Arc defining points form ONE snap-unit: the ctrl point is not a
         // segment endpoint (the closure above never reaches it), so dragging
         // the bend would otherwise snap to its own arc's endpoints/midpoint.
-        // If any of the three is excluded, all three are.
+        // Bezier handles are the same story. If any of the set is excluded,
+        // all of it is.
         let mut arc_closure = true;
         while arc_closure {
             arc_closure = false;
             for (_, s) in self.doc.all_segments() {
-                if s.kind != crate::core::document::SegmentKind::Arc {
+                let defs: Vec<PointId> = if s.kind == crate::core::document::SegmentKind::Arc {
+                    let Some(ctrl) = s.ctrl else { continue };
+                    vec![s.start, s.end, ctrl]
+                } else if s.kind == crate::core::document::SegmentKind::Bezier {
+                    let mut v = vec![s.start, s.end];
+                    if let Some(h) = s.handle_out {
+                        v.push(h);
+                    }
+                    if let Some(h) = s.handle_in {
+                        v.push(h);
+                    }
+                    v
+                } else {
                     continue;
-                }
-                let Some(ctrl) = s.ctrl else { continue };
-                let defs = [s.start, s.end, ctrl];
+                };
                 let any_in = defs.iter().any(|d| exclude_pts.contains(d));
                 let any_out = defs.iter().any(|d| !exclude_pts.contains(d));
                 if any_in && any_out {
                     for d in defs {
-                        if !exclude_pts.contains(&d) {
-                            exclude_pts.push(d);
+                        if exclude_pts.insert(d) {
+                            // The closure is intentionally repeated because a
+                            // newly excluded Bezier/arc can expose another
+                            // defining point in a later segment.
                         }
                     }
                     arc_closure = true;
@@ -1190,9 +1344,14 @@ impl Editor {
             if !exclude_pts.contains(&pid)
                 && starts.iter().any(|s| pick::distance(*s, p) <= tol)
             {
-                exclude_pts.push(pid);
+                exclude_pts.insert(pid);
             }
         }
+
+        // `snapping::best` takes a compact slice; keep the hash set for all
+        // membership checks above, then materialize this once for the snap
+        // queries instead of paying O(n) for every closure lookup.
+        let exclude_pts_vec: Vec<PointId> = exclude_pts.iter().copied().collect();
 
         // Single-endpoint drags of STANDALONE lines only snap when the
         // endpoint truly lands on another point — a passing axis alignment
@@ -1220,7 +1379,7 @@ impl Editor {
                     &self.doc,
                     self.snap_tol_doc(),
                     target,
-                    &exclude_pts,
+                    &exclude_pts_vec,
                     &exclude_segs,
                     endpoints_only,
                     false,
@@ -1825,6 +1984,17 @@ impl Editor {
                 self.snap_guides = guides;
                 return changed;
             }
+            Tool::Pen if self.pending_pen.is_none() => {
+                let (_at, guides) = self.snap_creation_point(self.cursor_doc(cursor));
+                let changed = match (&self.snap_guides, &guides) {
+                    (a, b) if a.len() == b.len() => a.iter().zip(b.iter()).any(|(x, y)| {
+                        x.kind != y.kind || pick::distance(x.to, y.to) > 1e-9
+                    }),
+                    _ => true,
+                };
+                self.snap_guides = guides;
+                return changed;
+            }
             _ => {}
         }
         // Dimension tool: hovering still highlights pickable points/lines
@@ -1873,6 +2043,45 @@ impl Editor {
             changed = true;
         }
         changed
+    }
+
+    /// Edit a cubic by grabbing the curve itself. The hit parameter is fixed
+    /// at mouse-down, so the same part of the curve remains under the cursor
+    /// while dragging. A normal drag moves that curve point exactly by moving
+    /// both handles; Alt changes the control hull's normal offset instead,
+    /// which changes the overall roundness without sliding the endpoints.
+    fn update_bezier_edge_drag(&mut self, edge: BezierEdgeDrag, cursor: Point2) -> bool {
+        let Some(seg) = self.doc.segment(edge.sid) else { return false };
+        let (Some(h0), Some(h1)) = (seg.handle_out, seg.handle_in) else { return false };
+        let Some((p0, p1, p2, p3)) = self.doc.bezier_geom(edge.sid) else { return false };
+        let t = edge.t;
+        let mt = 1.0 - t;
+        let tangent = Point2::new(
+            3.0 * mt * mt * (p1.x - p0.x) + 6.0 * mt * t * (p2.x - p1.x) + 3.0 * t * t * (p3.x - p2.x),
+            3.0 * mt * mt * (p1.y - p0.y) + 6.0 * mt * t * (p2.y - p1.y) + 3.0 * t * t * (p3.y - p2.y),
+        );
+        let length = (tangent.x * tangent.x + tangent.y * tangent.y).sqrt().max(1e-9);
+        let normal = Point2::new(-tangent.y / length, tangent.x / length);
+        let delta = Point2::new(cursor.x - edge.start_cursor.x, cursor.y - edge.start_cursor.y);
+        let amount = delta.x * normal.x + delta.y * normal.y;
+        if amount.abs() < 1e-9 { return false; }
+
+        let (n0, n1) = if self.alt_down {
+            // Alt uses the chord normal, rather than the local tangent, so
+            // the gesture controls the curve's broad roundness as a whole.
+            let chord = Point2::new(p3.x - p0.x, p3.y - p0.y);
+            let cl = (chord.x * chord.x + chord.y * chord.y).sqrt().max(1e-9);
+            let chord_normal = Point2::new(-chord.y / cl, chord.x / cl);
+            (Point2::new(chord_normal.x * amount, chord_normal.y * amount),
+             Point2::new(chord_normal.x * amount, chord_normal.y * amount))
+        } else {
+            let scale = amount / (3.0 * t * mt);
+            (Point2::new(normal.x * scale, normal.y * scale),
+             Point2::new(normal.x * scale, normal.y * scale))
+        };
+        self.doc.move_point(h0, Point2::new(edge.handle_out.x + n0.x, edge.handle_out.y + n0.y));
+        self.doc.move_point(h1, Point2::new(edge.handle_in.x + n1.x, edge.handle_in.y + n1.y));
+        true
     }
 
     fn constraint_hover_allowed(&self, element: ElementRef) -> bool {
@@ -1989,7 +2198,7 @@ impl Editor {
     fn update_creation_cursor(&mut self, cursor: gpui::Point<gpui::Pixels>) -> bool {
         let is_creation = matches!(
             self.tool,
-            Tool::Rectangle | Tool::Line | Tool::Ruler | Tool::Circle
+            Tool::Rectangle | Tool::Line | Tool::Ruler | Tool::Circle | Tool::Pen
         );
         if !is_creation || self.pan_start.is_some() {
             if self.creation_cursor.is_some() {
@@ -3074,6 +3283,17 @@ impl Editor {
             }
             return true;
         }
+        // Pen handle pull (or plain pen click) ends here: the gesture is
+        // over but the open chain stays armed for the next anchor.
+        if self.tool == Tool::Pen
+            && self.pending_pen.as_ref().is_some_and(|p| p.pulling)
+        {
+            if let Some(pending) = self.pending_pen.as_mut() {
+                pending.pulling = false;
+            }
+            self.flush_pending_history();
+            return true;
+        }
         self.dragging = None;
         self.snap_guides.clear();
         self.group_drag_last = None;
@@ -3138,7 +3358,7 @@ impl Editor {
                     self.maybe_add_tangent(seg, b);
                 }
                 self.selection = vec![ElementRef::Segment(seg)];
-                self.pending_line = Some(PendingLine { start: b, cursor: b });
+                self.pending_line = Some(PendingLine { start: b, cursor: b, anchor: None });
             } else {
                 self.pending_line = Some(pending);
             }
@@ -3382,6 +3602,485 @@ impl Editor {
         seg
     }
 
+    // -- pen tool (docs/pen-tool.md) --
+
+    /// Pushes an element to a layer unless it is already listed.
+    fn push_layer_once(&mut self, layer_id: u64, el: ElementRef) {
+        if let Some(layer) = self.doc.layer_mut(layer_id)
+            && !layer.elements.contains(&el)
+        {
+            layer.elements.push(el);
+        }
+    }
+
+    /// Weld lookup: nearest document point within snap tolerance, for the
+    /// pen's share-ids-silently rule. None = free space, create fresh.
+    fn pen_weld_target(&self, at: Point2) -> Option<PointId> {
+        let tol = self.snap_tol_doc();
+        let mut best: Option<(f64, PointId)> = None;
+        for (pid, p) in self.doc.all_points() {
+            let d = pick::distance(p, at);
+            if d <= tol && best.map_or(true, |(bd, _)| d < bd) {
+                best = Some((d, pid));
+            }
+        }
+        best.map(|(_, pid)| pid)
+    }
+
+    /// This path's handle pair for an anchor, if the anchor belongs to it.
+    fn pen_anchor_handles(&self, pid: PathId, anchor: PointId) -> Option<(PointId, PointId)> {
+        let path = self.doc.path(pid)?;
+        let anchors = self.doc.path_anchors(pid)?;
+        let i = anchors.iter().position(|&a| a == anchor)?;
+        path.handles.get(i).copied()
+    }
+
+    /// Index of an anchor in the first path owning it (for continuity and
+    /// close-target lookups).
+    fn path_anchor_index(&self, anchor: PointId) -> Option<(PathId, usize)> {
+        for (pid, _) in self.doc.all_paths() {
+            if let Some(anchors) = self.doc.path_anchors(pid)
+                && let Some(i) = anchors.iter().position(|&a| a == anchor)
+            {
+                return Some((pid, i));
+            }
+        }
+        None
+    }
+
+    /// True while anything else alive references the point: segments,
+    /// path pairs, constraints, dimensions, or other paths' anchors.
+    fn point_in_use(&self, pid: PointId, ignore_path: Option<PathId>) -> bool {
+        self.doc.all_segments().any(|(_, s)| {
+            s.start == pid
+                || s.end == pid
+                || s.ctrl == Some(pid)
+                || s.center == Some(pid)
+                || s.handle_out == Some(pid)
+                || s.handle_in == Some(pid)
+        }) || self.doc.all_paths().any(|(id, p)| {
+            id != ignore_path.unwrap_or(PathId::NONE)
+                && (p.handles.iter().any(|&(h0, h1)| h0 == pid || h1 == pid)
+                    || self
+                        .doc
+                        .path_anchors(id)
+                        .is_some_and(|anchors| anchors.contains(&pid)))
+        }) || self.doc.constraints.iter().any(|c| c.a == pid || c.b == pid)
+            || self.doc.dimensions.iter().any(|d| match d.target {
+                DimTarget::Points { a, b, .. } => a == pid || b == pid,
+                DimTarget::PointLine { p, .. } => p == pid,
+                _ => false,
+            })
+    }
+
+    /// Commits one pen anchor at the snapped cursor: weld-shares the point
+    /// when it locks onto real geometry, appends a segment to the live
+    /// path (or starts one), closes on a clean click of the start anchor.
+    /// Arms the handle pull for click-drag bends.
+    fn commit_pen_anchor(&mut self, at: Point2) {
+        use crate::core::document::ContinuityMode;
+        let layer_id = self.doc.layers[0].id;
+        // Weld first: the shared point IS the anchor (no coincident chip).
+        let (anchor, fresh) = match self.pen_weld_target(at) {
+            Some(pid) => (pid, false),
+            None => (self.doc.add_point(at), true),
+        };
+        let apos = self.doc.point(anchor).unwrap_or(at);
+        // Every anchor owns a handle pair from birth (collapsed here; the
+        // pull or later edits extend it).
+        let h0 = self.doc.add_point(apos);
+        let h1 = self.doc.add_point(apos);
+        let mut pending = self.pending_pen.take();
+        // The live chain may have died underneath us (Delete key while
+        // drawing): a dangling path or tip restarts the chain fresh.
+        if let Some(p) = &pending {
+            let path_ok = p.path.is_none_or(|id| self.doc.path(id).is_some());
+            if !path_ok || self.doc.point(p.last).is_none() {
+                pending = None;
+            }
+        }
+        match pending {
+            None => {
+                self.push_layer_once(layer_id, ElementRef::Point(anchor));
+                self.push_layer_once(layer_id, ElementRef::Point(h0));
+                self.push_layer_once(layer_id, ElementRef::Point(h1));
+                self.pending_pen = Some(PendingPen {
+                    path: None,
+                    last: anchor,
+                    cursor: at,
+                    pulling: true,
+                    last_fresh: fresh,
+                    last_handles: (h0, h1),
+                });
+                self.selection = vec![ElementRef::Point(anchor)];
+            }
+            Some(pending) => {
+                // Close on a clean click of the start anchor (shared ID =
+                // genuinely closed loop). Needs a real chain behind it.
+                let start_of = pending.path.and_then(|pid| {
+                    self.doc.path(pid).and_then(|p| {
+                        p.segments
+                            .first()
+                            .and_then(|&sid| self.doc.segment(sid).map(|s| s.start))
+                    })
+                });
+                if !fresh
+                    && Some(anchor) == start_of
+                    && anchor != pending.last
+                    && let Some(path_id) = pending.path
+                {
+                    let (from, from_pair) = (pending.last, pending.last_handles);
+                    self.doc.remove_point(h0);
+                    self.doc.remove_point(h1);
+                    // Closing segment: out of the tip, into the start
+                    // anchor's own incoming handle.
+                    let first_in = self
+                        .pen_anchor_handles(path_id, anchor)
+                        .map(|(_, h1)| h1)
+                        .unwrap_or(anchor);
+                    let sid =
+                        self.doc.add_bezier_segment(from, from_pair.0, first_in, anchor);
+                    self.push_layer_once(layer_id, ElementRef::Segment(sid));
+                    self.close_pen_path(path_id, sid);
+                    // A pulled tip smooths itself, like any other joint.
+                    self.smooth_pen_joint_if_bent(path_id, from);
+                    self.selection = vec![ElementRef::Path(path_id)];
+                    self.pending_pen = None;
+                    return;
+                }
+                // Clicking the active anchor itself is a no-op (keeps the
+                // chain armed for the next click elsewhere).
+                if anchor == pending.last && !fresh {
+                    // Weld hit our own tip: drop the spare pair, stay armed.
+                    self.doc.remove_point(h0);
+                    self.doc.remove_point(h1);
+                    self.pending_pen = Some(PendingPen {
+                        pulling: true,
+                        ..pending
+                    });
+                    return;
+                }
+                if anchor == pending.last && fresh {
+                    // Fresh duplicate of our own tip (shouldn't normally
+                    // happen — weld radius); fold it back in.
+                    self.doc.remove_point(anchor);
+                    self.pending_pen = Some(PendingPen {
+                        last_handles: pending.last_handles,
+                        pulling: true,
+                        ..pending
+                    });
+                    return;
+                }
+                // Normal link: segment last -> anchor.
+                let (from, from_pair) = (pending.last, pending.last_handles);
+                let sid = self.doc.add_bezier_segment(from, from_pair.0, h1, anchor);
+                self.push_layer_once(layer_id, ElementRef::Point(anchor));
+                self.push_layer_once(layer_id, ElementRef::Point(h0));
+                self.push_layer_once(layer_id, ElementRef::Point(h1));
+                self.push_layer_once(layer_id, ElementRef::Segment(sid));
+                let path_id = match pending.path {
+                    Some(pid) => {
+                        if let Some(path) = self.doc.path_mut(pid) {
+                            path.segments.push(sid);
+                            path.continuity.push(ContinuityMode::Corner);
+                            path.handles.push((h0, h1));
+                        }
+                        pid
+                    }
+                    None => {
+                        let pid = self.doc.add_path(
+                            vec![sid],
+                            false,
+                            vec![ContinuityMode::Corner, ContinuityMode::Corner],
+                            vec![pending.last_handles, (h0, h1)],
+                        );
+                        self.push_layer_once(layer_id, ElementRef::Path(pid));
+                        pid
+                    }
+                };
+                // A pulled joint smooths itself: extended handles imply it.
+                self.smooth_pen_joint_if_bent(path_id, from);
+                self.selection = vec![ElementRef::Segment(sid)];
+                self.pending_pen = Some(PendingPen {
+                    path: Some(path_id),
+                    last: anchor,
+                    cursor: at,
+                    pulling: true,
+                    last_fresh: fresh,
+                    last_handles: (h0, h1),
+                });
+            }
+        }
+    }
+
+    /// Appends the closing segment and seals the path. The continuity vec
+    /// already runs parallel to the closed anchors (open length n+1 for n
+    /// segments becomes n+1 anchors for n+1 segments), so only the flag
+    /// flips; the start anchor keeps its mode.
+    fn close_pen_path(&mut self, path_id: PathId, closing: SegmentId) {
+        if let Some(path) = self.doc.path_mut(path_id) {
+            path.segments.push(closing);
+            path.closed = true;
+        }
+    }
+
+    /// Click-drag on a fresh pen anchor pulls symmetric handles out of it:
+    /// the far handle rides the cursor, the near one mirrors. Below a small
+    /// screen-space threshold the pair stays collapsed (a plain click is a
+    /// sharp Corner anchor). Shift constrains the pull to 45-degree steps.
+    /// Continuity follows at the next commit (smooth_if_bent).
+    fn update_pen_pull(&mut self, cursor: Point2, shift: bool) {
+        let (last, pair) = match &self.pending_pen {
+            Some(p) if p.pulling => (p.last, p.last_handles),
+            _ => return,
+        };
+        let Some(a) = self.doc.point(last) else {
+            return;
+        };
+        if let Some(pending) = self.pending_pen.as_mut() {
+            pending.cursor = cursor;
+        }
+        let mut v = Point2::new(cursor.x - a.x, cursor.y - a.y);
+        if shift {
+            let snapped = tools::snap_angle(a, cursor);
+            v = Point2::new(snapped.x - a.x, snapped.y - a.y);
+        }
+        let len = (v.x * v.x + v.y * v.y).sqrt();
+        if len * self.camera.zoom < 5. {
+            self.doc.move_point(pair.0, a);
+            self.doc.move_point(pair.1, a);
+            return;
+        }
+        self.doc
+            .move_point(pair.0, Point2::new(a.x + v.x, a.y + v.y));
+        self.doc
+            .move_point(pair.1, Point2::new(a.x - v.x, a.y - v.y));
+    }
+
+    /// A joint smooths itself when its outgoing handle left the anchor: an
+    /// extended handle implies curvature, so Corner would lie.
+    fn smooth_pen_joint_if_bent(&mut self, path_id: PathId, joint: PointId) {
+        use crate::core::document::ContinuityMode;
+        let bent = match self.pen_anchor_handles(path_id, joint) {
+            Some((h0, _)) => self
+                .doc
+                .point(joint)
+                .zip(self.doc.point(h0))
+                .is_some_and(|(a, h)| pick::distance(a, h) > 1e-6),
+            None => false,
+        };
+        if !bent {
+            return;
+        }
+        // Only joints of THIS path, same index (sequential borrows).
+        let Some((_, i)) = self.path_anchor_index(joint) else {
+            return;
+        };
+        if !self
+            .doc
+            .path_anchors(path_id)
+            .is_some_and(|anchors| anchors.get(i) == Some(&joint))
+        {
+            return;
+        }
+        if let Some(path) = self.doc.path_mut(path_id)
+            && let Some(mode) = path.continuity.get_mut(i)
+        {
+            *mode = ContinuityMode::Smooth;
+        }
+    }
+
+    /// Abandons the open chain (tool switch / Esc): a lone fresh anchor
+    /// with no segments is removed again, everything else stays drawn.
+    fn abort_pending_pen(&mut self) {
+        let Some(pending) = self.pending_pen.take() else {
+            return;
+        };
+        if pending.path.is_none() && pending.last_fresh {
+            let (h0, h1) = pending.last_handles;
+            self.doc.remove_point(pending.last);
+            self.doc.remove_point(h0);
+            self.doc.remove_point(h1);
+        }
+    }
+
+    /// Backspace while drawing: pops the last anchor, the chain stays live
+    /// on the new tip. Shared (welded) points survive; only truly orphaned
+    /// points are removed.
+    pub(crate) fn pop_pen_anchor(&mut self) -> bool {
+        let Some(pending) = self.pending_pen.take() else {
+            return false;
+        };
+        let Some(path_id) = pending.path else {
+            // Lone anchor, no segments yet.
+            if pending.last_fresh {
+                let (h0, h1) = pending.last_handles;
+                self.doc.remove_point(pending.last);
+                self.doc.remove_point(h0);
+                self.doc.remove_point(h1);
+            }
+            self.selection.clear();
+            return true;
+        };
+        // Drop the last segment record first (manual splice: remove_segment
+        // would reset the surviving continuity modes).
+        let last_sid = self
+            .doc
+            .path(path_id)
+            .and_then(|p| p.segments.last().copied());
+        let Some(sid) = last_sid else {
+            self.doc.remove_path(path_id);
+            self.pending_pen = None;
+            self.selection.clear();
+            return true;
+        };
+        if let Some(path) = self.doc.path_mut(path_id) {
+            path.segments.retain(|&s| s != sid);
+            let want = path.segments.len() + !path.closed as usize;
+            path.continuity.truncate(want);
+            path.handles.pop();
+        }
+        // Segment record + layer cleanup without touching the path again
+        // (it no longer lists this segment).
+        self.doc.remove_segment(sid);
+        self.doc.detach_from_layers(ElementRef::Segment(sid));
+        // The popped tip and its pair die only as orphans.
+        let tip = pending.last;
+        let (h0, h1) = pending.last_handles;
+        for pid in [tip, h0, h1] {
+            if !self.point_in_use(pid, Some(path_id)) {
+                self.doc.remove_point(pid);
+                self.doc.detach_from_layers(ElementRef::Point(pid));
+            }
+        }
+        // Re-arm on the new tip, or unwind fully when nothing remains.
+        let anchors = self.doc.path_anchors(path_id).unwrap_or_default();
+        match anchors.last().copied() {
+            Some(new_tip) => {
+                let pair = self
+                    .pen_anchor_handles(path_id, new_tip)
+                    .unwrap_or((new_tip, new_tip));
+                self.pending_pen = Some(PendingPen {
+                    path: Some(path_id),
+                    last: new_tip,
+                    cursor: self.doc.point(new_tip).unwrap_or(pending.cursor),
+                    pulling: false,
+                    last_fresh: false,
+                    last_handles: pair,
+                });
+                self.selection = vec![ElementRef::Point(new_tip)];
+            }
+            None => {
+                self.doc.remove_path(path_id);
+                self.pending_pen = None;
+                self.selection.clear();
+            }
+        }
+        true
+    }
+
+    /// Double-click an anchor: Corner becomes Smooth, anything else becomes
+    /// Corner — in every path sharing the anchor.
+    fn toggle_anchor_continuity(&mut self, anchor: PointId) -> bool {
+        use crate::core::document::ContinuityMode;
+        let mut touched = false;
+        let owners: Vec<(PathId, usize)> = self
+            .doc
+            .all_paths()
+            .filter_map(|(pid, _)| {
+                self.doc.path_anchors(pid).and_then(|anchors| {
+                    anchors
+                        .iter()
+                        .position(|&a| a == anchor)
+                        .map(|i| (pid, i))
+                })
+            })
+            .collect();
+        for (pid, i) in owners {
+            if let Some(path) = self.doc.path_mut(pid)
+                && let Some(mode) = path.continuity.get_mut(i)
+            {
+                *mode = if *mode == ContinuityMode::Corner {
+                    ContinuityMode::Smooth
+                } else {
+                    ContinuityMode::Corner
+                };
+                touched = true;
+            }
+        }
+        touched
+    }
+
+    /// Click a curve: exact De Casteljau split inserts a junction anchor
+    /// that inherits the start anchor's mode. The drawn shape is unchanged
+    /// to the pixel; the chain continues from its live tip.
+    fn insert_pen_anchor(&mut self, sid: SegmentId, at: Point2) -> bool {
+        use crate::core::document::ContinuityMode;
+        let seg = self.doc.segment(sid).filter(|s| {
+            s.kind == crate::core::document::SegmentKind::Bezier
+        });
+        let Some(seg) = seg else { return false };
+        let Some(path_id) = self.path_containing(sid) else {
+            return false;
+        };
+        let Some((p0, p1, p2, p3)) = self.doc.bezier_geom(sid) else {
+            return false;
+        };
+        let (t, s) = crate::editor::bezier::param_of_closest(at, p0, p1, p2, p3);
+        if t <= 1e-3 || t >= 1. - 1e-3 {
+            return false;
+        }
+        let ((_, q0, r0, _), (_, r1, q2, _)) =
+            crate::editor::bezier::split(p0, p1, p2, p3, t);
+        let layer_id = self.doc.layers[0].id;
+        // Existing handles slide to their subdivision positions; the three
+        // new points are the junction anchor and the inner pair.
+        if let Some(h) = seg.handle_out {
+            self.doc.move_point(h, q0);
+        }
+        if let Some(h) = seg.handle_in {
+            self.doc.move_point(h, q2);
+        }
+        let ns = self.doc.add_point(s);
+        let nr0 = self.doc.add_point(r0);
+        let nr1 = self.doc.add_point(r1);
+        // Foreign beziers might lack stored handles; collapse replacements
+        // onto the endpoints so the split stays total.
+        let outer_out = seg.handle_out.unwrap_or_else(|| self.doc.add_point(p0));
+        let outer_in = seg.handle_in.unwrap_or_else(|| self.doc.add_point(p3));
+        let left = self.doc.add_bezier_segment(seg.start, outer_out, nr0, ns);
+        let right = self.doc.add_bezier_segment(ns, nr1, outer_in, seg.end);
+        for el in [
+            ElementRef::Point(ns),
+            ElementRef::Point(nr0),
+            ElementRef::Point(nr1),
+            ElementRef::Segment(left),
+            ElementRef::Segment(right),
+        ] {
+            self.push_layer_once(layer_id, el);
+        }
+        // Splice: swap the segment for the halves, inherit the start mode.
+        if let Some(path) = self.doc.path_mut(path_id) {
+            if let Some(pos) = path.segments.iter().position(|&x| x == sid) {
+                path.segments.splice(pos..=pos, [left, right]);
+                let mode = path
+                    .continuity
+                    .get(pos)
+                    .copied()
+                    .unwrap_or(ContinuityMode::Corner);
+                // Junction anchor index = pos + 1 in anchor order.
+                if path.continuity.len() >= pos + 1 {
+                    path.continuity.insert(pos + 1, mode);
+                }
+                path.handles.insert(pos + 1, (nr0, nr1));
+            }
+        }
+        self.doc.remove_segment(sid);
+        self.doc.detach_from_layers(ElementRef::Segment(sid));
+        self.selection = vec![ElementRef::Point(ns)];
+        true
+    }
+
     /// Deletes an element from the document and clears it from selection.
     pub fn delete_element(&mut self, el: ElementRef) {
         match el {
@@ -3413,12 +4112,23 @@ impl Editor {
                         if let Some(c) = seg.center {
                             v.push(c);
                         }
+                        if let Some(h) = seg.handle_out {
+                            v.push(h);
+                        }
+                        if let Some(h) = seg.handle_in {
+                            v.push(h);
+                        }
                         v
                     })
                     .unwrap_or_default();
                 self.doc.remove_segment(s);
                 for pid in ends {
-                    let still_used = self.doc.all_segments().any(|(_, seg)| seg.start == pid || seg.end == pid)
+                    let still_used = self.doc.all_segments().any(|(_, seg)| {
+                        seg.start == pid
+                            || seg.end == pid
+                            || seg.handle_out == Some(pid)
+                            || seg.handle_in == Some(pid)
+                    })
                         || self.doc.constraints.iter().any(|c| c.a == pid || c.b == pid)
                         || self.doc.dimensions.iter().any(|d| {
                             matches!(
@@ -3476,6 +4186,27 @@ impl Editor {
                     .constraints
                     .retain(|c| !(pts.contains(&c.a) && pts.contains(&c.b)));
                 for s in seg_ids {
+                    self.delete_element(ElementRef::Segment(s));
+                }
+            }
+            ElementRef::Path(p) => {
+                // Deleting a path takes its segments, anchors and handles
+                // with it. Points shared with surviving geometry (welded
+                // paths, coincident joins) stay alive: the segment cleanup
+                // below only removes truly orphaned points.
+                let seg_ids: Vec<crate::core::ids::SegmentId> = self
+                    .doc
+                    .path(p)
+                    .map(|path| path.segments.clone())
+                    .unwrap_or_default();
+                let pts = self.doc.element_points(ElementRef::Path(p));
+                self.doc.remove_path(p);
+                self.doc
+                    .constraints
+                    .retain(|c| !(pts.contains(&c.a) && pts.contains(&c.b)));
+                for s in seg_ids {
+                    // The path record is already gone, so the splice inside
+                    // remove_segment finds nothing to do.
                     self.delete_element(ElementRef::Segment(s));
                 }
             }
@@ -3563,7 +4294,8 @@ impl Editor {
         self.selection.retain(|el| match *el {
             ElementRef::Point(p) => self.doc.point(p).is_some(),
             ElementRef::Segment(s) => self.doc.segment(s).is_some(),
-            _ => true,
+            ElementRef::Fill(f) => self.doc.fill(f).is_some(),
+            ElementRef::Path(p) => self.doc.path(p).is_some(),
         });
         true
     }
@@ -3694,6 +4426,7 @@ impl Editor {
             ElementRef::Point(p) => self.doc.point(p).is_some(),
             ElementRef::Segment(s) => self.doc.segment(s).is_some(),
             ElementRef::Fill(f) => self.doc.fill(f).is_some(),
+            ElementRef::Path(p) => self.doc.path(p).is_some(),
         });
         self.selected_constraints
             .retain(|c| self.doc.constraints.contains(c));
@@ -3705,6 +4438,9 @@ impl Editor {
         self.pending_ruler = None;
         self.pending_line = None;
         self.pending_circle = None;
+        // The document was swapped wholesale; live chain ids may dangle.
+        // No geometry cleanup: the snapshot already owns the truth.
+        self.pending_pen = None;
         self.pending_via_click = false;
         self.dragging = None;
         self.marquee = None;
@@ -3720,9 +4456,12 @@ impl Editor {
             return true;
         }
         match el {
-            ElementRef::Segment(sid) => self
-                .fill_containing(sid)
-                .is_some_and(|f| self.selection.contains(&ElementRef::Fill(f))),
+            ElementRef::Segment(sid) => {
+                self.fill_containing(sid)
+                    .is_some_and(|f| self.selection.contains(&ElementRef::Fill(f)))
+                    || self.path_containing(sid)
+                        .is_some_and(|p| self.selection.contains(&ElementRef::Path(p)))
+            }
             ElementRef::Point(pid) => self.selection.iter().any(|sel| match *sel {
                 ElementRef::Segment(s) => self
                     .doc
@@ -3731,6 +4470,16 @@ impl Editor {
                 ElementRef::Fill(f) => {
                     self.doc.element_points(ElementRef::Fill(f)).contains(&pid)
                 }
+                ElementRef::Path(p) => {
+                    self.doc.element_points(ElementRef::Path(p)).contains(&pid)
+                }
+                _ => false,
+            }),
+            ElementRef::Path(pid) => self.selection.iter().any(|sel| match *sel {
+                ElementRef::Point(p) => self
+                    .doc
+                    .element_points(ElementRef::Path(pid))
+                    .contains(&p),
                 _ => false,
             }),
             _ => false,
@@ -3741,6 +4490,13 @@ impl Editor {
         self.doc
             .all_fills()
             .find(|(_, f)| f.segments.contains(&sid))
+            .map(|(id, _)| id)
+    }
+
+    fn path_containing(&self, sid: crate::core::ids::SegmentId) -> Option<crate::core::ids::PathId> {
+        self.doc
+            .all_paths()
+            .find(|(_, p)| p.segments.contains(&sid))
             .map(|(id, _)| id)
     }
 

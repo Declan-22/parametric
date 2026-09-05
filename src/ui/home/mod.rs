@@ -165,6 +165,7 @@ impl RenderOnce for DesignCard {
                         false, // show_grid (thumbnails never show grid)
                         crate::editor::Tool::Move,
                         None, // cursor_doc (no midpoint reveal in thumbnails)
+                        None, // pending_pen (never mid-draw in thumbnails)
                     ),
                     None => Vec::new(),
                 }

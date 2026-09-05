@@ -1,5 +1,5 @@
 use crate::core::geometry::{Point2, Rect};
-use crate::core::ids::{PointId, SegmentId};
+use crate::core::ids::{PathId, PointId, SegmentId};
 
 // Tool definitions and per-tool pending drag state. Each tool owns a small
 // pending-geometry struct; the commit logic lives on Editor.
@@ -10,6 +10,10 @@ use crate::core::ids::{PointId, SegmentId};
 pub enum Tool {
     Move,
     Pan,
+    // Redesigned pen (docs/pen-tool.md): path object + cubic segments.
+    // Geometry lands in Phase 1; the variant + toolbar entry come first so
+    // the tool has a home.
+    Pen,
     Line,
     Rectangle,
     Circle,
@@ -48,10 +52,14 @@ impl PendingShape {
 
 // In-progress line being drawn out (click-click or press-drag-release).
 // Shift snaps the direction to 45-degree increments, same as rulers.
+// `anchor` is the chain link: Some(pid) while chained from an existing
+// document point (the start tracks it across mid-chain edits), None for a
+// free-floating first link.
 #[derive(Clone, Copy, Debug)]
 pub struct PendingLine {
     pub start: Point2,
     pub cursor: Point2,
+    pub anchor: Option<PointId>,
 }
 
 impl PendingLine {
@@ -77,6 +85,21 @@ pub fn snap_angle(a: Point2, b: Point2) -> Point2 {
     let angle = (dy.atan2(dx) / step).round() * step;
     let len = (dx * dx + dy * dy).sqrt();
     Point2::new(a.x + len * angle.cos(), a.y + len * angle.sin())
+}
+
+// In-progress pen path: anchors + segments live in the document already;
+// this tracks the open chain. `last` is the active anchor (rubber starts
+// here, new segments chain from it); `pulling` while a fresh anchor's
+// handles are dragged out this gesture. `last_fresh` marks anchors the pen
+// created (vs. welded onto existing geometry) so aborts can clean up.
+#[derive(Clone, Copy, Debug)]
+pub struct PendingPen {
+    pub path: Option<PathId>,
+    pub last: PointId,
+    pub cursor: Point2,
+    pub pulling: bool,
+    pub last_fresh: bool,
+    pub last_handles: (PointId, PointId),
 }
 
 // In-progress circle/arc: stage 1 has `a` set, stage 2 adds the chord end

@@ -71,6 +71,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("space", ToolPan, None),
         KeyBinding::new("d", ToolDimension, None),
         KeyBinding::new("m", ToolRuler, None),
+        KeyBinding::new("p", ToolPen, None),
         KeyBinding::new("l", ToolLine, None),
         KeyBinding::new("r", ToolRectangle, None),
         KeyBinding::new("a", ToolCircle, None),

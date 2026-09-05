@@ -1,7 +1,7 @@
 use crate::core::constraints::{ConstraintKind, ElementRef};
-use crate::core::document::{Document, Segment, SegmentKind};
+use crate::core::document::{ContinuityMode, Document, Segment, SegmentKind};
 use crate::core::geometry::Point2;
-use crate::core::ids::{FillId, PointId, SegmentId};
+use crate::core::ids::{FillId, PathId, PointId, SegmentId};
 use crate::editor::Editor;
 
 // Copy/paste: serializes the ACTUAL selected elements (points, lines,
@@ -28,44 +28,72 @@ impl Editor {
             }
         }
 
+        let mut paths: Vec<(
+            PathId,
+            Vec<SegmentId>,
+            bool,
+            Vec<ContinuityMode>,
+            Vec<(PointId, PointId)>,
+        )> = Vec::new();
+
+        fn push_seg(
+            doc: &Document,
+            sid: SegmentId,
+            pts: &mut Vec<(PointId, Point2)>,
+            segs: &mut Vec<(SegmentId, Segment)>,
+        ) {
+            if let Some(seg) = doc.segment(sid) {
+                push_pt(doc, seg.start, pts);
+                push_pt(doc, seg.end, pts);
+                if let Some(c) = seg.ctrl {
+                    push_pt(doc, c, pts);
+                }
+                if let Some(c) = seg.center {
+                    push_pt(doc, c, pts);
+                }
+                if let Some(h) = seg.handle_out {
+                    push_pt(doc, h, pts);
+                }
+                if let Some(h) = seg.handle_in {
+                    push_pt(doc, h, pts);
+                }
+                if !segs.iter().any(|(id, _)| *id == sid) {
+                    segs.push((sid, seg));
+                }
+            }
+        }
+
         for &el in &self.selection {
             match el {
                 ElementRef::Point(pid) => push_pt(&self.doc, pid, &mut pts),
                 ElementRef::Segment(sid) => {
-                    if let Some(seg) = self.doc.segment(sid) {
-                        push_pt(&self.doc, seg.start, &mut pts);
-                        push_pt(&self.doc, seg.end, &mut pts);
-                        if let Some(c) = seg.ctrl {
-                            push_pt(&self.doc, c, &mut pts);
-                        }
-                        if let Some(c) = seg.center {
-                            push_pt(&self.doc, c, &mut pts);
-                        }
-                        if !segs.iter().any(|(id, _)| *id == sid) {
-                            segs.push((sid, seg));
-                        }
-                    }
+                    push_seg(&self.doc, sid, &mut pts, &mut segs);
                 }
                 ElementRef::Fill(fid) => {
                     if let Some(f) = self.doc.fill(fid) {
                         let ids: Vec<SegmentId> = f.segments.clone();
                         for &s in &ids {
-                            if let Some(seg) = self.doc.segment(s) {
-                                push_pt(&self.doc, seg.start, &mut pts);
-                                push_pt(&self.doc, seg.end, &mut pts);
-                                if let Some(c) = seg.ctrl {
-                                    push_pt(&self.doc, c, &mut pts);
-                                }
-                                if let Some(c) = seg.center {
-                                    push_pt(&self.doc, c, &mut pts);
-                                }
-                                if !segs.iter().any(|(id, _)| *id == s) {
-                                    segs.push((s, seg));
-                                }
-                            }
+                            push_seg(&self.doc, s, &mut pts, &mut segs);
                         }
                         if !fills.iter().any(|(id, _)| *id == fid) {
                             fills.push((fid, ids));
+                        }
+                    }
+                }
+                ElementRef::Path(pid) => {
+                    if let Some(p) = self.doc.path(pid) {
+                        let ids: Vec<SegmentId> = p.segments.clone();
+                        for &s in &ids {
+                            push_seg(&self.doc, s, &mut pts, &mut segs);
+                        }
+                        if !paths.iter().any(|(id, _, _, _, _)| *id == pid) {
+                            paths.push((
+                                pid,
+                                ids,
+                                p.closed,
+                                p.continuity.clone(),
+                                p.handles.clone(),
+                            ));
                         }
                     }
                 }
@@ -96,15 +124,20 @@ impl Editor {
                 SegmentKind::Line => "L",
                 SegmentKind::Ruler => "M",
                 SegmentKind::Arc => "A",
+                SegmentKind::Bezier => "B",
             };
+            // Handles append after the arc fields; old readers parse the
+            // first six and ignore the rest.
             s += &format!(
-                "|S:{},{},{},{},{},{}",
+                "|S:{},{},{},{},{},{},{},{}",
                 k,
                 idx(seg.start),
                 idx(seg.end),
                 seg.stroke_width,
                 seg.ctrl.map(|c| idx(c)).unwrap_or(-1),
                 seg.center.map(|c| idx(c)).unwrap_or(-1),
+                seg.handle_out.map(|h| idx(h)).unwrap_or(-1),
+                seg.handle_in.map(|h| idx(h)).unwrap_or(-1),
             );
         }
         for (_, f) in &fills {
@@ -114,6 +147,29 @@ impl Editor {
                 .map(|sid| seg_idx(*sid).to_string())
                 .collect();
             s += &list.join(",");
+        }
+        for (_, segs_ids, closed, modes, pairs) in &paths {
+            let list: Vec<String> = segs_ids
+                .iter()
+                .map(|sid| seg_idx(*sid).to_string())
+                .collect();
+            let cont: Vec<String> = modes
+                .iter()
+                .map(|m| ContinuityMode::code(*m).to_string())
+                .collect();
+            // Handle pairs as flat point indices (two per anchor); old
+            // readers split only three parts and ignore this one.
+            let hp: Vec<String> = pairs
+                .iter()
+                .flat_map(|(h0, h1)| [idx(*h0).to_string(), idx(*h1).to_string()])
+                .collect();
+            s += &format!(
+                "|H:{}:{}:{}:{}",
+                if *closed { 1 } else { 0 },
+                list.join(","),
+                cont.join(","),
+                hp.join(",")
+            );
         }
         // Constraints fully inside the copied point set (rectangle H/V
         // edges, coincident bonds within the group).
@@ -131,9 +187,19 @@ impl Editor {
             return false;
         };
         let mut pts: Vec<Point2> = Vec::new();
-        let mut seg_specs: Vec<(SegmentKind, usize, usize, f64, Option<usize>, Option<usize>)> =
-            Vec::new();
+        #[allow(clippy::type_complexity)]
+        let mut seg_specs: Vec<(
+            SegmentKind,
+            usize,
+            usize,
+            f64,
+            Option<usize>,
+            Option<usize>,
+            Option<usize>,
+            Option<usize>,
+        )> = Vec::new();
         let mut fill_specs: Vec<Vec<usize>> = Vec::new();
+        let mut path_specs: Vec<(bool, Vec<usize>, Vec<ContinuityMode>, Vec<usize>)> = Vec::new();
         let mut con_specs: Vec<(ConstraintKind, usize, usize)> = Vec::new();
 
         for part in payload.split('|') {
@@ -160,14 +226,24 @@ impl Editor {
                         "L" => SegmentKind::Line,
                         "M" => SegmentKind::Ruler,
                         "A" => SegmentKind::Arc,
+                        "B" => SegmentKind::Bezier,
                         _ => continue,
                     };
                     let (Ok(si), Ok(ei)) = (f[1].parse::<usize>(), f[2].parse::<usize>()) else {
                         continue;
                     };
                     let sw = f[3].parse::<f64>().unwrap_or(0.);
-                    let ci = f[4].parse::<i64>().ok().filter(|v| *v >= 0).map(|v| v as usize);
-                    let ce = f[5].parse::<i64>().ok().filter(|v| *v >= 0).map(|v| v as usize);                    seg_specs.push((kind, si, ei, sw, ci, ce));
+                    let opt = |i: usize| {
+                        f.get(i)
+                            .and_then(|v| v.parse::<i64>().ok())
+                            .filter(|v| *v >= 0)
+                            .map(|v| v as usize)
+                    };
+                    let ci = opt(4);
+                    let ce = opt(5);
+                    let h0 = opt(6);
+                    let h1 = opt(7);
+                    seg_specs.push((kind, si, ei, sw, ci, ce, h0, h1));
                 }
                 "F" => {
                     let list: Vec<usize> = rest
@@ -176,6 +252,33 @@ impl Editor {
                         .collect();
                     if !list.is_empty() {
                         fill_specs.push(list);
+                    }
+                }
+                "H" => {
+                    // paths: closed:seg,seg:mode,mode:h0,h1,...
+                    let mut parts = rest.splitn(4, ':');
+                    let closed = parts.next().is_some_and(|v| v == "1");
+                    let segs: Vec<usize> = parts
+                        .next()
+                        .unwrap_or("")
+                        .split(',')
+                        .filter_map(|v| v.parse::<usize>().ok())
+                        .collect();
+                    let modes: Vec<ContinuityMode> = parts
+                        .next()
+                        .unwrap_or("")
+                        .split(',')
+                        .filter_map(|v| v.parse::<u8>().ok())
+                        .map(ContinuityMode::from_code)
+                        .collect();
+                    let handles: Vec<usize> = parts
+                        .next()
+                        .unwrap_or("")
+                        .split(',')
+                        .filter_map(|v| v.parse::<usize>().ok())
+                        .collect();
+                    if !segs.is_empty() {
+                        path_specs.push((closed, segs, modes, handles));
                     }
                 }
                 "C" => {
@@ -207,7 +310,7 @@ impl Editor {
             .map(|p| self.doc.add_point(Point2::new(p.x + OFFSET, p.y + OFFSET)))
             .collect();
         let mut new_segs: Vec<SegmentId> = Vec::new();
-        for (kind, si, ei, sw, ci, ce) in &seg_specs {
+        for (kind, si, ei, sw, ci, ce, h0, h1) in &seg_specs {
             let (Some(&sp), Some(&ep)) = (ids.get(*si), ids.get(*ei)) else {
                 continue;
             };
@@ -221,6 +324,14 @@ impl Editor {
                     };
                     self.doc.add_arc_segment(sp, *ci, ep, *ce)
                 }
+                SegmentKind::Bezier => {
+                    let (Some(h0), Some(h1)) =
+                        (h0.and_then(|i| ids.get(i)), h1.and_then(|i| ids.get(i)))
+                    else {
+                        continue;
+                    };
+                    self.doc.add_bezier_segment(sp, *h0, *h1, ep)
+                }
             };
             new_segs.push(sid);
         }
@@ -233,6 +344,42 @@ impl Editor {
             if segs.len() >= 3 {
                 new_fills.push(self.doc.add_fill(segs));
             }
+        }
+        let mut new_paths: Vec<PathId> = Vec::new();
+        for (closed, list, modes, handles) in &path_specs {
+            let segs: Vec<SegmentId> = list
+                .iter()
+                .filter_map(|i| new_segs.get(*i).copied())
+                .collect();
+            if segs.is_empty() {
+                continue;
+            }
+            // Anchors implied by the pasted order; missing handle refs
+            // (old payloads) collapse onto their anchor.
+            let mut anchors: Vec<PointId> = Vec::new();
+            for &sid in &segs {
+                if let Some(s) = self.doc.segment(sid) {
+                    anchors.push(s.start);
+                }
+            }
+            if !closed
+                && let Some(&last) = segs.last()
+                && let Some(s) = self.doc.segment(last)
+            {
+                anchors.push(s.end);
+            }
+            let mut pairs: Vec<(PointId, PointId)> = Vec::new();
+            for (i, a) in anchors.iter().enumerate() {
+                let h = |k: usize| {
+                    handles
+                        .get(i * 2 + k)
+                        .and_then(|idx| ids.get(*idx))
+                        .copied()
+                        .unwrap_or(*a)
+                };
+                pairs.push((h(0), h(1)));
+            }
+            new_paths.push(self.doc.add_path(segs, *closed, modes.clone(), pairs));
         }
         for (kind, a, b) in &con_specs {
             if let (Some(&pa), Some(&pb)) = (ids.get(*a), ids.get(*b)) {
@@ -252,6 +399,10 @@ impl Editor {
         for fid in &new_fills {
             self.doc.push_to_layer(layer_id, ElementRef::Fill(*fid));
             sel.push(ElementRef::Fill(*fid));
+        }
+        for pid in &new_paths {
+            self.doc.push_to_layer(layer_id, ElementRef::Path(*pid));
+            sel.push(ElementRef::Path(*pid));
         }
         if sel.is_empty() {
             sel = ids.iter().map(|pid| ElementRef::Point(*pid)).collect();

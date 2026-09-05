@@ -793,6 +793,11 @@ impl Render for Shell {
         if dim_input_active {
             self.start_dim_blink(cx);
         }
+        let fps = self
+            .editor
+            .as_ref()
+            .map(|editor| editor.update(cx, |ed, _| ed.fps_counter.tick()))
+            .unwrap_or(0.0);
         let t = theme::active(cx);
         let shell_keys = cx.entity().downgrade();
 
@@ -1002,6 +1007,23 @@ impl Render for Shell {
                     });
                 }
             }))
+            .on_action(cx.listener(|shell, _: &crate::ui::actions::ToolPen, _, cx| {
+                if shell.renaming.is_some()
+                    || shell
+                        .editor
+                        .as_ref()
+                        .is_some_and(|ed| ed.read(cx).dim_input.is_some())
+                {
+                    return;
+                }
+                if let Some(ed) = shell.editor.as_ref() {
+                    ed.update(cx, |ed, cx| {
+                        if ed.set_tool(crate::editor::Tool::Pen) {
+                            cx.notify();
+                        }
+                    });
+                }
+            }))
             .on_action(cx.listener(|shell, _: &crate::ui::actions::ToolLine, _, cx| {
                 if shell.renaming.is_some()
                     || shell
@@ -1099,6 +1121,25 @@ impl Render for Shell {
                                 && ed.update(cx, |ed, _| ed.set_tool(crate::editor::Tool::Move))
                             {
                                 consumed = true;
+                            }
+                        }
+                        if consumed {
+                            cx.notify();
+                        }
+                    });
+                if consumed {
+                    return;
+                }
+            }
+                // Pen chain: Backspace pops the last anchor, chain stays live.
+                if key == "backspace" {
+                    let mut consumed = false;
+                    let _ = shell_keys.update(cx, |shell, cx| {
+                        if let Some(ed) = shell.editor.as_ref() {
+                            if ed.read(cx).tool == crate::editor::Tool::Pen
+                                && ed.read(cx).pending_pen.is_some()
+                            {
+                                consumed = ed.update(cx, |ed, _| ed.pop_pen_anchor());
                             }
                         }
                         if consumed {
@@ -1231,6 +1272,15 @@ impl Render for Shell {
                         .into_any_element()
                 }
             })
+            .child(
+                div()
+                    .absolute()
+                    .right(px(8.))
+                    .bottom(px(6.))
+                    .text_xs()
+                    .text_color(rgb(t.text_secondary))
+                    .child(format!("{fps:.0} FPS")),
+            )
             .when(self.pending_delete.is_some(), |root| {
                 let pending = self.pending_delete.unwrap();
                 let name = self

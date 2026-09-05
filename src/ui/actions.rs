@@ -28,6 +28,7 @@ actions!(
         ToolPan,
         ToolDimension,
         ToolRuler,
+        ToolPen,
         ToolLine,
         ToolRectangle,
         ToolCircle,

@@ -1,6 +1,6 @@
 use super::constraints::{Constraint, ConstraintKind, Dimension, ElementRef};
 use super::geometry::{Point2, Rect};
-use super::ids::{FillId, PointId, SegmentId};
+use super::ids::{FillId, PathId, PointId, SegmentId};
 
 // The permanent design. "What exists in the document?"
 // No GPUI types here — the engine is UI-independent.
@@ -33,6 +33,7 @@ pub struct Document {
     points: Arena<Point2>,
     segments: Arena<Segment>,
     fills: Arena<Fill>,
+    paths: Arena<Path>,
     // Geometric constraints (H/V/coincident) binding point pairs.
     pub constraints: Vec<Constraint>,
     // Dimensional measurements; a locked dimension doubles as a distance
@@ -51,6 +52,11 @@ pub enum SegmentKind {
     // Circular arc through start, ctrl (a point ON the arc), end. Becomes
     // a full circle when start/end share a Coincident constraint.
     Arc,
+    // Cubic Bezier from start to end. handle_out (P1, outgoing from start)
+    // and handle_in (P2, incoming to end) are REAL document points, like
+    // arc ctrls — directly pickable, snappable and solver-visible. A
+    // missing handle degenerates to its endpoint (straight line).
+    Bezier,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -62,21 +68,70 @@ pub struct Segment {
     // geometry (rectangle edges, etc.).
     pub stroke_width: f64,
     // Arc control point (a REAL point on the arc) for kind == Arc.
-    // None for lines/rulers. Endpoints + ctrl define the circumcircle.
+    // None for lines/rulers/beziers. Endpoints + ctrl define the circumcircle.
     pub ctrl: Option<PointId>,
     // Circumcenter point for arcs — a REAL document point that stays
     // centered. None for non-arcs. Enables snapping/constraints/hover.
     pub center: Option<PointId>,
+    // Bezier handles (REAL points) for kind == Bezier: handle_out leaves
+    // start, handle_in arrives at end. None for non-beziers.
+    pub handle_out: Option<PointId>,
+    pub handle_in: Option<PointId>,
 }
 
 impl Segment {
     fn line(start: PointId, end: PointId) -> Self {
-        Self { start, end, kind: SegmentKind::Line, stroke_width: 0., ctrl: None, center: None }
+        Self { start, end, kind: SegmentKind::Line, stroke_width: 0., ctrl: None, center: None, handle_out: None, handle_in: None }
     }
 
     fn with_kind(start: PointId, end: PointId, kind: SegmentKind) -> Self {
-        Self { start, end, kind, stroke_width: 0., ctrl: None, center: None }
+        Self { start, end, kind, stroke_width: 0., ctrl: None, center: None, handle_out: None, handle_in: None }
     }
+}
+
+// Continuity of one path anchor (docs/pen-tool.md section 13). Stored on
+// the path, not the point: one shared point can be sharp in one path and
+// smooth in another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContinuityMode {
+    Corner,
+    Smooth,
+    Symmetric,
+    Free,
+}
+
+impl ContinuityMode {
+    pub fn code(self) -> u8 {
+        match self {
+            ContinuityMode::Corner => 0,
+            ContinuityMode::Smooth => 1,
+            ContinuityMode::Symmetric => 2,
+            ContinuityMode::Free => 3,
+        }
+    }
+
+    pub fn from_code(code: u8) -> ContinuityMode {
+        match code {
+            1 => ContinuityMode::Smooth,
+            2 => ContinuityMode::Symmetric,
+            3 => ContinuityMode::Free,
+            _ => ContinuityMode::Corner,
+        }
+    }
+}
+
+// An ordered chain of segments sharing endpoints: the pen tool's path
+// object. Anchors are the joints (each segment's start, plus the final end
+// when open); `continuity` and `handles` run parallel to those anchors.
+// Each anchor owns its handle pair (outgoing, incoming) — shared anchors
+// keep independent tangents per path. Closed paths loop back onto their
+// first anchor (shared ID, genuinely closed).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Path {
+    pub segments: Vec<SegmentId>,
+    pub closed: bool,
+    pub continuity: Vec<ContinuityMode>,
+    pub handles: Vec<(PointId, PointId)>,
 }
 
 // A fill covers an ordered, closed loop of segments. Each segment must
@@ -230,7 +285,10 @@ impl Document {
         let dead: Vec<SegmentId> = self
             .segments
             .iter()
-            .filter(|(_, _, s)| s.start == id || s.end == id || s.ctrl == Some(id) || s.center == Some(id))
+            .filter(|(_, _, s)| {
+                s.start == id || s.end == id || s.ctrl == Some(id) || s.center == Some(id)
+                    || s.handle_out == Some(id) || s.handle_in == Some(id)
+            })
             .map(|(idx, generation, _)| SegmentId { idx, generation: generation })
             .collect();
         for sid in dead {
@@ -270,6 +328,8 @@ impl Document {
             stroke_width,
             ctrl: None,
             center: None,
+            handle_out: None,
+            handle_in: None,
         });
         SegmentId { idx, generation }
     }
@@ -290,8 +350,47 @@ impl Document {
             stroke_width: 0.,
             ctrl: Some(ctrl),
             center: Some(center),
+            handle_out: None,
+            handle_in: None,
         });
         SegmentId { idx, generation }
+    }
+
+    /// Adds a cubic Bezier from start to end with real handle points:
+    /// handle_out (P1) leaves start, handle_in (P2) arrives at end.
+    pub fn add_bezier_segment(
+        &mut self,
+        start: PointId,
+        handle_out: PointId,
+        handle_in: PointId,
+        end: PointId,
+    ) -> SegmentId {
+        let (idx, generation) = self.segments.insert(Segment {
+            start,
+            end,
+            kind: SegmentKind::Bezier,
+            stroke_width: 0.,
+            ctrl: None,
+            center: None,
+            handle_out: Some(handle_out),
+            handle_in: Some(handle_in),
+        });
+        SegmentId { idx, generation }
+    }
+
+    /// Resolved cubic control points (P0, P1, P2, P3). A missing handle
+    /// degenerates to its endpoint, so beziers stay renderable even when
+    /// partially constructed or partially restored.
+    pub fn bezier_geom(&self, id: SegmentId) -> Option<(Point2, Point2, Point2, Point2)> {
+        let s = self.segment(id)?;
+        if s.kind != SegmentKind::Bezier {
+            return None;
+        }
+        let p0 = self.point(s.start)?;
+        let p3 = self.point(s.end)?;
+        let p1 = s.handle_out.and_then(|h| self.point(h)).unwrap_or(p0);
+        let p2 = s.handle_in.and_then(|h| self.point(h)).unwrap_or(p3);
+        Some((p0, p1, p2, p3))
     }
 
     pub fn segment(&self, id: SegmentId) -> Option<Segment> {
@@ -304,10 +403,49 @@ impl Document {
         Some((self.point(s.start)?, self.point(s.end)?))
     }
 
-    /// Removes a segment and any fill loops passing through it.
+    /// Removes a segment: fill loops through it die, paths splice it out
+    /// (a path left with no segments dies with it).
     pub fn remove_segment(&mut self, id: SegmentId) -> bool {
         for fid in self.fills_referencing(id) {
             self.remove_fill(fid);
+        }
+        let emptied: Vec<PathId> = self
+            .paths
+            .iter()
+            .filter(|(_, _, p)| p.segments.contains(&id))
+            .map(|(idx, generation, _)| PathId { idx, generation })
+            .collect();
+        for pid in emptied {
+            let drop_path = match self.paths.get((pid.idx, pid.generation)) {
+                Some(p) => {
+                    let mut segs = p.segments.clone();
+                    segs.retain(|&s| s != id);
+                    if segs.is_empty() {
+                        true
+                    } else {
+                        if let Some(path) = self.paths.get_mut((pid.idx, pid.generation)) {
+                            path.segments = segs;
+                            // Continuity/handles run parallel to the anchors;
+                            // a splice re-indexes joints, so reset rather
+                            // than keep values on the wrong anchors.
+                            let want = path.segments.len() + !path.closed as usize;
+                            path.continuity = vec![ContinuityMode::Corner; want];
+                            path.handles.clear();
+                        }
+                        // Collapsed pairs keep the parallel invariant (anchor
+                        // count may have changed; read fresh, then fill).
+                        let anchors = self.path_anchors(pid).unwrap_or_default();
+                        if let Some(path) = self.paths.get_mut((pid.idx, pid.generation)) {
+                            path.handles = anchors.iter().map(|&a| (a, a)).collect();
+                        }
+                        false
+                    }
+                }
+                None => false,
+            };
+            if drop_path {
+                self.remove_path(pid);
+            }
         }
         self.detach_from_layers(ElementRef::Segment(id));
         self.segments.remove(id.idx).is_some()
@@ -352,9 +490,115 @@ impl Document {
         self.fills.remove(id.idx).is_some()
     }
 
+    // -- paths --
+
+    /// Adds a path over ordered segments. `continuity` and `handles` run
+    /// parallel to the anchors (each segment's start, plus the final end
+    /// when open); short vecs pad (Corner / collapsed at the anchor), long
+    /// ones truncate.
+    pub fn add_path(
+        &mut self,
+        segments: Vec<SegmentId>,
+        closed: bool,
+        continuity: Vec<ContinuityMode>,
+        handles: Vec<(PointId, PointId)>,
+    ) -> PathId {
+        let anchors: Vec<PointId> = {
+            let mut out = Vec::with_capacity(segments.len() + 1);
+            for &sid in &segments {
+                if let Some(seg) = self.segment(sid) {
+                    out.push(seg.start);
+                }
+            }
+            if !closed
+                && let Some(&last) = segments.last()
+                && let Some(seg) = self.segment(last)
+            {
+                out.push(seg.end);
+            }
+            out
+        };
+        let want = anchors.len();
+        let mut modes = continuity;
+        modes.truncate(want);
+        while modes.len() < want {
+            modes.push(ContinuityMode::Corner);
+        }
+        let mut pairs = handles;
+        pairs.truncate(want);
+        if let Some(&fallback) = anchors.first() {
+            while pairs.len() < want {
+                pairs.push((fallback, fallback));
+            }
+        }
+        let (idx, generation) = self.paths.insert(Path {
+            segments,
+            closed,
+            continuity: modes,
+            handles: pairs,
+        });
+        PathId { idx, generation }
+    }
+
+    /// Every anchor's handle pair, parallel to `path_anchors`.
+    pub fn path_handle_pairs(&self, id: PathId) -> Option<Vec<(PointId, PointId)>> {
+        self.path(id).map(|p| p.handles.clone())
+    }
+
+    pub fn path(&self, id: PathId) -> Option<&Path> {
+        self.paths.get((id.idx, id.generation))
+    }
+
+    pub fn path_mut(&mut self, id: PathId) -> Option<&mut Path> {
+        self.paths.get_mut((id.idx, id.generation))
+    }
+
+    pub fn remove_path(&mut self, id: PathId) -> bool {
+        self.detach_from_layers(ElementRef::Path(id));
+        self.paths.remove(id.idx).is_some()
+    }
+
+    /// All paths in the document (id + payload).
+    pub fn all_paths(&self) -> impl Iterator<Item = (PathId, &Path)> + '_ {
+        self.paths.iter().map(|(idx, generation, p)| (PathId { idx, generation }, p))
+    }
+
+    /// Ordered anchor points of a path: each segment's start, plus the
+    /// final end when the path is open.
+    pub fn path_anchors(&self, id: PathId) -> Option<Vec<PointId>> {
+        let path = self.path(id)?;
+        let mut out = Vec::with_capacity(path.segments.len() + 1);
+        for &sid in &path.segments {
+            out.push(self.segment(sid)?.start);
+        }
+        if !path.closed
+            && let Some(&last) = path.segments.last()
+        {
+            out.push(self.segment(last)?.end);
+        }
+        Some(out)
+    }
+
+    /// Every point a path owns: anchors plus bezier handles.
+    pub fn path_points(&self, id: PathId) -> Vec<PointId> {
+        let mut out = self.path_anchors(id).unwrap_or_default();
+        if let Some(path) = self.path(id) {
+            for &sid in &path.segments {
+                if let Some(seg) = self.segment(sid) {
+                    for h in [seg.handle_out, seg.handle_in].into_iter().flatten() {
+                        if !out.contains(&h) {
+                            out.push(h);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
     // -- layers --
 
-    fn detach_from_layers(&mut self, el: ElementRef) {
+    pub(crate) fn detach_from_layers(&mut self, el: ElementRef) {
         for layer in &mut self.layers {
             layer.retain_element(el);
         }
@@ -394,7 +638,8 @@ impl Document {
         self.bounds_of_points(&pts)
     }
 
-    /// All points referenced by an element (segment endpoints / loop corners).
+    /// All points referenced by an element (segment endpoints / loop corners
+    /// / path anchors + handles).
     pub fn element_points(&self, el: ElementRef) -> Vec<PointId> {
         match el {
             ElementRef::Point(p) => vec![p],
@@ -406,6 +651,12 @@ impl Document {
                     }
                     if let Some(c) = seg.center {
                         v.push(c);
+                    }
+                    if let Some(h) = seg.handle_out {
+                        v.push(h);
+                    }
+                    if let Some(h) = seg.handle_in {
+                        v.push(h);
                     }
                     v
                 }
@@ -420,6 +671,7 @@ impl Document {
                     .collect(),
                 None => Vec::new(),
             },
+            ElementRef::Path(p) => self.path_points(p),
         }
     }
 
@@ -522,6 +774,12 @@ impl Document {
                 if s.center == Some(drop) {
                     s.center = Some(keep);
                 }
+                if s.handle_out == Some(drop) {
+                    s.handle_out = Some(keep);
+                }
+                if s.handle_in == Some(drop) {
+                    s.handle_in = Some(keep);
+                }
             }
         }
         for c in &mut self.constraints {
@@ -587,11 +845,15 @@ impl Document {
             })
             .collect();
         let dims = self.dimensions.clone();
-        // A point survives only while something references it. Note a
-        // dimension counts as a reference: dims pin their geometry.
+        // A point survives only while something references it: segments,
+        // path anchor pairs, constraints, or dimensions. Note a dimension
+        // counts as a reference: dims pin their geometry.
         let referenced = |id: PointId| -> bool {
             self.all_segments().any(|(_, s)| {
                 s.start == id || s.end == id || s.ctrl == Some(id) || s.center == Some(id)
+                    || s.handle_out == Some(id) || s.handle_in == Some(id)
+            }) || self.all_paths().any(|(_, p)| {
+                p.handles.iter().any(|&(h0, h1)| h0 == id || h1 == id)
             }) || self.constraints.iter().any(|c| c.a == id || c.b == id)
                 || dims.iter().any(|d| match &d.target {
                     DimTarget::Points { a, b, .. } => *a == id || *b == id,
@@ -626,14 +888,31 @@ impl Document {
         stroke_width: f64,
         ctrl: Option<PointId>,
         center: Option<PointId>,
+        handle_out: Option<PointId>,
+        handle_in: Option<PointId>,
     ) {
         Self::reserve(&mut self.segments, id.idx, id.generation);
-        self.segments.set_at(id.idx, Segment { start, end, kind, stroke_width, ctrl, center });
+        self.segments.set_at(
+            id.idx,
+            Segment { start, end, kind, stroke_width, ctrl, center, handle_out, handle_in },
+        );
     }
 
     pub fn insert_fill_with_id(&mut self, id: FillId, segments: Vec<SegmentId>) {
         Self::reserve(&mut self.fills, id.idx, id.generation);
         self.fills.set_at(id.idx, Fill { segments });
+    }
+
+    pub fn insert_path_with_id(
+        &mut self,
+        id: PathId,
+        segments: Vec<SegmentId>,
+        closed: bool,
+        continuity: Vec<ContinuityMode>,
+        handles: Vec<(PointId, PointId)>,
+    ) {
+        Self::reserve(&mut self.paths, id.idx, id.generation);
+        self.paths.set_at(id.idx, Path { segments, closed, continuity, handles });
     }
 
     fn reserve<T>(arena: &mut Arena<T>, idx: u32, generation: u32) {

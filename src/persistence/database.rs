@@ -1,11 +1,11 @@
 use rusqlite::Connection;
 
 use crate::core::constraints::{ConstraintKind, Dimension, ElementRef};
-use crate::core::document::{DocSettings, Document, Layer, SegmentKind};
+use crate::core::document::{ContinuityMode, DocSettings, Document, Layer, SegmentKind};
 use crate::core::geometry::Point2;
-use crate::core::ids::{FillId, PointId, SegmentId};
+use crate::core::ids::{FillId, PathId, PointId, SegmentId};
 
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 pub struct Database {
     conn: Connection,
@@ -39,6 +39,8 @@ impl Database {
         )?;
         // v3 was a full break from the shape-based model; v4 added segment
         // stroke widths. Old databases don't migrate — dropped and rebuilt.
+        // v8 is additive over v7 (bezier handles + paths), so v7 files keep
+        // their data and gain columns/tables below.
         if self.schema_version()? < 7 {
             self.conn.execute_batch(
                 "DROP TABLE IF EXISTS shapes;
@@ -91,6 +93,26 @@ impl Database {
                 seg_gen INTEGER NOT NULL,
                 loop_index INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS paths (
+                idx INTEGER PRIMARY KEY,
+                generation INTEGER NOT NULL,
+                closed INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS path_segments (
+                path_idx INTEGER NOT NULL,
+                seg_idx INTEGER NOT NULL,
+                seg_gen INTEGER NOT NULL,
+                order_index INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS path_anchors (
+                path_idx INTEGER NOT NULL,
+                order_index INTEGER NOT NULL,
+                continuity INTEGER NOT NULL DEFAULT 0,
+                h0_idx INTEGER,
+                h0_gen INTEGER,
+                h1_idx INTEGER,
+                h1_gen INTEGER
+            );
             CREATE TABLE IF NOT EXISTS constraints (
                 id INTEGER PRIMARY KEY,
                 kind TEXT NOT NULL,
@@ -121,6 +143,7 @@ impl Database {
         )?;
         // Migrations for documents created before dimension kinds existed.
         // Best-effort: "duplicate column" errors mean it's already there.
+        // Same pattern carries v7 files into v8 (bezier handle columns).
         for sql in [
             "ALTER TABLE dimensions ADD COLUMN kind TEXT NOT NULL DEFAULT 'points'",
             "ALTER TABLE dimensions ADD COLUMN slide REAL NOT NULL DEFAULT 0",
@@ -129,6 +152,14 @@ impl Database {
             "ALTER TABLE dimensions ADD COLUMN sa_gen INTEGER",
             "ALTER TABLE dimensions ADD COLUMN sb_idx INTEGER",
             "ALTER TABLE dimensions ADD COLUMN sb_gen INTEGER",
+            "ALTER TABLE segments ADD COLUMN handle_out_idx INTEGER",
+            "ALTER TABLE segments ADD COLUMN handle_out_gen INTEGER",
+            "ALTER TABLE segments ADD COLUMN handle_in_idx INTEGER",
+            "ALTER TABLE segments ADD COLUMN handle_in_gen INTEGER",
+            "ALTER TABLE path_anchors ADD COLUMN h0_idx INTEGER",
+            "ALTER TABLE path_anchors ADD COLUMN h0_gen INTEGER",
+            "ALTER TABLE path_anchors ADD COLUMN h1_idx INTEGER",
+            "ALTER TABLE path_anchors ADD COLUMN h1_gen INTEGER",
         ] {
             let _ = self.conn.execute(sql, []);
         }
@@ -187,6 +218,9 @@ impl Database {
                  DELETE FROM constraints;
                  DELETE FROM fill_segments;
                  DELETE FROM fills;
+                 DELETE FROM path_anchors;
+                 DELETE FROM path_segments;
+                 DELETE FROM paths;
                  DELETE FROM segments;
                  DELETE FROM points;
                  DELETE FROM layer_elements;
@@ -204,18 +238,19 @@ impl Database {
                     SegmentKind::Line => "line",
                     SegmentKind::Ruler => "ruler",
                     SegmentKind::Arc => "arc",
+                    SegmentKind::Bezier => "bezier",
                 };
-                let (ctrl_idx, ctrl_gen) = match s.ctrl {
+                let pt_pair = |id: Option<crate::core::ids::PointId>| match id {
                     Some(c) => (Some(c.idx as i64), Some(c.generation as i64)),
                     None => (None, None),
                 };
-                let (center_idx, center_gen) = match s.center {
-                    Some(c) => (Some(c.idx as i64), Some(c.generation as i64)),
-                    None => (None, None),
-                };
+                let (ctrl_idx, ctrl_gen) = pt_pair(s.ctrl);
+                let (center_idx, center_gen) = pt_pair(s.center);
+                let (hout_idx, hout_gen) = pt_pair(s.handle_out);
+                let (hin_idx, hin_gen) = pt_pair(s.handle_in);
                 self.conn.execute(
-                    "INSERT INTO segments(idx, generation, kind, start_idx, start_gen, end_idx, end_gen, stroke_width, ctrl_idx, ctrl_gen, center_idx, center_gen)
-                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    "INSERT INTO segments(idx, generation, kind, start_idx, start_gen, end_idx, end_gen, stroke_width, ctrl_idx, ctrl_gen, center_idx, center_gen, handle_out_idx, handle_out_gen, handle_in_idx, handle_in_gen)
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                     rusqlite::params![
                         sid.idx as i64,
                         sid.generation as i64,
@@ -228,9 +263,55 @@ impl Database {
                         ctrl_idx,
                         ctrl_gen,
                         center_idx,
-                        center_gen
+                        center_gen,
+                        hout_idx,
+                        hout_gen,
+                        hin_idx,
+                        hin_gen
                     ],
                 )?;
+            }
+            for (pid, p) in doc.all_paths() {
+                self.conn.execute(
+                    "INSERT INTO paths(idx, generation, closed) VALUES(?1, ?2, ?3)",
+                    rusqlite::params![
+                        pid.idx as i64,
+                        pid.generation as i64,
+                        if p.closed { 1 } else { 0 }
+                    ],
+                )?;
+                for (i, &seg) in p.segments.iter().enumerate() {
+                    self.conn.execute(
+                        "INSERT INTO path_segments(path_idx, seg_idx, seg_gen, order_index)
+                         VALUES(?1, ?2, ?3, ?4)",
+                        rusqlite::params![
+                            pid.idx as i64,
+                            seg.idx as i64,
+                            seg.generation as i64,
+                            i as i64
+                        ],
+                    )?;
+                }
+                // One row per anchor (degenerate extras normalize away);
+                // missing handle pairs collapse onto the anchor.
+                let anchors = doc.path_anchors(pid).unwrap_or_default();
+                for (i, &a) in anchors.iter().enumerate() {
+                    let m = p.continuity.get(i).copied().unwrap_or(ContinuityMode::Corner);
+                    let (h0, h1) = p.handles.get(i).copied().unwrap_or((a, a));
+                    self.conn.execute(
+                        "INSERT INTO path_anchors(path_idx, order_index, continuity, h0_idx, h0_gen, h1_idx, h1_gen)
+                         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        rusqlite::params![
+                            pid.idx as i64,
+                            i as i64,
+                            m.code() as i64,
+                            h0.idx as i64,
+                            h0.generation as i64,
+                            h1.idx as i64,
+                            h1.generation as i64
+                        ],
+                    )?;
+                }
             }
             for (fid, f) in doc.all_fills() {
                 for (i, &seg) in f.segments.iter().enumerate() {
@@ -321,9 +402,10 @@ impl Database {
                 )?;
                 for (i, el) in layer.elements.iter().enumerate() {
                     let (kind, idx, generation) = match el {
-                        ElementRef::Point(id) => ("point", id.idx, id.generation),
-                        ElementRef::Segment(id) => ("segment", id.idx, id.generation),
-                        ElementRef::Fill(id) => ("fill", id.idx, id.generation),
+                    ElementRef::Point(id) => ("point", id.idx, id.generation),
+                    ElementRef::Segment(id) => ("segment", id.idx, id.generation),
+                    ElementRef::Fill(id) => ("fill", id.idx, id.generation),
+                    ElementRef::Path(id) => ("path", id.idx, id.generation),
                     };
                     self.conn.execute(
                         "INSERT INTO layer_elements(layer_id, kind, elem_idx, elem_gen, order_index)
@@ -394,7 +476,7 @@ impl Database {
         drop(stmt);
 
         let mut stmt = self.conn.prepare(
-            "SELECT idx, generation, kind, start_idx, start_gen, end_idx, end_gen, stroke_width, ctrl_idx, ctrl_gen, center_idx, center_gen
+            "SELECT idx, generation, kind, start_idx, start_gen, end_idx, end_gen, stroke_width, ctrl_idx, ctrl_gen, center_idx, center_gen, handle_out_idx, handle_out_gen, handle_in_idx, handle_in_gen
              FROM segments ORDER BY idx",
         )?;
         let mut rows = stmt.query([])?;
@@ -404,24 +486,21 @@ impl Database {
                 "line" => SegmentKind::Line,
                 "ruler" => SegmentKind::Ruler,
                 "arc" => SegmentKind::Arc,
+                "bezier" => SegmentKind::Bezier,
                 _ => continue,
             };
-            let ctrl = {
-                let idx: Option<i64> = row.get(8).ok().flatten();
-                let generation: Option<i64> = row.get(9).ok().flatten();
+            let opt_pt = |col: usize| {
+                let idx: Option<i64> = row.get(col).ok().flatten();
+                let generation: Option<i64> = row.get(col + 1).ok().flatten();
                 match (idx, generation) {
                     (Some(i), Some(g)) => Some(PointId { idx: i as u32, generation: g as u32 }),
                     _ => None,
                 }
             };
-            let center = {
-                let idx: Option<i64> = row.get(10).ok().flatten();
-                let generation: Option<i64> = row.get(11).ok().flatten();
-                match (idx, generation) {
-                    (Some(i), Some(g)) => Some(PointId { idx: i as u32, generation: g as u32 }),
-                    _ => None,
-                }
-            };
+            let ctrl = opt_pt(8);
+            let center = opt_pt(10);
+            let handle_out = opt_pt(12);
+            let handle_in = opt_pt(14);
             insert_segment_raw(
                 &mut doc,
                 SegmentId {
@@ -440,6 +519,8 @@ impl Database {
                 row.get::<_, f64>(7).unwrap_or(0.),
                 ctrl,
                 center,
+                handle_out,
+                handle_in,
             );
         }
         drop(rows);
@@ -467,6 +548,122 @@ impl Database {
         drop(rows);
         drop(stmt);
         insert_fills_raw(&mut doc, fills);
+
+        // Paths: segment order + per-anchor continuity, grouped by path slot.
+        // Missing tables (pre-v8 files) mean no paths — skip quietly. Two
+        // queries (segments, then modes) so an open path's trailing anchor
+        // — which has no matching segment row — still loads.
+        let mut path_segs: Vec<(u32, u32, bool, Vec<SegmentId>)> = Vec::new();
+        if let Ok(mut stmt) = self.conn.prepare(
+            "SELECT p.idx, p.generation, p.closed, ps.seg_idx, ps.seg_gen
+             FROM paths p LEFT JOIN path_segments ps ON ps.path_idx = p.idx
+             ORDER BY p.idx, ps.order_index",
+        ) {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    let (idx, generation): (i64, i64) =
+                        match (row.get(0), row.get(1)) {
+                            (Ok(a), Ok(b)) => (a, b),
+                            _ => continue,
+                        };
+                    let closed: i64 = row.get(2).unwrap_or(0);
+                    let seg: Option<SegmentId> = match (
+                        row.get::<_, Option<i64>>(3).ok().flatten(),
+                        row.get::<_, Option<i64>>(4).ok().flatten(),
+                    ) {
+                        (Some(i), Some(g)) => Some(SegmentId {
+                            idx: i as u32,
+                            generation: g as u32,
+                        }),
+                        _ => None,
+                    };
+                    match path_segs.iter_mut().find(|(pi, pg, _, _)| {
+                        *pi == idx as u32 && *pg == generation as u32
+                    }) {
+                        Some((_, _, _, segs)) => {
+                            if let Some(s) = seg {
+                                segs.push(s);
+                            }
+                        }
+                        None => {
+                            let mut segs = Vec::new();
+                            if let Some(s) = seg {
+                                segs.push(s);
+                            }
+                            path_segs.push((idx as u32, generation as u32, closed != 0, segs));
+                        }
+                    }
+                }
+            }
+        }
+        let mut path_modes: Vec<(u32, Vec<(ContinuityMode, Option<PointId>, Option<PointId>)>)> =
+            Vec::new();
+        if let Ok(mut stmt) = self.conn.prepare(
+            "SELECT path_idx, continuity, h0_idx, h0_gen, h1_idx, h1_gen
+             FROM path_anchors ORDER BY path_idx, order_index",
+        ) {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    let idx: i64 = match row.get(0) {
+                        Ok(v) => v,
+                        _ => continue,
+                    };
+                    let mode = row
+                        .get::<_, Option<i64>>(1)
+                        .ok()
+                        .flatten()
+                        .map(|v| ContinuityMode::from_code(v as u8))
+                        .unwrap_or(ContinuityMode::Corner);
+                    let opt_pt = |col: usize| {
+                        let i: Option<i64> = row.get(col).ok().flatten();
+                        let g: Option<i64> = row.get(col + 1).ok().flatten();
+                        match (i, g) {
+                            (Some(i), Some(g)) => Some(PointId {
+                                idx: i as u32,
+                                generation: g as u32,
+                            }),
+                            _ => None,
+                        }
+                    };
+                    // Tolerant: pre-handle files resolve pairs at insert.
+                    let h0 = opt_pt(2);
+                    let h1 = opt_pt(4);
+                    match path_modes.iter_mut().find(|(pi, _)| *pi == idx as u32) {
+                        Some((_, modes)) => modes.push((mode, h0, h1)),
+                        None => path_modes.push((idx as u32, vec![(mode, h0, h1)])),
+                    }
+                }
+            }
+        }
+        for (idx, generation, closed, segs) in path_segs {
+            let anchors = anchors_of(&segs, closed, &doc);
+            let (modes, pairs): (Vec<ContinuityMode>, Vec<(PointId, PointId)>) = match path_modes
+                .iter()
+                .find(|(pi, _)| *pi == idx)
+            {
+                Some((_, rows)) => {
+                    let mut modes = Vec::with_capacity(rows.len());
+                    let mut pairs = Vec::with_capacity(rows.len());
+                    for (i, (m, h0, h1)) in rows.iter().enumerate() {
+                        modes.push(*m);
+                        // Missing handle ids (pre-handle files) collapse
+                        // onto the anchor.
+                        let a = anchors
+                            .get(i)
+                            .or_else(|| anchors.last())
+                            .copied()
+                            .unwrap_or(PointId::NONE);
+                        let live = |h: &Option<PointId>| {
+                            h.filter(|id| doc.point(*id).is_some()).unwrap_or(a)
+                        };
+                        pairs.push((live(h0), live(h1)));
+                    }
+                    (modes, pairs)
+                }
+                None => (Vec::new(), Vec::new()),
+            };
+            doc.insert_path_with_id(PathId { idx, generation }, segs, closed, modes, pairs);
+        }
 
         let mut stmt = self.conn.prepare(
             "SELECT kind, p1_idx, p1_gen, p2_idx, p2_gen, s1_idx, s1_gen, s2_idx, s2_gen FROM constraints",
@@ -613,6 +810,10 @@ impl Database {
                     idx: row.get::<_, i64>(3)? as u32,
                     generation: row.get::<_, i64>(4)? as u32,
                 }),
+                "path" => ElementRef::Path(PathId {
+                    idx: row.get::<_, i64>(3)? as u32,
+                    generation: row.get::<_, i64>(4)? as u32,
+                }),
                 _ => continue,
             };
             if let Some(layer) = doc.layers.last_mut() {
@@ -636,14 +837,43 @@ fn insert_segment_raw(
     stroke_width: f64,
     ctrl: Option<PointId>,
     center: Option<PointId>,
+    handle_out: Option<PointId>,
+    handle_in: Option<PointId>,
 ) {
-    doc.insert_segment_with_id(id, start, end, kind, stroke_width, ctrl, center);
+    doc.insert_segment_with_id(
+        id,
+        start,
+        end,
+        kind,
+        stroke_width,
+        ctrl,
+        center,
+        handle_out,
+        handle_in,
+    );
 }
 
 fn insert_fills_raw(doc: &mut Document, fills: Vec<(u32, u32, Vec<SegmentId>)>) {
     for (idx, generation, segs) in fills {
         doc.insert_fill_with_id(FillId { idx, generation: generation }, segs);
     }
+}
+
+/// Anchor ids implied by an ordered segment list (no Path record needed).
+fn anchors_of(segs: &[SegmentId], closed: bool, doc: &Document) -> Vec<PointId> {
+    let mut out = Vec::with_capacity(segs.len() + 1);
+    for &sid in segs {
+        if let Some(s) = doc.segment(sid) {
+            out.push(s.start);
+        }
+    }
+    if !closed
+        && let Some(&last) = segs.last()
+        && let Some(s) = doc.segment(last)
+    {
+        out.push(s.end);
+    }
+    out
 }
 
 fn add_constraint_raw(doc: &mut Document, kind: ConstraintKind, a: PointId, b: PointId, segments: Option<(SegmentId, SegmentId)>) {
@@ -692,6 +922,58 @@ mod tests {
         let b = loaded.fill_bounds(fid).unwrap();
         assert_eq!(b.size.w, 100.);
         assert_eq!(b.size.h, 100.);
+    }
+
+    #[test]
+    fn bezier_path_roundtrip() {
+        use crate::core::document::ContinuityMode;
+        let db = Database::open_in_memory().unwrap();
+        let mut ed = Editor::new();
+        let p0 = ed.doc.add_point(Point2::new(0., 0.));
+        let h0 = ed.doc.add_point(Point2::new(10., 30.));
+        let h1 = ed.doc.add_point(Point2::new(40., -10.));
+        let p1 = ed.doc.add_point(Point2::new(50., 20.));
+        let h2 = ed.doc.add_point(Point2::new(60., 50.));
+        let h3 = ed.doc.add_point(Point2::new(90., 50.));
+        let p2 = ed.doc.add_point(Point2::new(100., 20.));
+        let s0 = ed.doc.add_bezier_segment(p0, h0, h1, p1);
+        let s1 = ed.doc.add_bezier_segment(p1, h2, h3, p2);
+        let path = ed.doc.add_path(
+            vec![s0, s1],
+            false,
+            vec![ContinuityMode::Corner, ContinuityMode::Smooth, ContinuityMode::Corner],
+            vec![(h0, h0), (h1, h2), (h3, h3)],
+        );
+        ed.doc.push_to_layer(1, ElementRef::Path(path));
+        ed.selection = vec![ElementRef::Path(path)];
+
+        db.save_document(&ed.doc).unwrap();
+        let loaded = db.load_document().unwrap();
+        let paths: Vec<_> = loaded.all_paths().collect();
+        assert_eq!(paths.len(), 1);
+        let (pid, p) = paths[0];
+        assert_eq!(pid, path);
+        assert!(!p.closed);
+        assert_eq!(p.segments.len(), 2);
+        assert_eq!(
+            p.continuity,
+            vec![
+                ContinuityMode::Corner,
+                ContinuityMode::Smooth,
+                ContinuityMode::Corner
+            ]
+        );
+        // Handles and anchors resolve; the midpoint sits on the curve.
+        let (m0, m1, m2, m3) = loaded.bezier_geom(p.segments[0]).unwrap();
+        assert_eq!((m0, m3), (Point2::new(0., 0.), Point2::new(50., 20.)));
+        assert_eq!((m1, m2), (Point2::new(10., 30.), Point2::new(40., -10.)));
+        assert!(loaded.layers[0].elements.contains(&ElementRef::Path(path)));
+        assert_eq!(loaded.path_anchors(pid).unwrap().len(), 3);
+        // Handle pairs resolve to the placed handle points.
+        let pairs = loaded.path_handle_pairs(pid).unwrap();
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(loaded.point(pairs[0].0).unwrap(), Point2::new(10., 30.));
+        assert_eq!(loaded.point(pairs[1].1).unwrap(), Point2::new(60., 50.));
     }
 
     #[test]

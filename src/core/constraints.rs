@@ -1,4 +1,4 @@
-use super::ids::{FillId, PointId, SegmentId};
+use super::ids::{FillId, PathId, PointId, SegmentId};
 
 // Geometric constraints bind to POINTS, not shapes — every constraint below
 // reduces to equations over point positions. A future solver iterates these
@@ -131,6 +131,7 @@ pub enum ElementRef {
     Point(PointId),
     Segment(SegmentId),
     Fill(FillId),
+    Path(PathId),
 }
 
 impl ElementRef {
@@ -151,6 +152,13 @@ impl ElementRef {
     pub fn as_fill(self) -> Option<FillId> {
         match self {
             ElementRef::Fill(f) => Some(f),
+            _ => None,
+        }
+    }
+
+    pub fn as_path(self) -> Option<PathId> {
+        match self {
+            ElementRef::Path(p) => Some(p),
             _ => None,
         }
     }

@@ -541,7 +541,7 @@ impl CanvasView {
         let prepaint = move |bounds: Bounds<Pixels>,
                              window: &mut Window,
                              cx: &mut App|
-              -> (Vec<paint::Primitive>, gpui::Hitbox) {
+                             -> (Vec<paint::Primitive>, gpui::Hitbox) {
             let hitbox = window.insert_hitbox(bounds, HitboxBehavior::default());
             let Some(editor) = editor.upgrade() else {
                 return (Vec::new(), hitbox);
@@ -591,6 +591,7 @@ impl CanvasView {
                 ed.show_grid,
                 ed.tool,
                 cursor_doc,
+                ed.pending_pen,
             );
             (list, hitbox)
         };

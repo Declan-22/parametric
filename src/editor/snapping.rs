@@ -171,9 +171,12 @@ pub fn targets(
             span_is_x: false,
         });
         // Edge spans: horizontal edge snaps Y within X range, vertical edge
-        // snaps X within Y range.
-        let horizontal = (a.y - b.y).abs() < 1e-9;
-        let vertical = (a.x - b.x).abs() < 1e-9;
+        // snaps X within Y range. Bezier chords are not snap rails (their
+        // bodies project separately below); lines and arcs keep their
+        // long-standing behavior.
+        let span_kind = seg.kind == SegmentKind::Line || seg.kind == SegmentKind::Arc;
+        let horizontal = span_kind && (a.y - b.y).abs() < 1e-9;
+        let vertical = span_kind && (a.x - b.x).abs() < 1e-9;
         if horizontal {
             out.push(SnapTarget {
                 x: m.x,
@@ -294,13 +297,51 @@ pub fn best(
             best = Some((score, dx, dy, hit_x, hit_y, tgt));
         }
     }
-    // Arc bodies — closest point on the arc curve (larger tolerance).
+    // Curve bodies — closest point on arc/bezier curves (larger tolerance).
+    // Bezier bodies also exclude their handles: dragging a handle must
+    // never snap back onto its own curve.
     let arc_tol = tol * 1.8;
     for (sid, seg) in doc.all_segments() {
-        if seg.kind != SegmentKind::Arc {
+        if seg.kind != SegmentKind::Arc && seg.kind != SegmentKind::Bezier {
             continue;
         }
         if exclude_segs.contains(&sid) {
+            continue;
+        }
+        if seg.kind == SegmentKind::Bezier {
+            if exclude_pts.contains(&seg.start)
+                || exclude_pts.contains(&seg.end)
+                || seg.handle_out.is_some_and(|id| exclude_pts.contains(&id))
+                || seg.handle_in.is_some_and(|id| exclude_pts.contains(&id))
+            {
+                continue;
+            }
+            let Some((p0, p1, p2, p3)) = doc.bezier_geom(sid) else {
+                continue;
+            };
+            let proj = crate::editor::bezier::closest_point(p, p0, p1, p2, p3);
+            if !visible.contains(proj) {
+                continue;
+            }
+            let dx = proj.x - p.x;
+            let dy = proj.y - p.y;
+            let d = (dx * dx + dy * dy).sqrt();
+            if d > arc_tol {
+                continue;
+            }
+            if best.as_ref().map_or(true, |(s, _, _, _, _, _)| d < *s) {
+                let tgt = SnapTarget {
+                    x: proj.x,
+                    y: proj.y,
+                    kind: SnapKind::Edge,
+                    snap_x: true,
+                    snap_y: true,
+                    span_lo: 0.,
+                    span_hi: 0.,
+                    span_is_x: false,
+                };
+                best = Some((d, dx, dy, true, true, tgt));
+            }
             continue;
         }
         let Some(sc) = seg.ctrl else { continue };
@@ -450,8 +491,8 @@ pub fn mid(a: Point2, b: Point2) -> Point2 {
 }
 
 /// Segment midpoint as a snap target: lines use the chord midpoint; arcs
-/// project to the middle of their sweep — ON the curve (the chord midpoint
-/// of an arc floats in empty space off the bend).
+/// project to the middle of their sweep and beziers to B(0.5) — ON the
+/// curve (chord midpoints float in empty space off the bend).
 fn segment_mid_target(doc: &Document, seg: crate::core::document::Segment, a: Point2, b: Point2) -> Point2 {
     if seg.kind == SegmentKind::Arc
         && let Some(sc) = seg.ctrl
@@ -459,6 +500,11 @@ fn segment_mid_target(doc: &Document, seg: crate::core::document::Segment, a: Po
         && let Some(m) = crate::editor::arc::curve_midpoint(a, b, c)
     {
         return m;
+    }
+    if seg.kind == SegmentKind::Bezier {
+        let p1 = seg.handle_out.and_then(|h| doc.point(h)).unwrap_or(a);
+        let p2 = seg.handle_in.and_then(|h| doc.point(h)).unwrap_or(b);
+        return crate::editor::bezier::point(a, p1, p2, b, 0.5);
     }
     mid(a, b)
 }
@@ -587,8 +633,10 @@ fn per_axis_object_locks(
                 ));
             }
         }
-        let horizontal = (a.y - b.y).abs() < 1e-9;
-        let vertical = (a.x - b.x).abs() < 1e-9;
+        // Bezier chords are not snap rails (see targets() above).
+        let span_kind = seg.kind == SegmentKind::Line || seg.kind == SegmentKind::Arc;
+        let horizontal = span_kind && (a.y - b.y).abs() < 1e-9;
+        let vertical = span_kind && (a.x - b.x).abs() < 1e-9;
         if horizontal && p.x >= a.x.min(b.x) && p.x <= a.x.max(b.x) {
             let dy = a.y - p.y;
             if dy.abs() <= tol && best_y.as_ref().map_or(true, |(s, _)| dy.abs() < *s) {
@@ -899,6 +947,28 @@ pub fn cursor_snap(
         }
     }
     if let Some((_, proj)) = best_arc {
+        return (proj, guide(proj, SnapKind::Edge));
+    }
+
+    // 5) Bezier bodies — closest point on the cubic (same tolerance).
+    let mut best_bez: Option<(f64, Point2)> = None;
+    for (sid, seg) in doc.all_segments() {
+        if seg.kind != SegmentKind::Bezier {
+            continue;
+        }
+        let Some((p0, p1, p2, p3)) = doc.bezier_geom(sid) else {
+            continue;
+        };
+        let proj = crate::editor::bezier::closest_point(p, p0, p1, p2, p3);
+        if !visible.contains(proj) && !visible.contains(p0) && !visible.contains(p3) {
+            continue;
+        }
+        let d = distance(p, proj);
+        if d <= arc_tol && best_bez.map_or(true, |(bd, _)| d < bd) {
+            best_bez = Some((d, proj));
+        }
+    }
+    if let Some((_, proj)) = best_bez {
         return (proj, guide(proj, SnapKind::Edge));
     }
 

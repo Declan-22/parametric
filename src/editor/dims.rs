@@ -120,6 +120,7 @@ pub fn update(ed: &mut Editor) {
         for (sid, seg) in ed.doc.all_segments() {
             if seg.kind == crate::core::document::SegmentKind::Ruler
                 || seg.kind == crate::core::document::SegmentKind::Arc
+                || seg.kind == crate::core::document::SegmentKind::Bezier
             {
                 continue;
             }
@@ -794,6 +795,11 @@ fn update_constraint_markers(ed: &mut Editor) {
                 crate::core::constraints::ElementRef::Fill(fid) => ed
                     .doc
                     .element_points(crate::core::constraints::ElementRef::Fill(fid))
+                    .iter()
+                    .any(|&p| p == c.a || p == c.b),
+                crate::core::constraints::ElementRef::Path(pid) => ed
+                    .doc
+                    .element_points(crate::core::constraints::ElementRef::Path(pid))
                     .iter()
                     .any(|&p| p == c.a || p == c.b),
             }

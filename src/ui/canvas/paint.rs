@@ -1,4 +1,5 @@
 use gpui::{Pixels, Size, rgb, rgba};
+use std::collections::{HashMap, HashSet};
 
 use crate::core::constraints::ElementRef;
 use crate::core::document::{Document, SegmentKind};
@@ -78,6 +79,7 @@ pub fn build_draw_list(
     show_grid: bool,
     tool: crate::editor::Tool,
     cursor_doc: Option<Point2>,
+    pending_pen: Option<crate::editor::PendingPen>,
 ) -> Vec<Primitive> {
     let min = camera.screen_to_unit(Point2::new(0., 0.));
     let max = camera.screen_to_unit(Point2::new(
@@ -90,6 +92,16 @@ pub fn build_draw_list(
     let color: gpui::Background = rgb(0x808080).into();
     let accent: gpui::Background = rgb(t.accent).into();
     let mut list = Vec::new();
+    // A pen segment is stored both as a path member and as a layer element so
+    // it can be selected independently.  Do not paint it twice.  This set is
+    // built once per frame instead of repeatedly scanning every path.
+    let path_segments: HashSet<_> = doc
+        .all_paths()
+        .flat_map(|(_, path)| path.segments.iter().copied())
+        .collect();
+    // Sampling a cubic is relatively expensive and used by the base pass and
+    // selection/hover overlays.  Reuse each segment's samples for this frame.
+    let mut bezier_cache: HashMap<crate::core::ids::SegmentId, Vec<Point2>> = HashMap::new();
 
     // 0) Infinite grid — viewport-culled, LOD-clamped, pan-aware. This is the
     // "genius" part: cost is O(viewport) not O(world). We never allocate
@@ -142,6 +154,9 @@ pub fn build_draw_list(
                     });
                 }
                 ElementRef::Segment(sid) => {
+                    if path_segments.contains(&sid) {
+                        continue;
+                    }
                     let Some(seg) = doc.segment(sid) else {
                         continue;
                     };
@@ -167,6 +182,29 @@ pub fn build_draw_list(
                             width: seg.stroke_width as f32,
                             color,
                         });
+                    }
+                    // Bezier segments: sampled cubic (adaptive so the curve
+                    // stays smooth at any zoom). Always stroked like arcs —
+                    // pen paths are user-drawn curves, not fill edges.
+                    if seg.kind == SegmentKind::Bezier {
+                        let Some(_) = doc.bezier_geom(sid) else {
+                            continue;
+                        };
+                        if !bezier_bounds_intersect(doc, sid, visible) {
+                            continue;
+                        }
+                        let Some(samples) = cached_bezier_samples(
+                            doc, sid, camera.zoom, &mut bezier_cache,
+                        ) else { continue };
+                        if samples.iter().any(|p| visible.contains(*p)) {
+                            push_polyline(
+                                &mut list,
+                                &samples.iter().map(|p| scr(*p)).collect::<Vec<_>>(),
+                                1.5,
+                                color,
+                            );
+                        }
+                        continue;
                     }
                     // Arc segments: sampled polyline of the arc through
                     // start -> ctrl -> end (adaptive so the curve stays
@@ -217,6 +255,48 @@ pub fn build_draw_list(
                                 crate::editor::arc::complement_samples(sa, sb, scp, n.max(32));
                             let pts: Vec<(f32, f32)> = comp.iter().map(|p| scr(*p)).collect();
                             dashed_polyline(&mut list, &pts, accent);
+                        }
+                    }
+                }
+                ElementRef::Path(pid) => {
+                    // Path members render as their own geometry (beziers
+                    // sampled, stroked lines as lines). Selection and hover
+                    // overlays trace them separately below.
+                    let Some(path) = doc.path(pid) else { continue };
+                    for &sid in &path.segments {
+                        let Some(seg) = doc.segment(sid) else {
+                            continue;
+                        };
+                        if seg.kind == SegmentKind::Bezier {
+                            if !bezier_bounds_intersect(doc, sid, visible) {
+                                continue;
+                            }
+                            let Some(samples) = cached_bezier_samples(
+                                doc, sid, camera.zoom, &mut bezier_cache,
+                            ) else { continue };
+                            if samples.iter().any(|p| visible.contains(*p)) {
+                                push_polyline(
+                                    &mut list,
+                                    &samples.iter().map(|p| scr(*p)).collect::<Vec<_>>(),
+                                    1.5,
+                                    color,
+                                );
+                            }
+                        } else if seg.kind == SegmentKind::Line
+                            && seg.stroke_width > 0.
+                            && let Some((a, b)) = doc.segment_geom(sid)
+                            && (visible.contains(a) || visible.contains(b))
+                        {
+                            let (ax, ay) = scr(a);
+                            let (bx, by) = scr(b);
+                            list.push(Primitive::Line {
+                                ax,
+                                ay,
+                                bx,
+                                by,
+                                width: seg.stroke_width as f32,
+                                color,
+                            });
                         }
                     }
                 }
@@ -380,16 +460,42 @@ pub fn build_draw_list(
     if let Some(h) = hover
         && !selection.contains(&h)
     {
-        element_outline(doc, h, &scr, accent, &mut list, camera.zoom);
+        element_outline(doc, h, &scr, accent, &mut list, camera.zoom, &mut bezier_cache);
     }
 
     // 5) Selection highlights + point handles drawn after everything —
     // points are the topmost affordance in the entire stack.
     for &sel in selection {
-        element_outline(doc, sel, &scr, accent, &mut list, camera.zoom);
+        element_outline(doc, sel, &scr, accent, &mut list, camera.zoom, &mut bezier_cache);
     }
-    for &sel in selection {
-        for pid in doc.element_points(sel) {
+    // Handle guides sit below the point dots, making the anchor controlled by
+    // every visible handle unambiguous.  The selected-point set also covers
+    // handles selected directly, or indirectly through a selected path.
+    let selected_points: HashSet<_> = selection
+        .iter()
+        .flat_map(|el| doc.element_points(*el))
+        .collect();
+    for (_sid, seg) in doc.all_segments() {
+        if seg.kind != SegmentKind::Bezier {
+            continue;
+        }
+        for (anchor, handle) in [
+            (seg.start, seg.handle_out),
+            (seg.end, seg.handle_in),
+        ] {
+            let Some(handle) = handle else { continue };
+            if !selected_points.contains(&handle) {
+                continue;
+            }
+            let (Some(a), Some(h)) = (doc.point(anchor), doc.point(handle)) else { continue };
+            let (ax, ay) = scr(a);
+            let (hx, hy) = scr(h);
+            list.push(Primitive::Line {
+                ax, ay, bx: hx, by: hy, width: 1., color: accent,
+            });
+        }
+    }
+    for &pid in &selected_points {
             if let Some(p) = doc.point(pid) {
                 let (x, y) = scr(p);
                 list.push(Primitive::Circle {
@@ -398,24 +504,19 @@ pub fn build_draw_list(
                     radius: 4.,
                 });
             }
-        }
     }
     // Arc center handles — show whenever the arc is selected in any way
     // (segment itself, or any of its defining points including the center).
     {
-        let selected_pids: std::collections::HashSet<_> = selection
-            .iter()
-            .flat_map(|el| doc.element_points(*el))
-            .collect();
         for (sid, seg) in doc.all_segments() {
             if seg.kind != SegmentKind::Arc {
                 continue;
             }
             let is_touched = selection.contains(&ElementRef::Segment(sid))
-                || seg.ctrl.is_some_and(|c| selected_pids.contains(&c))
-                || selected_pids.contains(&seg.start)
-                || selected_pids.contains(&seg.end)
-                || seg.center.is_some_and(|c| selected_pids.contains(&c));
+                || seg.ctrl.is_some_and(|c| selected_points.contains(&c))
+                || selected_points.contains(&seg.start)
+                || selected_points.contains(&seg.end)
+                || seg.center.is_some_and(|c| selected_points.contains(&c));
             if !is_touched {
                 continue;
             }
@@ -498,6 +599,68 @@ pub fn build_draw_list(
             width: 1.,
             color: accent,
         });
+    }
+
+    // In-progress pen chain: dots on the live anchors plus the rubber
+    // chord from the active tip to the cursor. The active handle pair and a
+    // low-opacity cubic preview are shown too, so a click-drag exposes both
+    // controls before the segment is committed.
+    if let Some(pen) = pending_pen {
+        let anchors: Vec<Point2> = match pen.path.and_then(|pid| doc.path_anchors(pid)) {
+            Some(anchors) => anchors
+                .iter()
+                .filter_map(|&id| doc.point(id))
+                .collect(),
+            None => doc.point(pen.last).into_iter().collect(),
+        };
+        for m in anchors {
+            if !visible.contains(m) {
+                continue;
+            }
+            let (mx, my) = scr(m);
+            list.push(Primitive::Circle {
+                cx: mx,
+                cy: my,
+                radius: 3.,
+            });
+        }
+        if let Some(tip) = doc.point(pen.last) {
+            let (ax, ay) = scr(tip);
+            let (bx, by) = scr(pen.cursor);
+            let preview_color: gpui::Background = rgba((t.accent << 8) | 0x66).into();
+            let (h0, h1) = pen.last_handles;
+            for handle in [h0, h1] {
+                if let Some(h) = doc.point(handle) {
+                    let (hx, hy) = scr(h);
+                    list.push(Primitive::Line {
+                        ax, ay, bx: hx, by: hy, width: 1., color: accent,
+                    });
+                    list.push(Primitive::Circle {
+                        cx: hx, cy: hy, radius: 3.,
+                    });
+                }
+            }
+            if let Some(h) = doc.point(h0) {
+                let preview = crate::editor::bezier::samples(
+                    tip, h, pen.cursor, pen.cursor,
+                    crate::editor::bezier::adaptive_samples(tip, h, pen.cursor, pen.cursor, camera.zoom),
+                );
+                push_polyline(
+                    &mut list,
+                    &preview.iter().map(|p| scr(*p)).collect::<Vec<_>>(),
+                    1.5,
+                    preview_color,
+                );
+            }
+            list.push(Primitive::Line {
+                ax,
+                ay,
+                bx,
+                by,
+                width: 1.,
+                color: preview_color,
+            });
+        }
     }
 
     // In-progress circle preview, per stage:
@@ -646,6 +809,7 @@ fn element_outline(
     accent: gpui::Background,
     list: &mut Vec<Primitive>,
     zoom: f64,
+    bezier_cache: &mut HashMap<crate::core::ids::SegmentId, Vec<Point2>>,
 ) {
     match el {
         // Points use the SAME styling everywhere: one clean small dot.
@@ -671,6 +835,15 @@ fn element_outline(
                     crate::editor::arc::adaptive_samples(a, b, c, zoom),
                 )
             {
+                let pts: Vec<(f32, f32)> = samples.iter().map(|p| scr(*p)).collect();
+                push_polyline(list, &pts, 2.5, accent);
+            } else if let Some(seg) = doc.segment(sid)
+                && seg.kind == SegmentKind::Bezier
+                && doc.bezier_geom(sid).is_some()
+            {
+                let Some(samples) = cached_bezier_samples(doc, sid, zoom, bezier_cache) else {
+                    return;
+                };
                 let pts: Vec<(f32, f32)> = samples.iter().map(|p| scr(*p)).collect();
                 push_polyline(list, &pts, 2.5, accent);
             } else if let Some((a, b)) = doc.segment_geom(sid) {
@@ -702,7 +875,45 @@ fn element_outline(
                 }
             }
         }
+        ElementRef::Path(pid) => {
+            // Accent-trace every member segment (beziers sampled, the rest
+            // as straight overlays).
+            if let Some(path) = doc.path(pid) {
+                for &sid in &path.segments {
+                    element_outline(doc, ElementRef::Segment(sid), scr, accent, list, zoom, bezier_cache);
+                }
+            }
+        }
     }
+}
+
+fn cached_bezier_samples<'a>(
+    doc: &Document,
+    sid: crate::core::ids::SegmentId,
+    zoom: f64,
+    cache: &'a mut HashMap<crate::core::ids::SegmentId, Vec<Point2>>,
+) -> Option<&'a [Point2]> {
+    if !cache.contains_key(&sid) {
+        let (p0, p1, p2, p3) = doc.bezier_geom(sid)?;
+        let n = crate::editor::bezier::adaptive_samples(p0, p1, p2, p3, zoom);
+        cache.insert(sid, crate::editor::bezier::samples(p0, p1, p2, p3, n));
+    }
+    cache.get(&sid).map(Vec::as_slice)
+}
+
+// The cubic is contained by its four-point control hull.  Rejecting an
+// off-viewport segment before adaptive sampling keeps a large document from
+// paying the maximum 512-sample cost for every invisible path member.
+fn bezier_bounds_intersect(doc: &Document, sid: crate::core::ids::SegmentId, visible: Rect) -> bool {
+    let Some((p0, p1, p2, p3)) = doc.bezier_geom(sid) else { return false };
+    let min_x = p0.x.min(p1.x).min(p2.x).min(p3.x);
+    let max_x = p0.x.max(p1.x).max(p2.x).max(p3.x);
+    let min_y = p0.y.min(p1.y).min(p2.y).min(p3.y);
+    let max_y = p0.y.max(p1.y).max(p2.y).max(p3.y);
+    min_x <= visible.origin.x + visible.size.w
+        && visible.origin.x <= max_x
+        && min_y <= visible.origin.y + visible.size.h
+        && visible.origin.y <= max_y
 }
 
 fn overlaps(a: Rect, b: Rect) -> bool {

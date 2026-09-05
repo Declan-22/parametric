@@ -23,3 +23,4 @@ macro_rules! define_id {
 define_id!(PointId);
 define_id!(SegmentId);
 define_id!(FillId);
+define_id!(PathId);

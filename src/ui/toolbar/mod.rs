@@ -35,6 +35,16 @@ const ICON_PAN: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" 
 
 "#;
 
+const ICON_PEN: &[u8] =
+    br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5">
+		<path d="m9.5 14.5l-7 7m8-7a1 1 0 1 1-2 0a1 1 0 0 1 2 0" />
+		<path d="m18.5 12l-1.762 4.028c-.85 1.944-1.276 2.915-2.076 3.538c-.8.624-1.846.798-3.938 1.147L3 22a1 1 0 0 1-1-1l1.287-7.724c.349-2.092.523-3.138 1.147-3.938c.623-.8 1.594-1.225 3.538-2.076L12 5.5" />
+		<path d="M18.379 11.879L12.12 5.62a2.121 2.121 0 0 1 3-3l6.26 6.26a2.121 2.121 0 0 1-3 3" />
+	</g>
+</svg>"#;
+
 const ICON_LINE: &[u8] =
     br#"<svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
     <g clip-path="url(#clip0_3_14)">
@@ -145,6 +155,7 @@ impl RenderOnce for Toolbar {
             .child(self.tool_button(Tool::Dimension, ICON_DIMENSION, active_tool, t, cx))
             .child(self.tool_button(Tool::Ruler, ICON_RULER, active_tool, t, cx))
             .child(divider(t))
+            .child(self.tool_button(Tool::Pen, ICON_PEN, active_tool, t, cx))
             .child(self.tool_button(Tool::Line, ICON_LINE, active_tool, t, cx))
             .child(self.tool_button(Tool::Rectangle, ICON_RECTANGLE, active_tool, t, cx))
             .child(self.tool_button(Tool::Circle, ICON_CIRCLE, active_tool, t, cx))
@@ -282,6 +293,7 @@ fn tool_debug_name(tool: Tool) -> &'static str {
     match tool {
         Tool::Move => "tool-move",
         Tool::Pan => "tool-pan",
+        Tool::Pen => "tool-pen",
         Tool::Line => "tool-line",
         Tool::Rectangle => "tool-rectangle",
         Tool::Circle => "tool-circle",
@@ -299,6 +311,7 @@ fn tool_tooltip(tool: Tool) -> (&'static str, &'static str) {
         Tool::Move => ("Move", "V"),
         Tool::Pan => ("Pan", "Space"),
         Tool::Ruler => ("Ruler", "M"),
+        Tool::Pen => ("Pen", "P"),
         Tool::Line => ("Line", "L"),
         Tool::Rectangle => ("Rectangle", "R"),
         Tool::Circle => ("Arc", "A"),

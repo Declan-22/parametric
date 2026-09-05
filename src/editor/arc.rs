@@ -8,7 +8,17 @@ use crate::core::ids::SegmentId;
 /// Circumcenter and radius of the circle through a, b, c.
 pub fn circumcircle(a: Point2, b: Point2, c: Point2) -> Option<(Point2, f64)> {
     let d = 2. * (a.x * (b.y - c.y) + b.x * (c.y - a.y) + c.x * (a.y - b.y));
-    if d.abs() < 1e-9 {
+    // Scale the degeneracy threshold with the triangle coordinates. A fixed
+    // epsilon incorrectly treats large, valid arcs as collinear and permits
+    // tiny near-collinear arcs to produce enormous unstable circles.
+    let scale = [
+        (a.x - b.x).abs(), (a.y - b.y).abs(),
+        (b.x - c.x).abs(), (b.y - c.y).abs(),
+        (c.x - a.x).abs(), (c.y - a.y).abs(),
+    ]
+    .into_iter()
+    .fold(1.0f64, f64::max);
+    if d.abs() < 1e-12 * scale * scale {
         return None;
     }
     let a2 = a.x * a.x + a.y * a.y;
@@ -254,4 +264,44 @@ pub fn segment_samples(doc: &Document, sid: SegmentId, n: usize) -> Option<Vec<P
     let b = doc.point(seg.end)?;
     let c = doc.point(seg.ctrl?)?;
     Some(samples_through(a, b, c, n))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{circumcircle, samples_through};
+    use crate::core::geometry::Point2;
+
+    #[test]
+    fn circumcircle_fits_right_triangle() {
+        let circle = circumcircle(
+            Point2::new(0., 0.),
+            Point2::new(2., 0.),
+            Point2::new(0., 2.),
+        )
+        .expect("non-collinear points have a circumcircle");
+        assert!((circle.0.x - 1.).abs() < 1e-9);
+        assert!((circle.0.y - 1.).abs() < 1e-9);
+        assert!((circle.1 - 2f64.sqrt()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn collinear_arc_has_no_circle() {
+        assert!(circumcircle(
+            Point2::new(0., 0.),
+            Point2::new(1., 0.),
+            Point2::new(2., 0.),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn degenerate_arc_falls_back_to_chord() {
+        let samples = samples_through(
+            Point2::new(0., 0.),
+            Point2::new(2., 0.),
+            Point2::new(1., 0.),
+            8,
+        );
+        assert_eq!(samples, vec![Point2::new(0., 0.), Point2::new(1., 0.), Point2::new(2., 0.)]);
+    }
 }

@@ -1787,8 +1787,12 @@ impl Editor {
                 }
                 continue;
             }
-            // Free center: follow the geometry.
-            self.doc.move_point(center_id, old_o);
+            // Free center: follow the geometry. The defining points may have
+            // moved during the solve, so the old circumcenter is stale and
+            // would leave the center handle detached from the visible arc.
+            if let Some((new_o, _)) = crate::editor::arc::circumcircle(a, b, c) {
+                self.doc.move_point(center_id, new_o);
+            }
         }
     }
 

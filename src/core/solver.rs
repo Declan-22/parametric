@@ -1081,7 +1081,6 @@ impl Solver {
 
             jtj.fill(0.0);
             jtr.fill(0.0);
-            self.residuals_into(&x, &mut residuals);
             for r in &residuals {
                 let w = r.weight;
                 // JᵀJ is symmetric. Assemble each gradient pair once and
@@ -1125,6 +1124,10 @@ impl Solver {
             if new_cost < cost {
                 x.copy_from_slice(&trial);
                 cost = new_cost;
+                // The trial residuals describe the new current iterate. Keep
+                // them and recycle the old current buffer for the next trial
+                // instead of evaluating the same state again next iteration.
+                std::mem::swap(&mut residuals, &mut trial_residuals);
                 lambda = (lambda * 0.5).max(1e-9);
             } else {
                 lambda *= 4.0;

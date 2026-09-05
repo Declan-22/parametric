@@ -990,7 +990,10 @@ impl Editor {
         // Dimension placement preview follows the cursor — every move is a
         // repaint, no exceptions. Without this the preview only updated
         // when some other event happened to trigger a frame (the lag).
-        if self.tool == Tool::Dimension && self.dim_input.is_none() {
+        if self.tool == Tool::Dimension
+            && self.dim_input.is_none()
+            && self.dim_drag.is_none()
+        {
             return true;
         }
         // Dragging a placed dimension's container repositions it.

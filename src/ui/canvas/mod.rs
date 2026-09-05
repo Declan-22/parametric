@@ -106,6 +106,9 @@ impl RenderOnce for CanvasView {
                 let shift = e.modifiers.shift;
                 let _ = editor_move.update(cx, |ed, cx| {
                     ed.alt_down = e.modifiers.alt;
+                    let dimension_preview = ed.tool == Tool::Dimension
+                        && ed.dim_input.is_none()
+                        && ed.dim_drag.is_none();
                     let mut changed = false;
                     // While idle, track which resize handle is under the
                     // cursor (used for cursor styling).
@@ -116,7 +119,7 @@ impl RenderOnce for CanvasView {
                     // Dimension geometry depends on hover/drag state and
                     // document geometry, not on every raw cursor event.
                     // Recompute only after one of those inputs changed.
-                    if changed {
+                    if changed && !dimension_preview {
                         ed.update_dim_geom();
                     }
                     // Arc center reveal follows the raw cursor even when

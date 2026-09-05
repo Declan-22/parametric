@@ -661,8 +661,9 @@ impl Solver {
 
     /// Evaluates all weighted residuals (geometric + soft anchors).
     /// Variables are SCALARS: free slot v owns variables (2v, 2v+1).
-    fn residuals(&self, x: &[Point2]) -> Vec<Residual> {
-        let mut out = Vec::with_capacity(self.active_eqs.len() * 2 + self.n_free * 2);
+    fn residuals_into(&self, x: &[Point2], out: &mut Vec<Residual>) {
+        out.clear();
+        out.reserve(self.active_eqs.len() * 2 + self.n_free * 2);
         for eq in &self.active_eqs {
             match *eq {
                 Eq::Horizontal { a, b } => {
@@ -1030,7 +1031,6 @@ impl Solver {
                 });
             }
         }
-        out
     }
 
     fn cost(residuals: &[Residual]) -> f64 {
@@ -1058,7 +1058,11 @@ impl Solver {
 
         let mut lambda = LAMBDA_INIT;
         let mut status = SolveStatus::MaxIterations;
-        let init_cost = Self::cost(&self.residuals(&x));
+        let residual_capacity = self.active_eqs.len() * 2 + self.n_free * 2;
+        let mut residuals = Vec::with_capacity(residual_capacity);
+        let mut trial_residuals = Vec::with_capacity(residual_capacity);
+        self.residuals_into(&x, &mut residuals);
+        let init_cost = Self::cost(&residuals);
         let mut cost = init_cost;
         // Reuse the normal-equation and trial buffers across LM iterations.
         // These are hot-path scratch values, not solver state: keeping them
@@ -1077,7 +1081,8 @@ impl Solver {
 
             jtj.fill(0.0);
             jtr.fill(0.0);
-            for r in &self.residuals(&x) {
+            self.residuals_into(&x, &mut residuals);
+            for r in &residuals {
                 let w = r.weight;
                 for &(vi, gi) in &r.grad {
                     for &(vj, gj) in &r.grad {
@@ -1105,7 +1110,8 @@ impl Solver {
                 )
                 .clamped();
             }
-            let new_cost = Self::cost(&self.residuals(&trial));
+            self.residuals_into(&trial, &mut trial_residuals);
+            let new_cost = Self::cost(&trial_residuals);
             if new_cost < cost {
                 x.copy_from_slice(&trial);
                 cost = new_cost;

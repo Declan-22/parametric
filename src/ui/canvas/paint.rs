@@ -9,6 +9,51 @@ use crate::editor::ruler;
 use crate::editor::{Camera, SnapGuide};
 use crate::theme::Theme;
 
+#[derive(Default)]
+pub struct RenderCache {
+    arcs: HashMap<crate::core::ids::SegmentId, (u64, Vec<Point2>)>,
+}
+
+impl RenderCache {
+    fn clear_if_oversized(&mut self) {
+        if self.arcs.len() >= 4096 {
+            self.arcs.clear();
+        }
+    }
+
+    fn arc_samples(
+        &mut self,
+        doc: &Document,
+        sid: crate::core::ids::SegmentId,
+        zoom: f64,
+    ) -> Option<&Vec<Point2>> {
+        let seg = doc.segment(sid)?;
+        let ctrl = seg.ctrl?;
+        let (a, b, c) = (doc.point(seg.start)?, doc.point(seg.end)?, doc.point(ctrl)?);
+        let fingerprint = [
+            zoom.to_bits(),
+            a.x.to_bits(), a.y.to_bits(),
+            b.x.to_bits(), b.y.to_bits(),
+            c.x.to_bits(), c.y.to_bits(),
+        ]
+        .iter()
+        .fold(0xcbf29ce484222325, |hash, bits| {
+            (hash ^ bits).wrapping_mul(0x100000001b3)
+        });
+        let needs_refresh = self
+            .arcs
+            .get(&sid)
+            .is_none_or(|(old_fingerprint, _)| *old_fingerprint != fingerprint);
+        if needs_refresh {
+            let n = crate::editor::arc::adaptive_samples(a, b, c, zoom);
+            let samples = crate::editor::arc::segment_samples(doc, sid, n)?;
+            self.clear_if_oversized();
+            self.arcs.insert(sid, (fingerprint, samples));
+        }
+        self.arcs.get(&sid).map(|(_, samples)| samples)
+    }
+}
+
 // Screen-space draw list built during prepaint (culled to the viewport),
 // consumed by the paint callback. Coordinates are plain f32 canvas-local
 // pixels; the paint callback converts to gpui types.
@@ -79,6 +124,7 @@ pub fn build_draw_list(
     show_grid: bool,
     tool: crate::editor::Tool,
     cursor_doc: Option<Point2>,
+    cache: Option<&mut RenderCache>,
 ) -> Vec<Primitive> {
     let min = camera.screen_to_unit(Point2::new(0., 0.));
     let max = camera.screen_to_unit(Point2::new(
@@ -90,11 +136,13 @@ pub fn build_draw_list(
     // Default fill: neutral gray, fully opaque.
     let color: gpui::Background = rgb(0x808080).into();
     let accent: gpui::Background = rgb(t.accent).into();
-    let mut list = Vec::new();
-    // Arc tessellation is reused by the base pass and selection overlays.
-    // Keep it frame-local for now; the next step can promote this to a
-    // revision-keyed cache owned by the editor.
-    let mut arc_cache: HashMap<crate::core::ids::SegmentId, Vec<Point2>> = HashMap::new();
+    let element_count: usize = doc.layers.iter().map(|layer| layer.elements.len()).sum();
+    let mut list = Vec::with_capacity(element_count.saturating_mul(2).saturating_add(64));
+    let mut owned_cache = RenderCache::default();
+    let cache: &mut RenderCache = match cache {
+        Some(cache) => cache,
+        None => &mut owned_cache,
+    };
 
     // 0) Infinite grid — viewport-culled, LOD-clamped, pan-aware. This is the
     // "genius" part: cost is O(viewport) not O(world). We never allocate
@@ -184,10 +232,21 @@ pub fn build_draw_list(
                         else {
                             continue;
                         };
+                        // The circumcircle bounds are a conservative cheap
+                        // rejection test. It may keep some offscreen arcs,
+                        // but never removes a visible one, and avoids
+                        // tessellating distant geometry.
+                        if let Some((center, radius)) =
+                            crate::editor::arc::circumcircle(sa, sb, scp)
+                            && (center.x + radius < visible.origin.x
+                                || center.x - radius > visible.origin.x + visible.size.w
+                                || center.y + radius < visible.origin.y
+                                || center.y - radius > visible.origin.y + visible.size.h)
+                        {
+                            continue;
+                        }
                         let n = crate::editor::arc::adaptive_samples(sa, sb, scp, camera.zoom);
-                        let Some(samples) = cached_arc_samples(
-                            doc, sid, camera.zoom, &mut arc_cache,
-                        ) else {
+                        let Some(samples) = cache.arc_samples(doc, sid, camera.zoom) else {
                             continue;
                         };
                         if samples.iter().any(|p| visible.contains(*p)) {
@@ -387,13 +446,13 @@ pub fn build_draw_list(
     if let Some(h) = hover
         && !selection.contains(&h)
     {
-        element_outline(doc, h, &scr, accent, &mut list, camera.zoom, &mut arc_cache);
+        element_outline(doc, h, &scr, accent, &mut list, camera.zoom, cache);
     }
 
     // 5) Selection highlights + point handles drawn after everything —
     // points are the topmost affordance in the entire stack.
     for &sel in selection {
-        element_outline(doc, sel, &scr, accent, &mut list, camera.zoom, &mut arc_cache);
+        element_outline(doc, sel, &scr, accent, &mut list, camera.zoom, cache);
     }
     for &sel in selection {
         for pid in doc.element_points(sel) {
@@ -653,7 +712,7 @@ fn element_outline(
     accent: gpui::Background,
     list: &mut Vec<Primitive>,
     zoom: f64,
-    arc_cache: &mut HashMap<crate::core::ids::SegmentId, Vec<Point2>>,
+    cache: &mut RenderCache,
 ) {
     match el {
         // Points use the SAME styling everywhere: one clean small dot.
@@ -670,7 +729,7 @@ fn element_outline(
         ElementRef::Segment(sid) => {
             if let Some(seg) = doc.segment(sid)
                 && seg.kind == SegmentKind::Arc
-                && let Some(samples) = cached_arc_samples(doc, sid, zoom, arc_cache)
+                && let Some(samples) = cache.arc_samples(doc, sid, zoom)
             {
                 let pts: Vec<(f32, f32)> = samples.iter().map(|p| scr(*p)).collect();
                 push_polyline(list, &pts, 2.5, accent);
@@ -902,22 +961,6 @@ fn push_grid(
             major_color,
         );
     }
-}
-
-fn cached_arc_samples<'a>(
-    doc: &Document,
-    sid: crate::core::ids::SegmentId,
-    zoom: f64,
-    cache: &'a mut HashMap<crate::core::ids::SegmentId, Vec<Point2>>,
-) -> Option<&'a Vec<Point2>> {
-    if !cache.contains_key(&sid) {
-        let seg = doc.segment(sid)?;
-        let ctrl = seg.ctrl?;
-        let (a, b, c) = (doc.point(seg.start)?, doc.point(seg.end)?, doc.point(ctrl)?);
-        let n = crate::editor::arc::adaptive_samples(a, b, c, zoom);
-        cache.insert(sid, crate::editor::arc::segment_samples(doc, sid, n)?);
-    }
-    cache.get(&sid)
 }
 
 // Dashed straight line between two screen points, any angle.

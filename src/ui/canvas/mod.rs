@@ -591,6 +591,7 @@ impl CanvasView {
                 ed.show_grid,
                 ed.tool,
                 cursor_doc,
+                Some(&mut *ed.render_cache.borrow_mut()),
             );
             (list, hitbox)
         };

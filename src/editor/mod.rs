@@ -8,6 +8,8 @@ pub mod ruler;
 mod snapping;
 mod tools;
 
+use std::cell::RefCell;
+
 pub use camera::Camera;
 
 pub use snapping::SnapGuide;
@@ -60,6 +62,10 @@ struct ArcKin {
 
 pub struct Editor {
     pub doc: Document,
+    // Persistent tessellation cache used by the canvas paint pass. Interior
+    // mutability keeps rendering read-only with respect to editor state while
+    // allowing unchanged geometry to skip resampling.
+    pub(crate) render_cache: RefCell<crate::ui::canvas::paint::RenderCache>,
     pub camera: Camera,
     pub tool: Tool,
     pub pending_shape: Option<PendingShape>,
@@ -193,6 +199,7 @@ impl Editor {
         let next_layer_id = doc.layers.iter().map(|l| l.id + 1).max().unwrap_or(1);
         Self {
             doc,
+            render_cache: RefCell::new(Default::default()),
             camera: Camera::new(),
             tool: Tool::Move,
             pending_shape: None,

@@ -188,6 +188,7 @@ impl Editor {
                         "horizontal" => ConstraintKind::Horizontal,
                         "vertical" => ConstraintKind::Vertical,
                         "tangent" => ConstraintKind::Tangent,
+                        "perpendicular" => ConstraintKind::Perpendicular,
                         _ => continue,
                     };
                     if let (Ok(a), Ok(b)) = (f[1].parse::<usize>(), f[2].parse::<usize>()) {

@@ -480,6 +480,7 @@ impl Database {
                 "vertical" => ConstraintKind::Vertical,
                 "tangent" => ConstraintKind::Tangent,
                 "parallel" => ConstraintKind::Parallel,
+                "perpendicular" => ConstraintKind::Perpendicular,
                 _ => continue,
             };
             let segments = match (

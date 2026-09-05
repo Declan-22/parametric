@@ -228,6 +228,7 @@ pub(crate) const ICON_CHIP_TANGENT: &[u8] = br#"<svg width="12" height="12" view
 </defs>
 </svg>"#;
 pub(crate) const ICON_CHIP_PARALLEL: &[u8] = br#"<svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M3.20312 6.72656L6.79688 3.13281M5.27344 8.79688L8.86719 5.20312" stroke="black" stroke-width="0.75" stroke-linecap="round"/><circle cx="2.29" cy="7.64" r="1.04" stroke="black" stroke-width="0.75"/><circle cx="7.64" cy="2.29" r="1.04" stroke="black" stroke-width="0.75"/><circle cx="4.36" cy="9.71" r="1.04" stroke="black" stroke-width="0.75"/><circle cx="9.71" cy="4.36" r="1.04" stroke="black" stroke-width="0.75"/></svg>"#;
+pub(crate) const ICON_CHIP_PERPENDICULAR: &[u8] = br#"<svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M.44 10.02h4.47M7.14 10.02h4.42M6.01 2.69v6.08" stroke="black" stroke-width=".75"/><circle cx="6.01" cy="1.7" r=".99" fill="black"/><circle cx="6.01" cy="9.96" r=".99" fill="black"/></svg>"#;
 
 impl CanvasView {
     // Dimension labels painted directly into the canvas pass — same
@@ -452,6 +453,7 @@ impl CanvasView {
                     ConstraintKind::Vertical => ICON_CHIP_VERTICAL,
                     ConstraintKind::Tangent => ICON_CHIP_TANGENT,
                     ConstraintKind::Parallel => ICON_CHIP_PARALLEL,
+                    ConstraintKind::Perpendicular => ICON_CHIP_PERPENDICULAR,
                 };
                 let border = if m.clicked { t.accent_border } else { t.accent };
                 let bg = if m.emphasized { t.accent } else { t.bg_primary };
@@ -466,10 +468,10 @@ impl CanvasView {
                     .absolute()
                     .left(px(m.cx_out - S / 2.))
                     .top(px(m.cy_out - S / 2.))
-                    .w(px(S as f32 + 2.0))
-                    .h(px(S as f32 + 2.0))
+                    .w(px(S as f32 + 4.0))
+                    .h(px(S as f32 + 4.0))
                     .rounded(px(6.))
-                    .border(px(1.5))
+                    .border(px(2.))
                     .border_color(rgb(border))
                     .bg(rgb(bg))
                     .flex()

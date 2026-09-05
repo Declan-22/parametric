@@ -7,6 +7,7 @@ use crate::theme::Theme;
 
 const ICON_CONSTRAINT_HV: &[u8] = br#"<svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg"><g clip-path="url(#clip0_10_2)"><path d="M3.12729 0.858231V7.82697M1.75229 0.858231V8.92073M1.75229 2.92073L0.810216 1.97866M1.75229 5.37385L1.28125 4.90281L0.810211 4.43178M1.75229 7.82697L0.810216 6.8849M3.12729 10.1997H5.18979M10.096 10.1997H7.64291L5.18979 10.1997M5.18979 10.1997L4.24772 11.1418M7.64291 10.1997L7.17187 10.6707L6.70083 11.1418M10.096 10.1997H11.1898M10.096 10.1997L9.15396 11.1418M11.1898 8.9474H3.95312" stroke="black" stroke-width="0.75" stroke-linecap="round"/></g><defs><clipPath id="clip0_10_2"><rect width="12" height="12" fill="white"/></clipPath></defs></svg>"#;
 const ICON_CONSTRAINT_PARALLEL: &[u8] = br#"<svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M3.20312 6.72656L6.79688 3.13281M5.27344 8.79688L8.86719 5.20312" stroke="black" stroke-width="0.75" stroke-linecap="round"/><circle cx="2.29" cy="7.64" r="1.04" stroke="black" stroke-width="0.75"/><circle cx="7.64" cy="2.29" r="1.04" stroke="black" stroke-width="0.75"/><circle cx="4.36" cy="9.71" r="1.04" stroke="black" stroke-width="0.75"/><circle cx="9.71" cy="4.36" r="1.04" stroke="black" stroke-width="0.75"/></svg>"#;
+const ICON_CONSTRAINT_PERPENDICULAR: &[u8] = br#"<svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M.44 10.02h4.47M7.14 10.02h4.42M6.01 2.69v6.08" stroke="black" stroke-width=".75"/><circle cx="6.01" cy="1.7" r=".99" fill="black"/><circle cx="6.01" cy="9.96" r=".99" fill="black"/></svg>"#;
 
 // Bottom toolbar: one centered row â€” mode tools (Move / Pan), a divider,
 // then shape tools (Rectangle).
@@ -153,6 +154,7 @@ impl RenderOnce for Toolbar {
             .child(self.tool_button(Tool::ConstraintTangent, crate::ui::canvas::ICON_CHIP_TANGENT, active_tool, t, cx))
             .child(self.tool_button(Tool::ConstraintCoincident, crate::ui::canvas::ICON_CHIP_COINCIDENT, active_tool, t, cx))
             .child(self.tool_button(Tool::ConstraintParallel, ICON_CONSTRAINT_PARALLEL, active_tool, t, cx))
+            .child(self.tool_button(Tool::ConstraintPerpendicular, ICON_CONSTRAINT_PERPENDICULAR, active_tool, t, cx))
     }
 }
 
@@ -291,6 +293,7 @@ fn tool_debug_name(tool: Tool) -> &'static str {
         Tool::ConstraintTangent => "tool-constraint-tangent",
         Tool::ConstraintCoincident => "tool-constraint-coincident",
         Tool::ConstraintParallel => "tool-constraint-parallel",
+        Tool::ConstraintPerpendicular => "tool-constraint-perpendicular",
     }
 }
 
@@ -307,5 +310,6 @@ fn tool_tooltip(tool: Tool) -> (&'static str, &'static str) {
         Tool::ConstraintTangent => ("Tangent constraint", ""),
         Tool::ConstraintCoincident => ("Coincident constraint", ""),
         Tool::ConstraintParallel => ("Parallel constraint", ""),
+        Tool::ConstraintPerpendicular => ("Perpendicular constraint", ""),
     }
 }

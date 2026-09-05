@@ -22,6 +22,8 @@ pub enum ConstraintKind {
     Tangent,
     // Two straight line segments have parallel directions.
     Parallel,
+    // Two straight line segments meet at a right angle.
+    Perpendicular,
 }
 
 impl ConstraintKind {
@@ -32,6 +34,7 @@ impl ConstraintKind {
             ConstraintKind::Vertical => "vertical",
             ConstraintKind::Tangent => "tangent",
             ConstraintKind::Parallel => "parallel",
+            ConstraintKind::Perpendicular => "perpendicular",
         }
     }
 }

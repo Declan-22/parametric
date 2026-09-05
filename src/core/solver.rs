@@ -44,11 +44,23 @@ impl Solution {
             && self.max_lin_residual.is_finite()
             && self.max_angle_residual.is_finite()
     }
+
+    /// Weighted least-squares is only the numerical search method.  It is
+    /// never permission to write a partially satisfied constraint system.
+    pub fn constraints_satisfied(&self) -> bool {
+        self.is_valid()
+            && self.max_lin_residual <= 1e-3
+            && self.max_angle_residual <= 1e-5
+    }
 }
 
 const ANCHOR_WEIGHT: f64 = 1.0;
-const DIM_WEIGHT: f64 = 1e6;
-const EQ_WEIGHT: f64 = 1e6;
+// Constraints are numerically hard.  The drag target and anchors remain
+// soft preferences; their lower weight lets the solver project an arbitrary
+// cursor position onto the valid constraint manifold instead of relaxing the
+// model to chase the cursor.
+const DIM_WEIGHT: f64 = 1e9;
+const EQ_WEIGHT: f64 = 1e9;
 const DRAG_WEIGHT: f64 = 1e3;
 // Implicit arc followers, per role (see build): left-behind endpoints stay
 // (stretch pivots), the center is middle ground, and the bend follows an
@@ -101,6 +113,7 @@ enum Eq {
     Tangent { l1: usize, l2: usize, o: usize, p: usize },
     CirclePoint { p: usize, o: usize, radius: f64 },
     Parallel { a1: usize, a2: usize, b1: usize, b2: usize },
+    Perpendicular { a1: usize, a2: usize, b1: usize, b2: usize },
 }
 
 // A residual evaluated at one iterate: value plus sparse gradient over
@@ -218,6 +231,13 @@ impl Solver {
                     let (Some(a1), Some(a2), Some(b1), Some(b2)) = (
                         slot_of(a_seg.start), slot_of(a_seg.end), slot_of(b_seg.start), slot_of(b_seg.end)) else { continue };
                     eqs.push(Eq::Parallel { a1, a2, b1, b2 });
+                }
+                ConstraintKind::Perpendicular => {
+                    let Some((first, second)) = c.tangent_segments else { continue };
+                    let (Some(a_seg), Some(b_seg)) = (doc.segment(first), doc.segment(second)) else { continue };
+                    let (Some(a1), Some(a2), Some(b1), Some(b2)) = (
+                        slot_of(a_seg.start), slot_of(a_seg.end), slot_of(b_seg.start), slot_of(b_seg.end)) else { continue };
+                    eqs.push(Eq::Perpendicular { a1, a2, b1, b2 });
                 }
             }
         }
@@ -612,7 +632,8 @@ impl Solver {
                     Eq::PointLineDist { p, l1, l2, .. } => [p, l1, l2, usize::MAX],
                     Eq::LineDist { a1, a2, b1, .. } => [a1, a2, b1, usize::MAX],
                     Eq::Angle { a1, a2, b1, b2, .. }
-                    | Eq::Parallel { a1, a2, b1, b2 } => [a1, a2, b1, b2],
+                    | Eq::Parallel { a1, a2, b1, b2 }
+                    | Eq::Perpendicular { a1, a2, b1, b2 } => [a1, a2, b1, b2],
                     Eq::ArcRadius { s, e, c, .. }
                     | Eq::ArcBend { s, e, c } => [s, e, c, usize::MAX],
                     Eq::EqualRadius { o, a, b } => [o, a, b, usize::MAX],
@@ -739,7 +760,8 @@ impl Solver {
             Eq::ArcBend { s, e, c } => [s, e, c, usize::MAX],
             Eq::Tangent { l1, l2, o, p } => [l1, l2, o, p],
             Eq::CirclePoint { p, o, .. } => [p, o, usize::MAX, usize::MAX],
-            Eq::Parallel { a1, a2, b1, b2 } => [a1, a2, b1, b2],
+            Eq::Parallel { a1, a2, b1, b2 }
+            | Eq::Perpendicular { a1, a2, b1, b2 } => [a1, a2, b1, b2],
         };
         slots
             .iter()
@@ -1044,6 +1066,27 @@ impl Solver {
                     if let Some(i) = self.free_of[b2] { grad.push((i * 2, dvx)); grad.push((i * 2 + 1, dvy)); }
                     out.push(Residual { value, grad, weight: EQ_WEIGHT });
                 }
+                Eq::Perpendicular { a1, a2, b1, b2 } => {
+                    // Normalized dot product: zero exactly when the two
+                    // directions are perpendicular, independent of scale.
+                    let (a, b, c, d) = (self.pos(a1, x), self.pos(a2, x), self.pos(b1, x), self.pos(b2, x));
+                    let ux = b.x - a.x; let uy = b.y - a.y;
+                    let vx = d.x - c.x; let vy = d.y - c.y;
+                    let lu = (ux * ux + uy * uy).sqrt().max(1e-9);
+                    let lv = (vx * vx + vy * vy).sqrt().max(1e-9);
+                    let m = ((lu + lv) / 2.).max(1e-9);
+                    let dot = ux * vx + uy * vy;
+                    let dux = vx / m - dot * ux / (2. * lu * m * m);
+                    let duy = vy / m - dot * uy / (2. * lu * m * m);
+                    let dvx = ux / m - dot * vx / (2. * lv * m * m);
+                    let dvy = uy / m - dot * vy / (2. * lv * m * m);
+                    let mut grad = Vec::new();
+                    if let Some(i) = self.free_of[a1] { grad.push((i * 2, -dux)); grad.push((i * 2 + 1, -duy)); }
+                    if let Some(i) = self.free_of[a2] { grad.push((i * 2, dux)); grad.push((i * 2 + 1, duy)); }
+                    if let Some(i) = self.free_of[b1] { grad.push((i * 2, -dvx)); grad.push((i * 2 + 1, -dvy)); }
+                    if let Some(i) = self.free_of[b2] { grad.push((i * 2, dvx)); grad.push((i * 2 + 1, dvy)); }
+                    out.push(Residual { value: dot / m, grad, weight: EQ_WEIGHT });
+                }
                 Eq::ArcRadius { s, e, c, target } => {
                     let (ps, pe, pc) = (self.pos(s, x), self.pos(e, x), self.pos(c, x));
                     // Chord geometry: half-length m, bend height h (signed
@@ -1122,6 +1165,40 @@ impl Solver {
 
     fn cost(residuals: &[Residual]) -> f64 {
         residuals.iter().map(|r| r.weight * r.value * r.value).sum()
+    }
+
+    /// Projects an iterate onto the active constraint manifold.  This is a
+    /// sequential Gauss--Seidel projection over the sparse Jacobian rows:
+    /// each row removes its own residual along the shortest available
+    /// coordinate-space correction.  It is deliberately independent of the
+    /// equation variant, so adding a future constraint only requires a
+    /// residual and gradient; it does not require another solver branch.
+    fn project_hard_constraints(&self, x: &mut [Point2], residuals: &[Residual]) -> f64 {
+        let mut max_residual = 0.0f64;
+        for residual in residuals {
+            if residual.weight < EQ_WEIGHT || residual.grad.is_empty() || !residual.value.is_finite() {
+                continue;
+            }
+            let norm = residual.grad.iter().map(|(_, gradient)| gradient * gradient).sum::<f64>();
+            if !norm.is_finite() || norm < 1e-18 {
+                continue;
+            }
+            let correction = (-residual.value / norm) * 0.9;
+            for &(scalar, gradient) in &residual.grad {
+                let point = scalar / 2;
+                if point >= x.len() {
+                    continue;
+                }
+                let delta = correction * gradient;
+                if scalar & 1 == 0 {
+                    x[point].x += delta;
+                } else {
+                    x[point].y += delta;
+                }
+            }
+            max_residual = max_residual.max(residual.value.abs());
+        }
+        max_residual
     }
 
     /// Runs LM from current geometry. Returns new positions for all slots
@@ -1237,6 +1314,17 @@ impl Solver {
                     p.y + d[1].clamp(-STEP_CAP, STEP_CAP),
                 )
                 .clamped();
+            }
+            // First-order LM steps are useful for choosing the nearby branch,
+            // but they are not allowed to relax a geometric constraint. Run
+            // a bounded sparse projection on the candidate before comparing
+            // it with the current state. This keeps cursor/anchor objectives
+            // soft while the model itself remains exact.
+            for _ in 0..8 {
+                self.residuals_into(&trial, &mut trial_residuals);
+                if self.project_hard_constraints(&mut trial, &trial_residuals) <= 1e-8 {
+                    break;
+                }
             }
             self.residuals_into(&trial, &mut trial_residuals);
             let new_cost = Self::cost(&trial_residuals);
@@ -1365,6 +1453,17 @@ impl Solver {
                     let m = ((lv + lr) / 2.).max(1e-9);
                     let v = (vx * rx + vy * ry).abs() / m;
                     lin = lin.max(v);
+                    continue;
+                }
+                Eq::Perpendicular { a1, a2, b1, b2 } => {
+                    let (a, b, c, d) = (self.pos(a1, x), self.pos(a2, x), self.pos(b1, x), self.pos(b2, x));
+                    let ux = b.x - a.x;
+                    let uy = b.y - a.y;
+                    let vx = d.x - c.x;
+                    let vy = d.y - c.y;
+                    let lu = (ux * ux + uy * uy).sqrt().max(1e-9);
+                    let lv = (vx * vx + vy * vy).sqrt().max(1e-9);
+                    lin = lin.max(((ux * vx + uy * vy) / ((lu + lv) / 2.).max(1e-9)).abs());
                     continue;
                 }
                 Eq::CirclePoint { p, o, radius } => {
@@ -1733,6 +1832,21 @@ mod tests {
         assert!(solution.positions.iter().all(|(_, p)| p.x.is_finite() && p.y.is_finite()));
         assert!(solution.max_lin_residual <= 0.5);
         assert!(solution.max_angle_residual <= 0.02);
+    }
+
+    #[test]
+    fn dragged_dimensioned_edge_projects_without_breaking_dimension() {
+        let mut doc = Document::new();
+        let a = doc.add_point(Point2::new(0., 0.));
+        let b = doc.add_point(Point2::new(100., 0.));
+        let segment = doc.add_segment(a, b);
+        doc.add_dimension(Dimension {
+            target: DimTarget::Points { a, b, mode: crate::core::constraints::DimMode::Aligned },
+            value: 100., offset: 20., slide: 0.5, sweep: 0.,
+        });
+        let solution = Solver::build(&doc, &[(b, Point2::new(140., 35.))], &[]).solve();
+        assert!(solution.constraints_satisfied());
+        let _ = segment;
     }
 
     fn eighty() -> usize { 80 }

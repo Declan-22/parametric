@@ -479,6 +479,20 @@ impl Document {
         }
     }
 
+    pub fn add_perpendicular_constraint(&mut self, first: SegmentId, second: SegmentId) {
+        let (Some(a), Some(b)) = (self.segment(first), self.segment(second)) else { return };
+        let c = Constraint {
+            kind: ConstraintKind::Perpendicular,
+            a: a.start,
+            b: b.start,
+            tangent_segments: Some((first, second)),
+            point_on_segment: None,
+        };
+        if !self.constraints.contains(&c) {
+            self.constraints.push(c);
+        }
+    }
+
     /// Constrains `point` to a new/selected point that lies on `segment`.
     /// Keeping the edge point as a real point makes the relationship
     /// persistent and lets the solver preserve it when either object moves.

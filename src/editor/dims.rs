@@ -743,7 +743,29 @@ fn update_constraint_markers(ed: &mut Editor) {
         };
         let has_own_edge = ed.doc.all_segments().any(|(_, s)| is_edge_pair(s));
         let mid = (((ma.x + mb.x) / 2.) as f32, ((ma.y + mb.y) / 2.) as f32);
-        let (cx, cy) = if c.kind == crate::core::constraints::ConstraintKind::Parallel
+        let pair_junction = c.tangent_segments.and_then(|(first, second)| {
+            let first = ed.doc.segment(first)?;
+            let second = ed.doc.segment(second)?;
+            let candidates = [
+                (first.start, second.start), (first.start, second.end),
+                (first.end, second.start), (first.end, second.end),
+            ];
+            candidates.into_iter().find_map(|(left, right)| {
+                if left == right {
+                    return ed.doc.point(left);
+                }
+                let (a, b) = (ed.doc.point(left)?, ed.doc.point(right)?);
+                (pick::distance(a, b) <= ed.snap_tol_doc()).then_some(Point2::new(
+                    (a.x + b.x) / 2., (a.y + b.y) / 2.,
+                ))
+            })
+        });
+        let (cx, cy) = if matches!(c.kind, crate::core::constraints::ConstraintKind::Parallel | crate::core::constraints::ConstraintKind::Perpendicular)
+            && let Some(junction) = pair_junction
+        {
+            let p = ed.camera.unit_to_screen(junction);
+            (p.x as f32, p.y as f32 - HANDLE_R - CHIP_ABOVE_PX)
+        } else if matches!(c.kind, crate::core::constraints::ConstraintKind::Parallel | crate::core::constraints::ConstraintKind::Perpendicular)
             && let Some((first, second)) = c.tangent_segments
             && let (Some((fa, fb)), Some((sa, sb))) = (ed.doc.segment_geom(first), ed.doc.segment_geom(second))
         {
@@ -764,7 +786,8 @@ fn update_constraint_markers(ed: &mut Editor) {
                 crate::core::constraints::ConstraintKind::Horizontal => {
                     [ma.x.min(mb.x), ma.y, ma.x.max(mb.x), ma.y]
                 }
-                _ => [ma.x, ma.y.min(mb.y), ma.x, ma.y.max(mb.y)],
+                crate::core::constraints::ConstraintKind::Vertical => [ma.x, ma.y.min(mb.y), ma.x, ma.y.max(mb.y)],
+                _ => [ma.x, ma.y, mb.x, mb.y],
             };
             guide = Some([g[0] as f32, g[1] as f32, g[2] as f32, g[3] as f32]);
             (((g[0] + g[2]) / 2.) as f32, ((g[1] + g[3]) / 2.) as f32)
@@ -834,30 +857,61 @@ fn update_constraint_markers(ed: &mut Editor) {
             hovered: is_hovered,
         });
     }
+
+    // Preview the perpendicular relation without inserting it into the
+    // document. Placement commits the same source/target segment pair.
+    if let Some((source, start, end)) = ed.perpendicular_preview
+        && let Some(seg) = ed.doc.segment(source)
+        && let (Some(a), Some(b)) = (ed.doc.point(seg.start), ed.doc.point(seg.end))
+    {
+        let sm = ed.camera.unit_to_screen(Point2::new((a.x + b.x) / 2., (a.y + b.y) / 2.));
+        let em = ed.camera.unit_to_screen(Point2::new((start.x + end.x) / 2., (start.y + end.y) / 2.));
+        let junction = [start, end].into_iter().min_by(|left, right| {
+            let distance = |point: Point2| [a, b].iter().map(|other| pick::distance(point, *other)).fold(f64::MAX, f64::min);
+            distance(*left).partial_cmp(&distance(*right)).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let connected = junction.is_some_and(|point| [a, b].iter().any(|other| pick::distance(point, *other) <= ed.snap_tol_doc()));
+        let (cx, cy, guide) = if connected {
+            let p = ed.camera.unit_to_screen(junction.unwrap_or(start));
+            (p.x as f32, p.y as f32, None)
+        } else {
+            (((sm.x + em.x) / 2.) as f32, ((sm.y + em.y) / 2.) as f32,
+             Some([sm.x as f32, sm.y as f32, em.x as f32, em.y as f32]))
+        };
+        let constraint = crate::core::constraints::Constraint {
+            kind: crate::core::constraints::ConstraintKind::Perpendicular,
+            a: seg.start,
+            b: seg.end,
+            tangent_segments: Some((source, source)),
+            point_on_segment: None,
+        };
+        ed.constraint_markers.push(ConstraintMarker {
+            key: "perpendicular-preview".into(), constraint,
+            cx_out: cx, cy_out: cy, cx_in: cx, cy_in: cy,
+            flipped: false, visible: true, emphasized: false,
+            clicked: false, guide, hovered: false,
+        });
+    }
     // Multiple constraints attached to one point share a single horizontal
     // chip row. The previous placement gave every chip the same point-based
     // anchor, so the overlay stacked vertically and obscured itself.
     let mut groups: Vec<Vec<usize>> = Vec::new();
     for (i, marker) in ed.constraint_markers.iter().enumerate() {
-        // Group only chips that are physically attached to the same anchor.
-        // Sharing an endpoint is not sufficient: adjacent rectangle edges
-        // share corners but their H/V chips belong on their own edge. Point
-        // constraints use the same screen anchor; duplicate constraints on
-        // one exact edge may share its edge midpoint.
+        // Group chips that occupy the same physical anchor. This deliberately
+        // uses the final screen position instead of only the constraint's
+        // point ids: a coincident constraint and a line-pair constraint can
+        // describe the same junction through different ids/metadata. Guide
+        // markers remain separate because they belong to disconnected pairs.
         if let Some(group) = groups.iter_mut().find(|group| {
             let first = &ed.constraint_markers[group[0]];
-            let first_point = first.constraint.a == first.constraint.b
-                || first.constraint.kind == crate::core::constraints::ConstraintKind::Coincident;
-            let marker_point = marker.constraint.a == marker.constraint.b
-                || marker.constraint.kind == crate::core::constraints::ConstraintKind::Coincident;
-            let same_point = first_point && marker_point
-                && (first.cx_out - marker.cx_out).abs() < 1.0
-                && (first.cy_out - marker.cy_out).abs() < 1.0;
+            let same_anchor = first.guide.is_none()
+                && marker.guide.is_none()
+                && (first.cx_out - marker.cx_out).hypot(first.cy_out - marker.cy_out) <= 8.0;
             let same_edge = first.constraint.tangent_segments.is_none()
                 && marker.constraint.tangent_segments.is_none()
                 && ((first.constraint.a == marker.constraint.a && first.constraint.b == marker.constraint.b)
                     || (first.constraint.a == marker.constraint.b && first.constraint.b == marker.constraint.a));
-            same_point || same_edge
+            same_anchor || same_edge
         }) {
             group.push(i);
         } else {

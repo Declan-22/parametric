@@ -19,6 +19,7 @@ pub enum Tool {
     ConstraintTangent,
     ConstraintCoincident,
     ConstraintParallel,
+    ConstraintPerpendicular,
 }
 
 // In-progress rectangle being dragged out (tool-side preview only).

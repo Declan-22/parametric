@@ -71,6 +71,8 @@ pub struct Editor {
     pub pending_shape: Option<PendingShape>,
     pub pending_ruler: Option<PendingRuler>,
     pub pending_line: Option<PendingLine>,
+    // Existing edge and prospective line geometry for the creation preview.
+    pub perpendicular_preview: Option<(SegmentId, Point2, Point2)>,
     pub pending_circle: Option<PendingCircle>,
     // Pending shape created by a single click (commit on next click).
     pub pending_via_click: bool,
@@ -205,6 +207,7 @@ impl Editor {
             pending_shape: None,
             pending_ruler: None,
             pending_line: None,
+            perpendicular_preview: None,
             pending_circle: None,
             pending_via_click: false,
             selection: Vec::new(),
@@ -266,6 +269,7 @@ impl Editor {
         self.pending_shape = None;
         self.pending_ruler = None;
         self.pending_line = None;
+        self.perpendicular_preview = None;
         self.pending_circle = None;
         self.pending_via_click = false;
         self.selection.clear();
@@ -519,6 +523,9 @@ impl Editor {
                             self.snap_guides.clear();
                             let layer_id = self.doc.layers[0].id;
                             let seg = self.create_line(layer_id, pending.start, b);
+                            if let Some((source, _, _)) = self.perpendicular_preview.take() {
+                                self.doc.add_perpendicular_constraint(source, seg);
+                            }
                             if shift { self.maybe_add_tangent(seg, b); }
                             self.selection = vec![ElementRef::Segment(seg)];
                             // Chain: the next line starts where this one ended.
@@ -686,7 +693,8 @@ impl Editor {
                 Tool::ConstraintHorizontalVertical
                 | Tool::ConstraintTangent
                 | Tool::ConstraintCoincident
-                | Tool::ConstraintParallel => false,
+                | Tool::ConstraintParallel
+                | Tool::ConstraintPerpendicular => false,
             }
             }
             _ => false,
@@ -808,6 +816,13 @@ impl Editor {
                                     for o in [a_seg.start, a_seg.end, b_seg.start, b_seg.end] {
                                         push_aux(o, &mut aux);
                                     }
+                                }
+                                ConstraintKind::Perpendicular => {
+                                    let Some((first, second)) = c.tangent_segments else { continue };
+                                    let (Some(a_seg), Some(b_seg)) = (self.doc.segment(first), self.doc.segment(second)) else { continue };
+                                    let touches = [a_seg.start, a_seg.end, b_seg.start, b_seg.end].contains(&pid);
+                                    if !touches { continue; }
+                                    for o in [a_seg.start, a_seg.end, b_seg.start, b_seg.end] { push_aux(o, &mut aux); }
                                 }
                                 _ => {}
                             }
@@ -1045,8 +1060,12 @@ impl Editor {
             let tangent_at = self.pending_line.as_ref().and_then(|p| {
                 if shift { self.tangent_snap_for_line(p.start, at) } else { None }
             });
+            let start = self.pending_line.map(|p| p.start).unwrap_or(at);
+            let perpendicular = self.perpendicular_snap_for_line(start, tangent_at.unwrap_or(at));
+            let final_at = perpendicular.map(|(point, _)| point).unwrap_or(tangent_at.unwrap_or(at));
+            self.perpendicular_preview = perpendicular.map(|(point, sid)| (sid, start, point));
             if let Some(pending) = self.pending_line.as_mut() {
-                pending.cursor = tangent_at.unwrap_or(at);
+                pending.cursor = final_at;
             }
             return true;
         }
@@ -1334,10 +1353,7 @@ impl Editor {
         // A live drag may request an impossible step, but applying a partial
         // LM iterate would visibly break a locked constraint. Keep the last
         // valid geometry until a later cursor position becomes solvable.
-        if !solution.is_valid()
-            || solution.max_lin_residual > 0.5
-            || solution.max_angle_residual > 0.02
-        {
+        if !solution.constraints_satisfied() {
             self.snap_guides.clear();
             return true;
         }
@@ -1820,6 +1836,44 @@ impl Editor {
         dims::update(self);
     }
 
+    /// Snaps a prospective line to a nearby right-angle direction. The
+    /// source segment is returned for preview/commit of the relation.
+    fn perpendicular_snap_for_line(&self, start: Point2, cursor: Point2) -> Option<(Point2, SegmentId)> {
+        let length = pick::distance(start, cursor);
+        if length <= 1e-6 { return None; }
+        let cursor_angle = (cursor.y - start.y).atan2(cursor.x - start.x);
+        let mut best: Option<(f64, Point2, SegmentId)> = None;
+        for (sid, seg) in self.doc.all_segments() {
+            if seg.kind != crate::core::document::SegmentKind::Line { continue; }
+            let (Some(a), Some(b)) = (self.doc.point(seg.start), self.doc.point(seg.end)) else { continue };
+            let angle = (b.y - a.y).atan2(b.x - a.x);
+            let mut error = (cursor_angle - angle).abs();
+            while error > std::f64::consts::PI { error -= std::f64::consts::TAU; }
+            let right_angle_error = (error.abs() - std::f64::consts::FRAC_PI_2).abs();
+            if right_angle_error > 8f64.to_radians() { continue; }
+            let perpendicular = angle + std::f64::consts::FRAC_PI_2;
+            let alternate = angle - std::f64::consts::FRAC_PI_2;
+            let q1 = Point2::new(start.x + length * perpendicular.cos(), start.y + length * perpendicular.sin());
+            let q2 = Point2::new(start.x + length * alternate.cos(), start.y + length * alternate.sin());
+            let (q, score) = if pick::distance(q1, cursor) <= pick::distance(q2, cursor) {
+                (q1, pick::distance(q1, cursor))
+            } else { (q2, pick::distance(q2, cursor)) };
+            // A perpendicular relation is only meaningful when the new
+            // segment is actually joined to the existing one. Never turn a
+            // merely similarly-oriented line elsewhere on the canvas into a
+            // constraint candidate.
+            let connected = [a, b].iter().any(|&point| {
+                pick::distance(start, point) <= self.snap_tol_doc()
+                    || pick::distance(q, point) <= self.snap_tol_doc()
+            });
+            if !connected { continue; }
+            if best.as_ref().map_or(true, |(old, _, _)| score < *old) {
+                best = Some((score, q, sid));
+            }
+        }
+        best.map(|(_, point, sid)| (point, sid))
+    }
+
     // -- hover --
 
     pub fn canvas_hover(&mut self, cursor: gpui::Point<gpui::Pixels>) -> bool {
@@ -1901,6 +1955,7 @@ impl Editor {
             }
             Tool::ConstraintCoincident => matches!(element, ElementRef::Point(_) | ElementRef::Segment(_)),
             Tool::ConstraintParallel => matches!(element, ElementRef::Segment(sid) if self.doc.segment(sid).is_some_and(|s| s.kind == crate::core::document::SegmentKind::Line)),
+            Tool::ConstraintPerpendicular => matches!(element, ElementRef::Segment(sid) if self.doc.segment(sid).is_some_and(|s| s.kind == crate::core::document::SegmentKind::Line)),
             _ => false,
         }
     }
@@ -1911,13 +1966,14 @@ impl Editor {
         }
         let ElementRef::Point(point) = element else { return None };
         match self.tool {
-            Tool::ConstraintHorizontalVertical | Tool::ConstraintTangent => self
+            Tool::ConstraintHorizontalVertical | Tool::ConstraintTangent | Tool::ConstraintPerpendicular => self
                 .doc
                 .all_segments()
                 .filter(|(_, s)| {
                     let allowed = match self.tool {
                         Tool::ConstraintHorizontalVertical => s.kind == crate::core::document::SegmentKind::Line,
                         Tool::ConstraintTangent => matches!(s.kind, crate::core::document::SegmentKind::Line | crate::core::document::SegmentKind::Arc),
+                        Tool::ConstraintPerpendicular => s.kind == crate::core::document::SegmentKind::Line,
                         _ => false,
                     };
                     allowed && (s.start == point || s.end == point || s.ctrl == Some(point))
@@ -2591,8 +2647,8 @@ impl Editor {
         let direct_distance = matches!(target,
             crate::core::constraints::DimTarget::Points { mode: crate::core::constraints::DimMode::Aligned, .. });
         if !solution.is_valid()
-            || (!direct_distance && solution.max_lin_residual > 0.5)
-            || solution.max_angle_residual > 0.02
+            || solution.max_angle_residual > 1e-5
+            || (!direct_distance && solution.max_lin_residual > 1e-3)
         {
             self.overconstrained = true;
             return false;
@@ -2628,6 +2684,7 @@ impl Editor {
                 | Tool::ConstraintTangent
                 | Tool::ConstraintCoincident
                 | Tool::ConstraintParallel
+                | Tool::ConstraintPerpendicular
         )
     }
 
@@ -2638,7 +2695,7 @@ impl Editor {
         // point. Constraint tools need the underlying edge when the cursor
         // is on that edge, otherwise a line endpoint can hide the arc (or
         // vice versa) and tangent receives the same element twice.
-        let hit = if matches!(self.tool, Tool::ConstraintTangent | Tool::ConstraintHorizontalVertical) {
+        let hit = if matches!(self.tool, Tool::ConstraintTangent | Tool::ConstraintHorizontalVertical | Tool::ConstraintPerpendicular) {
             let edge = picker.segment(p).map(ElementRef::Segment);
             if edge.as_ref().is_some_and(|element| self.constraint_picks.contains(element)) {
                 picker.element(p)
@@ -2767,7 +2824,7 @@ impl Editor {
                     self.constraint_picks.clear();
                 }
             }
-            Tool::ConstraintParallel => {
+            Tool::ConstraintParallel | Tool::ConstraintPerpendicular => {
                 if let [ElementRef::Segment(first), ElementRef::Segment(second)] = self.constraint_picks.as_slice()
                     && let (Some(a), Some(b)) = (self.doc.segment(*first), self.doc.segment(*second))
                 {
@@ -2781,7 +2838,11 @@ impl Editor {
                     });
                     let (foundation, moving) = if fixed { (*second, *first) } else { (*first, *second) };
                     self.make_line_parallel(moving, foundation);
-                    self.doc.add_parallel_constraint(foundation, moving);
+                    if self.tool == Tool::ConstraintParallel {
+                        self.doc.add_parallel_constraint(foundation, moving);
+                    } else {
+                        self.doc.add_perpendicular_constraint(foundation, moving);
+                    }
                     self.solve_constraint_now(&[ElementRef::Segment(foundation), ElementRef::Segment(moving)]);
                     self.selection = self.constraint_picks.clone();
                     self.constraint_picks.clear();
@@ -2793,12 +2854,53 @@ impl Editor {
         true
     }
 
-    fn solve_constraint_now(&mut self, elements: &[ElementRef]) {
+    fn solve_constraint_now(&mut self, elements: &[ElementRef]) -> bool {
         let mut ids = Vec::new();
         for &element in elements {
             for id in self.doc.element_points(element) {
                 if !ids.contains(&id) { ids.push(id); }
             }
+        }
+        // Constraint creation must project the complete connected component,
+        // not just the two endpoints that were clicked. Otherwise a new
+        // horizontal/vertical/parallel relation on a chained drawing has no
+        // movable path and is discarded as if it were over-constrained.
+        let mut cursor = 0;
+        while cursor < ids.len() {
+            let pid = ids[cursor];
+            for (_, seg) in self.doc.all_segments() {
+                if seg.start != pid && seg.end != pid && seg.ctrl != Some(pid) && seg.center != Some(pid) {
+                    continue;
+                }
+                for linked in [Some(seg.start), Some(seg.end), seg.ctrl, seg.center].into_iter().flatten() {
+                    if self.doc.point(linked).is_some() && !ids.contains(&linked) {
+                        ids.push(linked);
+                    }
+                }
+            }
+            for constraint in &self.doc.constraints {
+                let mut linked = constraint.a == pid || constraint.b == pid;
+                if let Some(segment_id) = constraint.point_on_segment
+                    && let Some(seg) = self.doc.segment(segment_id)
+                {
+                    linked |= seg.start == pid || seg.end == pid || seg.ctrl == Some(pid) || seg.center == Some(pid);
+                    if linked {
+                        for point in [Some(seg.start), Some(seg.end), seg.ctrl, seg.center].into_iter().flatten() {
+                            if self.doc.point(point).is_some() && !ids.contains(&point) {
+                                ids.push(point);
+                            }
+                        }
+                    }
+                }
+                if linked {
+                    for point in [constraint.a, constraint.b] {
+                        if self.doc.point(point).is_some() && !ids.contains(&point) {
+                            ids.push(point);
+                        }
+                    }
+                }
+            }
+            cursor += 1;
         }
         let aux: Vec<_> = ids
             .iter()
@@ -2811,14 +2913,19 @@ impl Editor {
             1.0,
         );
         let solution = solver.solve();
-        if solution.is_valid()
-            && solution.max_lin_residual <= 0.5
-            && solution.max_angle_residual <= 0.02
-        {
+        if solution.constraints_satisfied() {
             for (id, pos) in solution.positions {
                 self.doc.move_point(id, pos);
             }
             self.doc_gen += 1;
+            true
+        } else {
+            // Constraint creation is transactional. The caller has just
+            // appended the candidate relation; if the complete component
+            // cannot satisfy it, remove that candidate instead of leaving a
+            // latent broken constraint in the document.
+            self.doc.constraints.pop();
+            false
         }
     }
 
@@ -3179,6 +3286,9 @@ impl Editor {
             if pick::distance(b, pending.start) > 1e-6 {
                 let layer_id = self.doc.layers[0].id;
                 let seg = self.create_line(layer_id, pending.start, b);
+                if let Some((source, _, _)) = self.perpendicular_preview.take() {
+                    self.doc.add_perpendicular_constraint(source, seg);
+                }
                 if shift {
                     self.maybe_add_tangent(seg, b);
                 }
@@ -3749,6 +3859,7 @@ impl Editor {
         self.pending_shape = None;
         self.pending_ruler = None;
         self.pending_line = None;
+        self.perpendicular_preview = None;
         self.pending_circle = None;
         self.pending_via_click = false;
         self.dragging = None;

@@ -4,7 +4,7 @@ use gpui::{
     div, fill, prelude::*, px, rgb, rgba, svg,
 };
 
-use crate::editor::Editor;
+use crate::editor::{Editor, Tool};
 use crate::ui::shell::title_bar::TITLE_BAR_HEIGHT;
 
 pub mod context_menu;

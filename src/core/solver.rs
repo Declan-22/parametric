@@ -1349,3 +1349,39 @@ fn gauss_solve_in_place(a: &mut [f64], n: usize, b: &mut [f64], out: &mut [f64])
     }
     true
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::constraints::{DimTarget, Dimension};
+
+    #[test]
+    fn existing_right_angle_accepts_locked_angle_dimension() {
+        let mut doc = Document::new();
+        let origin = doc.add_point(Point2::new(0., 0.));
+        let horizontal = doc.add_point(Point2::new(100., 0.));
+        let vertical = doc.add_point(Point2::new(0., 100.));
+        let first = doc.add_segment(origin, horizontal);
+        let second = doc.add_segment(origin, vertical);
+        doc.add_constraint(ConstraintKind::Horizontal, origin, horizontal);
+        doc.add_constraint(ConstraintKind::Vertical, origin, vertical);
+        doc.add_dimension(Dimension {
+            target: DimTarget::Angle { a: first, b: second },
+            value: 90.,
+            offset: 25.,
+            slide: 0.5,
+            sweep: 90.,
+        });
+
+        let aux = doc
+            .all_points()
+            .map(|(id, point)| (id, point))
+            .collect::<Vec<_>>();
+        let pins = vec![(origin, Point2::new(0., 0.))];
+        let solver = Solver::build_pinned(&doc, &[], &aux, &pins, 2.0);
+        let solution = solver.solve();
+
+        assert!(solution.max_angle_residual <= 0.02);
+        assert!(solution.max_lin_residual <= 0.5);
+    }
+}

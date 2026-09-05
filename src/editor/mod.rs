@@ -2358,7 +2358,7 @@ impl Editor {
                 let typed = input.buffer.parse::<f64>().ok();
                 let value = if is_angle {
                     let mag = typed.map(|t| t.abs()).unwrap_or(input.measured.abs());
-                    input.measured.signum() * mag
+                    angle_value_for_input(input.measured, mag)
                 } else {
                     typed.unwrap_or(input.measured)
                 };
@@ -2537,16 +2537,39 @@ impl Editor {
         // height edit (100 -> 50) keeps the top edge where it is and pulls
         // the bottom edge up the full 50, instead of both edges converging
         // 25 apiece. "Everything shifts toward the top-left."
-        let pins: Vec<(PointId, Point2)> = aux
-            .iter()
-            .copied()
-            .min_by(|a, b| {
-                (a.1.y, a.1.x)
-                    .partial_cmp(&(b.1.y, b.1.x))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .into_iter()
-            .collect();
+        // ANGLE PIVOT: for connected edges, pin their shared vertex rather
+        // than an unrelated top-left point. The angle should rotate/deform
+        // around its actual corner; pinning elsewhere can force the solver
+        // into a poor branch and report a valid 90-degree lock as infeasible.
+        let angle_vertex = match target {
+            crate::core::constraints::DimTarget::Angle { a, b } => {
+                let first = trial.segment(a);
+                let second = trial.segment(b);
+                first.and_then(|first| {
+                    second.and_then(|second| {
+                        [first.start, first.end]
+                            .into_iter()
+                            .find(|&pid| equivalent_angle_vertex(&trial, pid, second.start)
+                                || equivalent_angle_vertex(&trial, pid, second.end))
+                    })
+                })
+            }
+            _ => None,
+        };
+        let pins: Vec<(PointId, Point2)> = angle_vertex
+            .and_then(|pid| trial.point(pid).map(|point| (pid, point)))
+            .map(|pin| vec![pin])
+            .unwrap_or_else(|| {
+                aux.iter()
+                    .copied()
+                    .min_by(|a, b| {
+                        (a.1.y, a.1.x)
+                            .partial_cmp(&(b.1.y, b.1.x))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .into_iter()
+                    .collect()
+            });
         // STRONG-but-soft anchors: the freed component deforms minimally.
         // The weight ratio vs DIM_WEIGHT (1e6) sets the equilibrium
         // residual: sqrt(2/1e6) * displacement — tiny at 2.0, but ~10% of
@@ -3877,10 +3900,33 @@ impl Editor {
     }
 }
 
+/// Converts an angle entry while preserving the sector selected during
+/// placement. A reflex preview is stored as (for example) -270 degrees;
+/// reducing that to -90 degrees changes the constraint branch instead of
+/// expressing the same 90-degree corner on the selected side.
+fn angle_value_for_input(measured: f64, magnitude: f64) -> f64 {
+    let magnitude = magnitude.abs().clamp(0., 360.);
+    let magnitude = if measured.abs() > 180. {
+        360. - magnitude
+    } else {
+        magnitude
+    };
+    measured.signum() * magnitude
+}
+
+fn equivalent_angle_vertex(doc: &Document, a: PointId, b: PointId) -> bool {
+    a == b
+        || doc.constraints.iter().any(|constraint| {
+            constraint.kind == ConstraintKind::Coincident
+                && ((constraint.a == a && constraint.b == b)
+                    || (constraint.a == b && constraint.b == a))
+        })
+}
+
 /// Snap a single drag target's direction to 45-degree steps around the
 /// other endpoint of its owning segment (shift-resize). Standalone lines
 /// get angle-only snapping — no inch-mark length quantization.
-    fn snap_target_direction(doc: &Document, targets: &mut [(PointId, Point2)]) {
+fn snap_target_direction(doc: &Document, targets: &mut [(PointId, Point2)]) {
     let (pid, target) = targets[0];
     let mut anchor: Option<Point2> = None;
     let mut bare_line = false;
@@ -3914,4 +3960,25 @@ impl Editor {
     } else {
         snapped_b
     };
+}
+
+#[cfg(test)]
+mod angle_tests {
+    use super::*;
+
+    #[test]
+    fn angle_input_keeps_reflex_sector() {
+        assert_eq!(angle_value_for_input(-270., 90.), -270.);
+        assert_eq!(angle_value_for_input(-240., 120.), -240.);
+        assert_eq!(angle_value_for_input(90., 90.), 90.);
+    }
+
+    #[test]
+    fn coincident_endpoints_are_angle_pivots() {
+        let mut doc = Document::new();
+        let a = doc.add_point(Point2::new(0., 0.));
+        let b = doc.add_point(Point2::new(0., 0.));
+        doc.add_constraint(ConstraintKind::Coincident, a, b);
+        assert!(equivalent_angle_vertex(&doc, a, b));
+    }
 }

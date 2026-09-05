@@ -1384,4 +1384,89 @@ mod tests {
         assert!(solution.max_angle_residual <= 0.02);
         assert!(solution.max_lin_residual <= 0.5);
     }
+
+    #[test]
+    fn slanted_angle_dimension_converges() {
+        let mut doc = Document::new();
+        let origin = doc.add_point(Point2::new(0., 0.));
+        let first_end = doc.add_point(Point2::new(100., 0.));
+        let second_end = doc.add_point(Point2::new(100., 100.));
+        let first = doc.add_segment(origin, first_end);
+        let second = doc.add_segment(origin, second_end);
+        doc.add_dimension(Dimension {
+            target: DimTarget::Angle { a: first, b: second },
+            value: 30.,
+            offset: 25.,
+            slide: 0.5,
+            sweep: 30.,
+        });
+
+        let aux = doc
+            .all_points()
+            .map(|(id, point)| (id, point))
+            .collect::<Vec<_>>();
+        let pins = vec![(origin, Point2::new(0., 0.))];
+        let solution = Solver::build_pinned(&doc, &[], &aux, &pins, 2.0).solve();
+
+        assert!(solution.max_angle_residual <= 0.02);
+        assert!(solution.max_lin_residual <= 0.5);
+    }
+
+    #[test]
+    fn connected_120_degree_edges_can_lock_to_90_degrees() {
+        let mut doc = Document::new();
+        let vertex = doc.add_point(Point2::new(0., 0.));
+        let first_end = doc.add_point(Point2::new(100., 0.));
+        let second_end = doc.add_point(Point2::new(-50., 86.6025403784));
+        let first = doc.add_segment(vertex, first_end);
+        // Reverse the stored direction to match the common connected-edge
+        // ordering that previously exposed the false over-constraint.
+        let second = doc.add_segment(second_end, vertex);
+        doc.add_dimension(Dimension {
+            target: DimTarget::Angle { a: first, b: second },
+            value: 90.,
+            offset: 25.,
+            slide: 0.5,
+            sweep: 90.,
+        });
+
+        let aux = doc
+            .all_points()
+            .map(|(id, point)| (id, point))
+            .collect::<Vec<_>>();
+        let pins = vec![(vertex, Point2::new(0., 0.))];
+        let solution = Solver::build_pinned(&doc, &[], &aux, &pins, 2.0).solve();
+
+        assert!(solution.max_angle_residual <= 0.02);
+        assert!(solution.max_lin_residual <= 0.5);
+    }
+
+    #[test]
+    fn coincident_endpoints_can_lock_a_right_angle() {
+        let mut doc = Document::new();
+        let first_vertex = doc.add_point(Point2::new(0., 0.));
+        let first_end = doc.add_point(Point2::new(100., 0.));
+        let second_vertex = doc.add_point(Point2::new(0., 0.));
+        let second_end = doc.add_point(Point2::new(0., 100.));
+        let first = doc.add_segment(first_vertex, first_end);
+        let second = doc.add_segment(second_vertex, second_end);
+        doc.add_constraint(ConstraintKind::Coincident, first_vertex, second_vertex);
+        doc.add_dimension(Dimension {
+            target: DimTarget::Angle { a: first, b: second },
+            value: 90.,
+            offset: 25.,
+            slide: 0.5,
+            sweep: 90.,
+        });
+
+        let aux = doc
+            .all_points()
+            .map(|(id, point)| (id, point))
+            .collect::<Vec<_>>();
+        let pins = vec![(first_vertex, Point2::new(0., 0.))];
+        let solution = Solver::build_pinned(&doc, &[], &aux, &pins, 2.0).solve();
+
+        assert!(solution.max_angle_residual <= 0.02);
+        assert!(solution.max_lin_residual <= 0.5);
+    }
 }

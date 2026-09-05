@@ -628,65 +628,57 @@ impl Editor {
                         }
                         return true;
                     }
-                    // Placement mode: a click on EMPTY SPACE places the
-                    // dimension at the cursor; a click on geometry
-                    // re-resolves the pending target instead (edge + edge
-                    // turns into an angle/distance pair, point + edge into
-                    // a point-line distance...).
-                    if self.dim_target.is_some() {
-                        let doc_p = self.cursor_doc(cursor);
-                        if let Some(target) = self.dim_target {
-                            if let Some((mode, offset, slide, measured)) = self.dim_placement(target, doc_p) {
-                                // Once two picks form a target, every click is
-                                // a placement click. Previously a point hit
-                                // near a slanted dimension was interpreted as
-                                // another pick, so the value editor never
-                                // opened for aligned displacement dimensions.
-                                self.dim_picks.clear();
-                                self.dim_target = None;
-                                self.selection.clear();
-                                self.dim_input = Some(DimInput {
-                                    target: target.with_mode(mode), offset, slide, measured,
-                                    buffer: String::new(), existing: None,
-                                });
-                            }
-                        }
-                        return true;
-                    }
-                    // Accumulate picks: points and whole lines (an edge is a
-                    // complete dimension all by itself; an arc is a radius).
-                    // Re-clicking a pick deselects it.
                     let doc_p = self.cursor_doc(cursor);
                     let picker = pick::Picker::new(&self.doc, &self.camera, HANDLE_TOL_PX);
                     let new_pick = picker
                         .point(doc_p)
                         .map(DimPick::Point)
                         .or_else(|| picker.segment(doc_p).map(DimPick::Line));
-                    let Some(pick) = new_pick else {
-                        return false;
-                    };
-                    if let Some(pos) = self.dim_picks.iter().position(|&p| p == pick) {
-                        self.dim_picks.remove(pos);
-                    } else {
-                        self.dim_picks.push(pick);
-                        // A pair overflows: drop the oldest pick so the two
-                        // most recent picks define the dimension.
-                        if self.dim_picks.len() > 2 {
-                            self.dim_picks.remove(0);
+                    // Accumulate geometry picks before considering placement.
+                    // A line is already a valid length target, so the old
+                    // ordering treated the second edge click as placement
+                    // instead of allowing an edge + edge angle target.
+                    if let Some(pick) = new_pick {
+                        // Re-clicking a pick deselects it.
+                        if let Some(pos) = self.dim_picks.iter().position(|&p| p == pick) {
+                            self.dim_picks.remove(pos);
+                        } else {
+                            self.dim_picks.push(pick);
+                            // A pair overflows: drop the oldest pick so the two
+                            // most recent picks define the dimension.
+                            if self.dim_picks.len() > 2 {
+                                self.dim_picks.remove(0);
+                            }
                         }
+                        self.dim_target = self.resolve_dim_target(&self.dim_picks);
+                        // Mirror the picks as selection so they highlight —
+                        // without visible feedback a pick looks like it failed.
+                        self.selection = self
+                            .dim_picks
+                            .iter()
+                            .map(|p| match p {
+                                DimPick::Point(id) => ElementRef::Point(*id),
+                                DimPick::Line(id) => ElementRef::Segment(*id),
+                            })
+                            .collect();
+                        return true;
                     }
-                    self.dim_target = self.resolve_dim_target(&self.dim_picks);
-                    // Mirror the picks as selection so they highlight —
-                    // without visible feedback a pick looks like it failed.
-                    self.selection = self
-                        .dim_picks
-                        .iter()
-                        .map(|p| match p {
-                            DimPick::Point(id) => ElementRef::Point(*id),
-                            DimPick::Line(id) => ElementRef::Segment(*id),
-                        })
-                        .collect();
-                    true
+                    // Placement mode: a click on empty space places the
+                    // pending dimension at the cursor. Geometry clicks were
+                    // handled above so a second edge can form an angle.
+                    if let Some(target) = self.dim_target {
+                        if let Some((mode, offset, slide, measured)) = self.dim_placement(target, doc_p) {
+                            self.dim_picks.clear();
+                            self.dim_target = None;
+                            self.selection.clear();
+                            self.dim_input = Some(DimInput {
+                                target: target.with_mode(mode), offset, slide, measured,
+                                buffer: String::new(), existing: None,
+                            });
+                        }
+                        return true;
+                    }
+                    false
                 }
                 // Constraint tools are handled before this mode match so
                 // their clicks never enter shape/dimension creation. Keep an

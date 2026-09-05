@@ -597,11 +597,40 @@ impl Solver {
 
     }
 
+    /// Returns whether an equation can influence the current free iterate.
+    /// The document may contain many unrelated constraints; evaluating their
+    /// residuals during a local drag only burns CPU because every variable in
+    /// their gradient is fixed.
+    fn eq_touches_free(&self, eq: Eq) -> bool {
+        let slots: [usize; 4] = match eq {
+            Eq::Horizontal { a, b }
+            | Eq::Vertical { a, b }
+            | Eq::Distance { a, b, .. }
+            | Eq::DistanceX { a, b, .. }
+            | Eq::DistanceY { a, b, .. } => [a, b, usize::MAX, usize::MAX],
+            Eq::PointLineDist { p, l1, l2, .. } => [p, l1, l2, usize::MAX],
+            Eq::LineDist { a1, a2, b1, .. } => [a1, a2, b1, usize::MAX],
+            Eq::Angle { a1, a2, b1, b2, .. } => [a1, a2, b1, b2],
+            Eq::ArcRadius { s, e, c, .. } => [s, e, c, usize::MAX],
+            Eq::EqualRadius { o, a, b } => [o, a, b, usize::MAX],
+            Eq::ArcBend { s, e, c } => [s, e, c, usize::MAX],
+            Eq::Tangent { l1, l2, o, p } => [l1, l2, o, p],
+            Eq::CirclePoint { p, o, .. } => [p, o, usize::MAX, usize::MAX],
+            Eq::Parallel { a1, a2, b1, b2 } => [a1, a2, b1, b2],
+        };
+        slots
+            .iter()
+            .any(|&slot| slot != usize::MAX && self.free_of[slot].is_some())
+    }
+
     /// Evaluates all weighted residuals (geometric + soft anchors).
     /// Variables are SCALARS: free slot v owns variables (2v, 2v+1).
     fn residuals(&self, x: &[Point2]) -> Vec<Residual> {
         let mut out = Vec::with_capacity(self.eqs.len() * 2 + self.n_free * 2);
         for eq in &self.eqs {
+            if !self.eq_touches_free(*eq) {
+                continue;
+            }
             match *eq {
                 Eq::Horizontal { a, b } => {
                     let (pa, pb) = (self.pos(a, x), self.pos(b, x));

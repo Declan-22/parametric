@@ -1060,6 +1060,14 @@ impl Solver {
         let mut status = SolveStatus::MaxIterations;
         let init_cost = Self::cost(&self.residuals(&x));
         let mut cost = init_cost;
+        // Reuse the normal-equation and trial buffers across LM iterations.
+        // These are hot-path scratch values, not solver state: keeping them
+        // here avoids allocating several large vectors for every iteration
+        // of every live drag.
+        let mut jtj = vec![0.0; n * n];
+        let mut jtr = vec![0.0; n];
+        let mut dx = vec![0.0; n];
+        let mut trial = vec![Point2::new(0., 0.); self.n_free];
 
         for _iter in 0..MAX_ITER {
             if cost < TOL {
@@ -1067,12 +1075,8 @@ impl Solver {
                 break;
             }
 
-            // Keep the dense system in one contiguous buffer. The previous
-            // Vec<Vec<_>> representation allocated one row per solve and
-            // gauss_solve cloned every row on every iteration, which made
-            // live drags disproportionately expensive.
-            let mut jtj = vec![0.0; n * n];
-            let mut jtr = vec![0.0; n];
+            jtj.fill(0.0);
+            jtr.fill(0.0);
             for r in &self.residuals(&x) {
                 let w = r.weight;
                 for &(vi, gi) in &r.grad {
@@ -1086,36 +1090,30 @@ impl Solver {
                 jtj[i * n + i] += lambda + 1e-12;
             }
 
-            match gauss_solve(&jtj, n, &jtr) {
-                Some(dx) => {
-                    let trial: Vec<Point2> = x
-                        .iter()
-                        .zip(dx.chunks_exact(2))
-                        .map(|(p, d)| {
-                            Point2::new(
-                                p.x + d[0].clamp(-STEP_CAP, STEP_CAP),
-                                p.y + d[1].clamp(-STEP_CAP, STEP_CAP),
-                            )
-                            .clamped()
-                        })
-                        .collect();
-                    let new_cost = Self::cost(&self.residuals(&trial));
-                    if new_cost < cost {
-                        x = trial;
-                        cost = new_cost;
-                        lambda = (lambda * 0.5).max(1e-9);
-                    } else {
-                        lambda *= 4.0;
-                        if lambda > 1e8 {
-                            break;
-                        }
-                    }
+            if !gauss_solve_in_place(&mut jtj, n, &mut jtr, &mut dx) {
+                lambda *= 10.0;
+                if lambda > 1e8 {
+                    break;
                 }
-                None => {
-                    lambda *= 10.0;
-                    if lambda > 1e8 {
-                        break;
-                    }
+                continue;
+            }
+
+            for (i, (p, d)) in x.iter().zip(dx.chunks_exact(2)).enumerate() {
+                trial[i] = Point2::new(
+                    p.x + d[0].clamp(-STEP_CAP, STEP_CAP),
+                    p.y + d[1].clamp(-STEP_CAP, STEP_CAP),
+                )
+                .clamped();
+            }
+            let new_cost = Self::cost(&self.residuals(&trial));
+            if new_cost < cost {
+                x.copy_from_slice(&trial);
+                cost = new_cost;
+                lambda = (lambda * 0.5).max(1e-9);
+            } else {
+                lambda *= 4.0;
+                if lambda > 1e8 {
+                    break;
                 }
             }
         }
@@ -1291,49 +1289,44 @@ fn signed_angle(a1: Point2, a2: Point2, b1: Point2, b2: Point2) -> f64 {
 }
 
 /// Gaussian elimination with partial pivoting; None when singular.
-fn gauss_solve(a: &[f64], n: usize, b: &[f64]) -> Option<Vec<f64>> {
+fn gauss_solve_in_place(a: &mut [f64], n: usize, b: &mut [f64], out: &mut [f64]) -> bool {
     debug_assert_eq!(a.len(), n * n);
     debug_assert_eq!(b.len(), n);
-    let n = b.len();
-    // Augment in-place so solving does not first clone a row-vector matrix.
-    let mut m = vec![0.0; n * (n + 1)];
-    for row in 0..n {
-        m[row * (n + 1)..row * (n + 1) + n]
-            .copy_from_slice(&a[row * n..row * n + n]);
-        m[row * (n + 1) + n] = b[row];
-    }
-    for i in 0..n {
-        let pivot = (i..n).max_by(|r1, r2| {
-            m[*r1 * (n + 1) + i]
+    debug_assert_eq!(out.len(), n);
+    for col in 0..n {
+        let pivot = (col..n).max_by(|r1, r2| {
+            a[*r1 * n + col]
                 .abs()
-                .partial_cmp(&m[*r2 * (n + 1) + i].abs())
+                .partial_cmp(&a[*r2 * n + col].abs())
                 .unwrap()
-        })?;
-        if m[pivot * (n + 1) + i].abs() < 1e-14 {
-            return None;
+        });
+        let Some(pivot) = pivot else { return false };
+        if a[pivot * n + col].abs() < 1e-14 {
+            return false;
         }
-        if pivot != i {
-            for col in i..=n {
-                m.swap(i * (n + 1) + col, pivot * (n + 1) + col);
+        if pivot != col {
+            for j in col..n {
+                a.swap(col * n + j, pivot * n + j);
             }
+            b.swap(col, pivot);
         }
-        let inv = 1.0 / m[i * (n + 1) + i];
-        for row in i + 1..n {
-            let factor = m[row * (n + 1) + i] * inv;
+        let inv = 1.0 / a[col * n + col];
+        for row in col + 1..n {
+            let factor = a[row * n + col] * inv;
             if factor != 0.0 {
-                for col in i..=n {
-                    m[row * (n + 1) + col] -= factor * m[i * (n + 1) + col];
+                for j in col..n {
+                    a[row * n + j] -= factor * a[col * n + j];
                 }
+                b[row] -= factor * b[col];
             }
         }
     }
-    let mut out = vec![0.0; n];
     for row in (0..n).rev() {
-        let mut sum = m[row * (n + 1) + n];
+        let mut sum = b[row];
         for col in row + 1..n {
-            sum -= m[row * (n + 1) + col] * out[col];
+            sum -= a[row * n + col] * out[col];
         }
-        out[row] = sum / m[row * (n + 1) + row];
+        out[row] = sum / a[row * n + row];
     }
-    Some(out)
+    true
 }

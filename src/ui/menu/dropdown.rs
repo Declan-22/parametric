@@ -1,6 +1,6 @@
 use gpui::{
-    App, FontWeight, MouseButton, Point, SharedString, WeakEntity, Window, div, point, prelude::*,
-    px, rgb, rgba,
+    App, MouseButton, Point, SharedString, WeakEntity, Window, div, point, prelude::*, px, rgb,
+    rgba,
 };
 
 use crate::theme::Theme;
@@ -11,7 +11,7 @@ use crate::ui::shell::title_bar::TITLE_BAR_HEIGHT;
 pub const MENU_LEFT: f32 = 6.0;
 pub const PANEL_WIDTH: f32 = 200.0;
 pub const SUBMENU_WIDTH: f32 = 232.0;
-pub const ENTRY_HEIGHT: f32 = 26.0;
+pub const ENTRY_HEIGHT: f32 = 28.0;
 pub const SEPARATOR_HEIGHT: f32 = 11.0;
 pub const PANEL_PADDING_Y: f32 = 4.0;
 pub const PANEL_PADDING_X: f32 = 4.0;
@@ -57,7 +57,7 @@ impl AppMenu {
             .bg(rgb(t.bg_darker))
             .border_1()
             .border_color(rgb(t.menu_border_color))
-            .rounded(px(8.))
+            .rounded(px(12.))
             .shadow(vec![t.shadow_sm()])
             .opacity(opacity)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -99,8 +99,10 @@ impl AppMenu {
             .items_center()
             .justify_between()
             .h(px(ENTRY_HEIGHT))
-            .px(px(10.))
-            .rounded(px(6.))
+            .pl(px(8.))
+            .pr(px(6.))
+            .py(px(10.))
+            .rounded(px(10.))
             .text_sm()
             .text_color(rgb(t.text_primary))
             .cursor_pointer()
@@ -203,7 +205,7 @@ fn render_submenu(
         .bg(rgb(t.bg_darker))
         .border_1()
         .border_color(rgb(t.menu_border_color))
-        .rounded(px(8.))
+        .rounded(px(12.))
         .shadow(vec![t.shadow_sm()])
         .opacity(opacity)
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -255,8 +257,10 @@ fn render_item(
                 .items_center()
                 .justify_between()
                 .h(px(ENTRY_HEIGHT))
-                .px(px(10.))
-                .rounded(px(6.))
+                .pl(px(8.))
+                .pr(px(4.))
+                .py(px(10.))
+                .rounded(px(10.))
                 .text_sm()
                 .text_color(rgb(t.text_primary))
                 .cursor_pointer()
@@ -281,17 +285,42 @@ fn render_item(
                     let _ = shell.update(cx, |shell, cx| shell.close_menu(cx));
                 })
                 .child(entry.label.clone())
-                .children(entry.shortcut.clone().map(|shortcut| {
-                    div()
-                        .pl(px(24.))
-                        .text_xs()
-                        .font_family(crate::theme::FONT_UI)
-                        .text_color(rgb(t.empty_text_primary))
-                        .child(shortcut)
-                }))
+                .children(
+                    entry
+                        .shortcut
+                        .clone()
+                        .map(|shortcut| shortcut_hint(shortcut, t)),
+                )
                 .into_any_element()
         }
     }
+}
+
+/// Floating-menu keycap styling, with a flexible width for shortcuts such as
+/// "Ctrl+Z" and "Shift+Alt+P" while retaining the compact square shape for
+/// one-character shortcuts.
+fn shortcut_hint(shortcut: SharedString, t: Theme) -> gpui::AnyElement {
+    let width = (18. + shortcut.to_string().len() as f32 * 5.).max(18.);
+    div()
+        .min_w(px(18.))
+        .w(px(width))
+        .h(px(18.))
+        .px(px(4.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(6.))
+        .bg(rgb(t.bg_primary))
+        .border_1()
+        .border_color(rgb(t.border_color))
+        .child(
+            div()
+                .text_xs()
+                .font_family(crate::theme::FONT_UI)
+                .text_color(rgb(t.empty_text_primary))
+                .child(shortcut),
+        )
+        .into_any_element()
 }
 
 struct SubmenuPlacement {

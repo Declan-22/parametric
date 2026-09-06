@@ -1229,6 +1229,13 @@ impl Render for Shell {
             }))
             .on_key_down(move |e: &gpui::KeyDownEvent, _, cx| {
                 let key = e.keystroke.key.clone();
+                let inspector_active = shell_keys
+                    .upgrade()
+                    .is_some_and(|s| s.read(cx).editor.as_ref().is_some_and(|ed| ed.read(cx).inspector_input.is_some()));
+                if inspector_active {
+                    let handled = shell_keys.upgrade().is_some_and(|s| s.update(cx, |shell, cx| shell.editor.as_ref().is_some_and(|ed| ed.update(cx, |ed, cx| ed.inspector_input_key(&key, cx)))));
+                    if handled { cx.stop_propagation(); return; }
+                }
                 // Dimension value input: while a placed dim waits for its
                 // value, keystrokes drive it (Enter commits, Esc cancels,
                 // digits edit) — exactly like the rename flow.

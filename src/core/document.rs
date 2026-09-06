@@ -38,6 +38,33 @@ pub struct Document {
     // Dimensional measurements; a locked dimension doubles as a distance
     // constraint during edits.
     pub dimensions: Vec<Dimension>,
+    /// Parametric edge treatments. The source segments remain identifiable so
+    /// the treatment can be removed without losing the user's geometry.
+    pub modifiers: Vec<Modifier>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Modifier {
+    Fillet(FilletModifier),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FilletModifier {
+    pub first: SegmentId,
+    pub second: SegmentId,
+    pub corner: PointId,
+    pub radius: f64,
+    /// The generated tangent arc. Its construction points are owned by the
+    /// modifier and are removed with it.
+    pub arc: SegmentId,
+    pub first_trim: PointId,
+    pub second_trim: PointId,
+    pub center: PointId,
+    pub control: PointId,
+    pub first_original_start: PointId,
+    pub first_original_end: PointId,
+    pub second_original_start: PointId,
+    pub second_original_end: PointId,
 }
 
 // -- entities --
@@ -59,6 +86,19 @@ pub enum SegmentKind {
     Bezier,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StrokeDash {
+    Solid,
+    Dashed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StrokeCap {
+    Butt,
+    Round,
+    Square,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Segment {
     pub start: PointId,
@@ -67,6 +107,10 @@ pub struct Segment {
     // Screen-px stroke rendered for standalone lines; 0 = invisible
     // geometry (rectangle edges, etc.).
     pub stroke_width: f64,
+    pub stroke_color: u32,
+    pub opacity: f32,
+    pub dash: StrokeDash,
+    pub cap: StrokeCap,
     // Arc control point (a REAL point on the arc) for kind == Arc.
     // None for lines/rulers. Endpoints + ctrl define the circumcircle.
     pub ctrl: Option<PointId>,
@@ -77,11 +121,11 @@ pub struct Segment {
 
 impl Segment {
     fn line(start: PointId, end: PointId) -> Self {
-        Self { start, end, kind: SegmentKind::Line, stroke_width: 0., ctrl: None, center: None }
+        Self { start, end, kind: SegmentKind::Line, stroke_width: 0., stroke_color: 0x202124, opacity: 1., dash: StrokeDash::Solid, cap: StrokeCap::Butt, ctrl: None, center: None }
     }
 
     fn with_kind(start: PointId, end: PointId, kind: SegmentKind) -> Self {
-        Self { start, end, kind, stroke_width: 0., ctrl: None, center: None }
+        Self { start, end, kind, stroke_width: 0., stroke_color: 0x202124, opacity: 1., dash: StrokeDash::Solid, cap: StrokeCap::Butt, ctrl: None, center: None }
     }
 
     /// Bezier handles: (handle1, handle2). None slots mean sharp/degenerate.
@@ -102,6 +146,7 @@ impl Segment {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Fill {
     pub segments: Vec<SegmentId>,
+    pub fill_color: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -286,6 +331,10 @@ impl Document {
             end,
             kind: SegmentKind::Line,
             stroke_width,
+            stroke_color: 0x202124,
+            opacity: 1.,
+            dash: StrokeDash::Solid,
+            cap: StrokeCap::Butt,
             ctrl: None,
             center: None,
         });
@@ -306,6 +355,10 @@ impl Document {
             end,
             kind: SegmentKind::Bezier,
             stroke_width: 1.0,
+            stroke_color: 0x202124,
+            opacity: 1.,
+            dash: StrokeDash::Solid,
+            cap: StrokeCap::Round,
             ctrl: Some(handle1),
             center: Some(handle2),
         });
@@ -326,6 +379,10 @@ impl Document {
             end,
             kind: SegmentKind::Arc,
             stroke_width: 0.,
+            stroke_color: 0x202124,
+            opacity: 1.,
+            dash: StrokeDash::Solid,
+            cap: StrokeCap::Round,
             ctrl: Some(ctrl),
             center: Some(center),
         });
@@ -381,12 +438,16 @@ impl Document {
     // -- fills --
 
     pub fn add_fill(&mut self, segments: Vec<SegmentId>) -> FillId {
-        let (idx, generation) = self.fills.insert(Fill { segments });
+        let (idx, generation) = self.fills.insert(Fill { segments, fill_color: 0xD9E2F3 });
         FillId { idx, generation: generation }
     }
 
     pub fn fill(&self, id: FillId) -> Option<&Fill> {
         self.fills.get((id.idx, id.generation))
+    }
+
+    pub fn fill_mut(&mut self, id: FillId) -> Option<&mut Fill> {
+        self.fills.get_mut((id.idx, id.generation))
     }
 
     pub fn remove_fill(&mut self, id: FillId) -> bool {
@@ -658,6 +719,12 @@ impl Document {
         self.dimensions.push(dim);
     }
 
+    pub fn add_modifier(&mut self, modifier: Modifier) { self.modifiers.push(modifier); }
+
+    pub fn remove_modifier(&mut self, index: usize) -> Option<Modifier> {
+        (index < self.modifiers.len()).then(|| self.modifiers.remove(index))
+    }
+
     /// Removes dimensions whose referenced geometry no longer exists, then
     /// points that nothing references anymore (no segment endpoints, no
     /// constraint, no dimension). Called after deletions so a deleted shape
@@ -727,12 +794,12 @@ impl Document {
         center: Option<PointId>,
     ) {
         Self::reserve(&mut self.segments, id.idx, id.generation);
-        self.segments.set_at(id.idx, Segment { start, end, kind, stroke_width, ctrl, center });
+        self.segments.set_at(id.idx, Segment { start, end, kind, stroke_width, stroke_color: 0x202124, opacity: 1., dash: StrokeDash::Solid, cap: StrokeCap::Butt, ctrl, center });
     }
 
     pub fn insert_fill_with_id(&mut self, id: FillId, segments: Vec<SegmentId>) {
         Self::reserve(&mut self.fills, id.idx, id.generation);
-        self.fills.set_at(id.idx, Fill { segments });
+        self.fills.set_at(id.idx, Fill { segments, fill_color: 0xD9E2F3 });
     }
 
     fn reserve<T>(arena: &mut Arena<T>, idx: u32, generation: u32) {

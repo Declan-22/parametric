@@ -16,8 +16,14 @@ pub use camera::Camera;
 pub use snapping::SnapGuide;
 pub use tools::{DimInput, DimPick, PenMode, PendingBezier, PendingCircle, PendingLine, PendingPen, PendingRuler, PendingShape, Tool};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InspectorField { X, Y, Width, Height, Opacity, StrokeHex, FillHex, Dimension(usize) }
+
+#[derive(Clone, Debug)]
+pub struct InspectorInput { pub field: InspectorField, pub value: String }
+
 use crate::core::constraints::{ConstraintKind, DimTarget, ElementRef};
-use crate::core::document::{Document, Layer};
+use crate::core::document::{Document, Layer, StrokeDash};
 use crate::core::geometry::{Point2, Rect};
 use crate::core::ids::{FillId, PointId, SegmentId};
 
@@ -92,6 +98,8 @@ pub struct Editor {
     // Pending shape created by a single click (commit on next click).
     pub pending_via_click: bool,
     pub selection: Vec<ElementRef>,
+    pub inspector_input: Option<InspectorInput>,
+    pub color_picker_open: bool,
     // Elements picked by an active constraint tool before its constraint is
     // committed.
     pub constraint_picks: Vec<ElementRef>,
@@ -228,6 +236,8 @@ impl Editor {
             pen_anchor_id: None,
             pending_via_click: false,
             selection: Vec::new(),
+            inspector_input: None,
+            color_picker_open: false,
             constraint_picks: Vec::new(),
             constraint_point_picks: Vec::new(),
             selected_constraints: Vec::new(),
@@ -323,7 +333,9 @@ impl Editor {
             if mode == PenMode::Bezier
                 && let Some(pb) = pen.bezier.as_mut()
             {
-                pb.h1 = self.pen_mirror_handle();
+                pb.h1 = self
+                    .pen_mirror_handle()
+                    .or_else(|| self.pen_incoming_line_handle());
             }
             pen
         });
@@ -395,6 +407,35 @@ impl Editor {
             }
         }
         fallback
+    }
+
+    /// Default near handle for the first Bezier span after a line. This is
+    /// also used when starting on an existing line, not only while chaining.
+    /// This is only preview/creation state: it does not add a tangent
+    /// constraint and an explicit handle drag can replace it.
+    fn pen_incoming_line_handle(&self) -> Option<Point2> {
+        let anchor = self.pen_anchor?;
+        let (_, _, start, end, distance) = self
+            .doc
+            .all_segments()
+            .filter(|(_, s)| s.kind == crate::core::document::SegmentKind::Line)
+            .filter_map(|(id, line)| {
+                let start = self.doc.point(line.start)?;
+                let end = self.doc.point(line.end)?;
+                let distance = pick::point_segment_distance(anchor, start, end);
+                Some((id, line, start, end, distance))
+            })
+            .min_by(|a, b| a.4.partial_cmp(&b.4).unwrap_or(std::cmp::Ordering::Equal))?;
+        if distance > self.snap_tol_doc() * 2. {
+            return None;
+        }
+        let dx = end.x - start.x;
+        let dy = end.y - start.y;
+        let length = (dx * dx + dy * dy).sqrt();
+        (length > 1e-6).then_some(Point2::new(
+            anchor.x + dx / 3.,
+            anchor.y + dy / 3.,
+        ))
     }
 
     /// Explicit dimension-type lock from the floating menu.
@@ -1793,7 +1834,9 @@ impl Editor {
                 // previous span (a later drag near that side overrides it).
                 let (nat, g) = self.snap_creation_point(at);
                 self.snap_guides = g;
-                let mirror = self.pen_mirror_handle();
+                let mirror = self
+                    .pen_mirror_handle()
+                    .or_else(|| self.pen_incoming_line_handle());
                 pb.p1 = Some(nat);
                 pb.h1 = mirror;
                 pb.h2 = None;
@@ -1820,7 +1863,9 @@ impl Editor {
         };
         self.snap_guides = g;
         self.pen_anchor = Some(nat);
-        let h1 = self.pen_mirror_handle();
+        let h1 = self
+            .pen_mirror_handle()
+            .or_else(|| self.pen_incoming_line_handle());
         self.pending_pen = Some(PendingPen {
             mode: PenMode::Bezier,
             line: None,
@@ -1885,7 +1930,9 @@ impl Editor {
         // Dragged handles win per side (the far drag rides opposite, via
         // `effective`); an untouched near side mirrors the previous span's
         // far handle (smooth joints); otherwise thirds (straight).
-        let mirror = self.pen_mirror_handle();
+        let mirror = self
+            .pen_mirror_handle()
+            .or_else(|| self.pen_incoming_line_handle());
         let c1 = pb.h1.or(mirror).unwrap_or_else(|| lerp(1. / 3.));
         let c2 = pb
             .h2
@@ -4104,6 +4151,161 @@ impl Editor {
 
     pub fn set_snap_to_objects(&mut self, on: bool, cx: &mut gpui::Context<Self>) {
         self.apply_setting(2, on, cx);
+    }
+
+    pub fn begin_inspector_input(&mut self, field: InspectorField, value: impl Into<String>, cx: &mut gpui::Context<Self>) {
+        self.inspector_input = Some(InspectorInput { field, value: value.into() });
+        cx.notify();
+    }
+
+    pub fn toggle_color_picker(&mut self, cx: &mut gpui::Context<Self>) {
+        self.color_picker_open = !self.color_picker_open;
+        cx.notify();
+    }
+
+    pub fn inspector_input_key(&mut self, key: &str, cx: &mut gpui::Context<Self>) -> bool {
+        let Some(input) = self.inspector_input.as_mut() else { return false; };
+        match key {
+            "backspace" => { input.value.pop(); cx.notify(); true }
+            "escape" => { self.inspector_input = None; cx.notify(); true }
+            "enter" => { let input = self.inspector_input.take().unwrap(); self.commit_inspector_input(input.field, &input.value, cx); true }
+            k if k.len() == 1 => { input.value.push_str(k); cx.notify(); true }
+            _ => false,
+        }
+    }
+
+    fn commit_inspector_input(&mut self, field: InspectorField, raw: &str, cx: &mut gpui::Context<Self>) {
+        match field {
+            InspectorField::StrokeHex | InspectorField::FillHex => {
+                let Ok(color) = u32::from_str_radix(raw.trim().trim_start_matches('#'), 16) else { return; };
+                self.history_begin();
+                if field == InspectorField::StrokeHex { for id in self.selection.iter().filter_map(|e| e.as_segment()) { if let Some(s)=self.doc.segment_mut(id) { s.stroke_color=color & 0x00ff_ffff; } } }
+                else { for id in self.selection.iter().filter_map(|e| e.as_fill()) { if let Some(f)=self.doc.fill_mut(id) { f.fill_color=color & 0x00ff_ffff; } } }
+                self.doc_gen += 1; self.flush_pending_history(); cx.notify();
+            }
+            InspectorField::Opacity => if let Ok(v)=raw.parse::<f32>() { self.history_begin(); for id in self.selection.iter().filter_map(|e|e.as_segment()) { if let Some(s)=self.doc.segment_mut(id) { s.opacity=(v/100.).clamp(0.,1.); } } self.doc_gen+=1; self.flush_pending_history(); cx.notify(); },
+            InspectorField::Dimension(i) => if let Ok(v)=raw.parse::<f64>() { if i < self.doc.dimensions.len() { self.history_begin(); if let Some(d)=self.doc.dimensions.get_mut(i) { d.value=v; } self.doc_gen+=1; self.flush_pending_history(); cx.notify(); } },
+            InspectorField::X | InspectorField::Y => if let Ok(v)=raw.parse::<f64>() { let pts=self.doc.selection_points(&self.selection); if let Some(b)=self.doc.bounds_of_points(pts.iter()) { let delta=if field==InspectorField::X { Point2::new(v-b.origin.x,0.) } else { Point2::new(0.,v-b.origin.y) }; self.history_begin(); self.doc.move_points(&pts,delta); self.doc_gen+=1; self.flush_pending_history(); cx.notify(); } },
+            InspectorField::Width => if let Ok(v)=raw.parse::<f64>() { self.inspector_scale_selection(Some(v),None,cx); },
+            InspectorField::Height => if let Ok(v)=raw.parse::<f64>() { self.inspector_scale_selection(None,Some(v),cx); },
+        }
+    }
+
+    /// Small, inspector-friendly mutations. They deliberately operate on
+    /// the current selection so every control remains useful for points,
+    /// segments, and fills without introducing a second selection model.
+    pub fn inspector_nudge(&mut self, dx: f64, dy: f64, cx: &mut gpui::Context<Self>) {
+        let points = self.doc.selection_points(&self.selection);
+        if points.is_empty() { return; }
+        self.history_begin();
+        self.doc.move_points(&points, Point2::new(dx, dy));
+        self.doc_gen += 1;
+        self.flush_pending_history();
+        cx.notify();
+    }
+
+    pub fn inspector_scale_selection(&mut self, width: Option<f64>, height: Option<f64>, cx: &mut gpui::Context<Self>) {
+        let points = self.doc.selection_points(&self.selection);
+        let Some(bounds) = self.doc.bounds_of_points(points.iter()) else { return; };
+        let sx = width.map(|v| if bounds.size.w.abs() < f64::EPSILON { 1. } else { v / bounds.size.w }).unwrap_or(1.);
+        let sy = height.map(|v| if bounds.size.h.abs() < f64::EPSILON { 1. } else { v / bounds.size.h }).unwrap_or(1.);
+        self.history_begin();
+        for id in points { if let Some(p) = self.doc.point(id) { self.doc.move_point(id, Point2::new(bounds.origin.x + (p.x - bounds.origin.x) * sx, bounds.origin.y + (p.y - bounds.origin.y) * sy)); } }
+        self.doc_gen += 1;
+        self.flush_pending_history();
+        cx.notify();
+    }
+
+    pub fn inspector_remove_constraint(&mut self, constraint: crate::core::constraints::Constraint, cx: &mut gpui::Context<Self>) {
+        self.history_begin();
+        self.doc.constraints.retain(|c| *c != constraint);
+        self.selected_constraints.retain(|c| *c != constraint);
+        self.doc_gen += 1;
+        self.flush_pending_history();
+        cx.notify();
+    }
+
+    pub fn inspector_remove_dimension(&mut self, index: usize, cx: &mut gpui::Context<Self>) {
+        if index >= self.doc.dimensions.len() { return; }
+        self.history_begin();
+        self.doc.dimensions.remove(index);
+        self.doc_gen += 1;
+        self.flush_pending_history();
+        cx.notify();
+    }
+
+    pub fn inspector_remove_selected_fills(&mut self, cx: &mut gpui::Context<Self>) {
+        let fills: Vec<_> = self.selection.iter().filter_map(|e| e.as_fill()).collect();
+        if fills.is_empty() { return; }
+        self.history_begin();
+        for id in fills { self.doc.remove_fill(id); }
+        self.selection.retain(|e| !matches!(e, ElementRef::Fill(_)));
+        self.doc_gen += 1;
+        self.flush_pending_history();
+        cx.notify();
+    }
+
+    pub fn inspector_flip(&mut self, horizontal: bool, cx: &mut gpui::Context<Self>) {
+        let points = self.doc.selection_points(&self.selection);
+        let Some(bounds) = self.doc.bounds_of_points(points.iter()) else { return; };
+        let center = if horizontal { bounds.origin.x + bounds.size.w / 2. } else { bounds.origin.y + bounds.size.h / 2. };
+        self.history_begin();
+        for id in points {
+            if let Some(p) = self.doc.point(id) {
+                let to = if horizontal { Point2::new(2. * center - p.x, p.y) } else { Point2::new(p.x, 2. * center - p.y) };
+                self.doc.move_point(id, to);
+            }
+        }
+        self.doc_gen += 1;
+        self.flush_pending_history();
+        cx.notify();
+    }
+
+    pub fn inspector_stroke_width(&mut self, delta: f64, cx: &mut gpui::Context<Self>) {
+        let ids: Vec<_> = self.selection.iter().filter_map(|e| e.as_segment()).collect();
+        if ids.is_empty() { return; }
+        self.history_begin();
+        for id in ids { if let Some(s) = self.doc.segment_mut(id) { s.stroke_width = (s.stroke_width + delta).max(0.25); } }
+        self.doc_gen += 1;
+        self.flush_pending_history();
+        cx.notify();
+    }
+
+    pub fn inspector_cycle_stroke(&mut self, cx: &mut gpui::Context<Self>) {
+        let ids: Vec<_> = self.selection.iter().filter_map(|e| e.as_segment()).collect();
+        if ids.is_empty() { return; }
+        self.history_begin();
+        for id in ids { if let Some(s) = self.doc.segment_mut(id) { s.dash = match s.dash { StrokeDash::Solid => StrokeDash::Dashed, StrokeDash::Dashed => StrokeDash::Solid }; } }
+        self.doc_gen += 1;
+        self.flush_pending_history();
+        cx.notify();
+    }
+
+    pub fn inspector_cycle_color(&mut self, cx: &mut gpui::Context<Self>) {
+        let ids: Vec<_> = self.selection.iter().filter_map(|e| e.as_segment()).collect();
+        if ids.is_empty() { return; }
+        self.history_begin();
+        for id in ids { if let Some(s) = self.doc.segment_mut(id) { s.stroke_color = match s.stroke_color { 0x202124 => 0x2563eb, 0x2563eb => 0xdc2626, _ => 0x202124 }; } }
+        self.doc_gen += 1;
+        self.flush_pending_history();
+        cx.notify();
+    }
+
+    pub fn inspector_set_color(&mut self, color: u32, cx: &mut gpui::Context<Self>) {
+        self.history_begin();
+        for id in self.selection.iter().filter_map(|e| e.as_segment()) { if let Some(s)=self.doc.segment_mut(id) { s.stroke_color=color & 0x00ff_ffff; } }
+        for id in self.selection.iter().filter_map(|e| e.as_fill()) { if let Some(f)=self.doc.fill_mut(id) { f.fill_color=color & 0x00ff_ffff; } }
+        self.doc_gen += 1; self.flush_pending_history(); cx.notify();
+    }
+
+    pub fn inspector_cycle_opacity(&mut self, cx: &mut gpui::Context<Self>) {
+        let ids: Vec<_> = self.selection.iter().filter_map(|e| e.as_segment()).collect();
+        if ids.is_empty() { return; }
+        self.history_begin();
+        for id in ids { if let Some(s) = self.doc.segment_mut(id) { s.opacity = if s.opacity > 0.75 { 0.5 } else if s.opacity > 0.25 { 1.0 } else { 0.5 }; } }
+        self.doc_gen += 1;
+        self.flush_pending_history();
+        cx.notify();
     }
 
     // -- dimension tool --

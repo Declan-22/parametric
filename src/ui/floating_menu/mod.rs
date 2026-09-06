@@ -157,11 +157,6 @@ impl RenderOnce for FloatingMenu {
                         shell.floating_shown = true;
                         shell.floating_anim = 0.0;
                         shell.start_floating_anim(1.0, cx);
-                    } else if shell.floating_parts != parts_key && shell.floating_anim > 0.9 {
-                        // Content changed while fully shown: dip and slide
-                        // back in so the swap reads as motion, not a jump.
-                        shell.floating_anim = 0.35;
-                        shell.start_floating_anim(1.0, cx);
                     }
                     shell.floating_parts = parts_key;
                 } else if shell.floating_shown {
@@ -484,6 +479,7 @@ fn mode_row(
     };
     let shell_hover = shell.clone();
     let key_h = key.clone();
+    let active_shadow = if is_active { vec![t.shadow_sm()] } else { Vec::new() };
     div()
         .id(gpui::SharedString::from(key.clone()))
         .flex()
@@ -507,6 +503,7 @@ fn mode_row(
         } else {
             t.bg_tertiary
         }))
+        .shadow(active_shadow)
         .on_hover(move |hovered, _, cx| {
             let _ = shell_hover.update(cx, |shell, cx| {
                 shell.animate_fade(&key_h, if *hovered { 1.0 } else { 0.0 }, cx);
@@ -572,6 +569,7 @@ fn action_row(
         lerp_rgb(t.bg_tertiary, t.bg_primary, k)
     };
     let shell_hover = shell.clone();
+    let active_shadow = if active { vec![t.shadow_sm()] } else { Vec::new() };
     let key_owned = key.to_string();
     let key_hover = key_owned.clone();
     div()
@@ -597,6 +595,7 @@ fn action_row(
         } else {
             t.bg_tertiary
         }))
+        .shadow(active_shadow)
         .on_hover(move |hovered, _, cx| {
             let _ = shell_hover.update(cx, |shell, cx| {
                 shell.animate_fade(&key_hover, if *hovered { 1.0 } else { 0.0 }, cx);

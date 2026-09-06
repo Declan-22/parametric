@@ -221,6 +221,7 @@ pub fn build_draw_list(
         for &el in &layer.elements {
             match el {
                 ElementRef::Fill(fid) => {
+                    let Some(fill) = doc.fill(fid) else { continue };
                     let Some(pts) = crate::editor::pick::loop_points(doc, fid) else {
                         continue;
                     };
@@ -248,7 +249,7 @@ pub fn build_draw_list(
                     }
                     list.push(Primitive::Polygon {
                         points: pts.iter().map(|&p| scr(p)).collect(),
-                        color,
+                        color: rgb(fill.fill_color).into(),
                     });
                 }
                 ElementRef::Segment(sid) => {
@@ -275,7 +276,7 @@ pub fn build_draw_list(
                             bx,
                             by,
                             width: seg.stroke_width as f32,
-                            color,
+                            color: rgba((seg.stroke_color << 8) | ((seg.opacity.clamp(0., 1.) * 255.) as u32)).into(),
                         });
                     }
                     // Arc segments: sampled polyline of the arc through
@@ -311,7 +312,7 @@ pub fn build_draw_list(
                                 &mut list,
                                 &samples.iter().map(|p| scr(*p)).collect::<Vec<_>>(),
                                 1.5,
-                                color,
+                                rgba((seg.stroke_color << 8) | ((seg.opacity.clamp(0., 1.) * 255.) as u32)).into(),
                             );
                         }
                         // Dashed complement while incomplete — show whenever the

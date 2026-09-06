@@ -75,6 +75,8 @@ impl Database {
                 end_idx INTEGER NOT NULL,
                 end_gen INTEGER NOT NULL,
                 stroke_width REAL NOT NULL DEFAULT 0,
+                stroke_color INTEGER NOT NULL DEFAULT 2105636,
+                opacity REAL NOT NULL DEFAULT 1,
                 ctrl_idx INTEGER,
                 ctrl_gen INTEGER,
                 center_idx INTEGER,
@@ -83,7 +85,8 @@ impl Database {
             CREATE TABLE IF NOT EXISTS fills (
                 idx INTEGER PRIMARY KEY,
                 generation INTEGER NOT NULL,
-                loop_index INTEGER NOT NULL
+                loop_index INTEGER NOT NULL,
+                fill_color INTEGER NOT NULL DEFAULT 14212179
             );
             CREATE TABLE IF NOT EXISTS fill_segments (
                 fill_idx INTEGER NOT NULL,
@@ -119,6 +122,10 @@ impl Database {
                 slide REAL NOT NULL DEFAULT 0
             );",
         )?;
+        // Appearance columns are additive for the prototype database.
+        let _ = self.conn.execute("ALTER TABLE segments ADD COLUMN stroke_color INTEGER NOT NULL DEFAULT 2105636", []);
+        let _ = self.conn.execute("ALTER TABLE segments ADD COLUMN opacity REAL NOT NULL DEFAULT 1", []);
+        let _ = self.conn.execute("ALTER TABLE fills ADD COLUMN fill_color INTEGER NOT NULL DEFAULT 14212179", []);
         // Migrations for documents created before dimension kinds existed.
         // Best-effort: "duplicate column" errors mean it's already there.
         for sql in [
@@ -232,13 +239,17 @@ impl Database {
                         center_gen
                     ],
                 )?;
+                self.conn.execute(
+                    "UPDATE segments SET stroke_color = ?1, opacity = ?2 WHERE idx = ?3 AND generation = ?4",
+                    rusqlite::params![s.stroke_color as i64, s.opacity as f64, sid.idx as i64, sid.generation as i64],
+                )?;
             }
             for (fid, f) in doc.all_fills() {
                 for (i, &seg) in f.segments.iter().enumerate() {
                     if i == 0 {
                         self.conn.execute(
-                            "INSERT INTO fills(idx, generation, loop_index) VALUES(?1, ?2, 0)",
-                            rusqlite::params![fid.idx as i64, fid.generation as i64],
+                            "INSERT INTO fills(idx, generation, loop_index, fill_color) VALUES(?1, ?2, 0, ?3)",
+                            rusqlite::params![fid.idx as i64, fid.generation as i64, f.fill_color as i64],
                         )?;
                     }
                     self.conn.execute(
@@ -407,7 +418,7 @@ impl Database {
         drop(stmt);
 
         let mut stmt = self.conn.prepare(
-            "SELECT idx, generation, kind, start_idx, start_gen, end_idx, end_gen, stroke_width, ctrl_idx, ctrl_gen, center_idx, center_gen
+            "SELECT idx, generation, kind, start_idx, start_gen, end_idx, end_gen, stroke_width, ctrl_idx, ctrl_gen, center_idx, center_gen, stroke_color, opacity
              FROM segments ORDER BY idx",
         )?;
         let mut rows = stmt.query([])?;
@@ -455,27 +466,32 @@ impl Database {
                 ctrl,
                 center,
             );
+            if let Some(s) = doc.segment_mut(SegmentId { idx: row.get::<_, i64>(0)? as u32, generation: row.get::<_, i64>(1)? as u32 }) {
+                s.stroke_color = row.get::<_, i64>(12).unwrap_or(2105636) as u32;
+                s.opacity = row.get::<_, f64>(13).unwrap_or(1.) as f32;
+            }
         }
         drop(rows);
         drop(stmt);
 
         // Fills: gather segment lists grouped by fill slot.
-        let mut fills: Vec<(u32, u32, Vec<SegmentId>)> = Vec::new();
+        let mut fills: Vec<(u32, u32, u32, Vec<SegmentId>)> = Vec::new();
         let mut stmt = self.conn.prepare(
-            "SELECT f.idx, f.generation, fs.seg_idx, fs.seg_gen
+            "SELECT f.idx, f.generation, f.fill_color, fs.seg_idx, fs.seg_gen
              FROM fills f JOIN fill_segments fs ON fs.fill_idx = f.idx
              ORDER BY f.idx, fs.loop_index",
         )?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let (idx, generation): (i64, i64) = (row.get(0)?, row.get(1)?);
+            let fill_color = row.get::<_, i64>(2).unwrap_or(14212179) as u32;
             let seg = SegmentId {
-                idx: row.get::<_, i64>(2)? as u32,
-                generation: row.get::<_, i64>(3)? as u32,
+                idx: row.get::<_, i64>(3)? as u32,
+                generation: row.get::<_, i64>(4)? as u32,
             };
-            match fills.iter_mut().find(|(fi, fg, _)| *fi == idx as u32 && *fg == generation as u32) {
-                Some((_, _, segs)) => segs.push(seg),
-                None => fills.push((idx as u32, generation as u32, vec![seg])),
+            match fills.iter_mut().find(|(fi, fg, _, _)| *fi == idx as u32 && *fg == generation as u32) {
+                Some((_, _, _, segs)) => segs.push(seg),
+                None => fills.push((idx as u32, generation as u32, fill_color, vec![seg])),
             }
         }
         drop(rows);
@@ -672,9 +688,10 @@ fn insert_segment_raw(
     doc.insert_segment_with_id(id, start, end, kind, stroke_width, ctrl, center);
 }
 
-fn insert_fills_raw(doc: &mut Document, fills: Vec<(u32, u32, Vec<SegmentId>)>) {
-    for (idx, generation, segs) in fills {
+fn insert_fills_raw(doc: &mut Document, fills: Vec<(u32, u32, u32, Vec<SegmentId>)>) {
+    for (idx, generation, fill_color, segs) in fills {
         doc.insert_fill_with_id(FillId { idx, generation: generation }, segs);
+        if let Some(fill) = doc.fill_mut(FillId { idx, generation }) { fill.fill_color = fill_color; }
     }
 }
 

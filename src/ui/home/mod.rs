@@ -199,11 +199,41 @@ impl RenderOnce for DesignCard {
                             color,
                         ));
                     }
-                    paint::Primitive::Polygon { .. } => {}
-                    paint::Primitive::Line { .. } => {}
+                    paint::Primitive::Polygon { points, color } => {
+                        if points.len() < 3 { continue; }
+                        let to_px = |(x, y): (f32, f32)| Point { x: px(x) + ox, y: px(y) + oy };
+                        let mut path = gpui::Path::new(to_px(points[0]));
+                        for &point in &points[1..] { path.line_to(to_px(point)); }
+                        path.line_to(to_px(points[0]));
+                        window.paint_path(path, color);
+                    }
+                    paint::Primitive::Line { ax, ay, bx, by, width, color } => {
+                        let (dx, dy) = (bx - ax, by - ay);
+                        let len = (dx * dx + dy * dy).sqrt();
+                        if len < 1e-3 { continue; }
+                        let (nx, ny) = (-dy / len * width / 2., dx / len * width / 2.);
+                        let mut path = gpui::Path::new(Point { x: px(ax + nx) + ox, y: px(ay + ny) + oy });
+                        path.line_to(Point { x: px(bx + nx) + ox, y: px(by + ny) + oy });
+                        path.line_to(Point { x: px(bx - nx) + ox, y: px(by - ny) + oy });
+                        path.line_to(Point { x: px(ax - nx) + ox, y: px(ay - ny) + oy });
+                        path.line_to(Point { x: px(ax + nx) + ox, y: px(ay + ny) + oy });
+                        window.paint_path(path, color);
+                    }
+                    paint::Primitive::Circle { cx, cy, radius } => {
+                        let r = px(radius);
+                        window.paint_quad(gpui::quad(Bounds { origin: Point { x: px(cx) - r + ox, y: px(cy) - r + oy }, size: Size { width: r * 2., height: r * 2. } }, px(3.), rgb(0xffffff), gpui::Edges::all(px(1.)), rgb(0x777777), gpui::BorderStyle::Solid));
+                    }
+                    paint::Primitive::Diamond { cx, cy, radius } => {
+                        let mut path = gpui::Path::new(Point { x: px(cx) + ox, y: px(cy - radius) + oy });
+                        path.line_to(Point { x: px(cx + radius) + ox, y: px(cy) + oy });
+                        path.line_to(Point { x: px(cx) + ox, y: px(cy + radius) + oy });
+                        path.line_to(Point { x: px(cx - radius) + ox, y: px(cy) + oy });
+                        path.line_to(Point { x: px(cx) + ox, y: px(cy - radius) + oy });
+                        window.paint_path(path, rgb(0x777777));
+                    }
+                    // Selection-only geometry is intentionally omitted from
+                    // gallery previews.
                     paint::Primitive::Outline { .. } => {}
-                    paint::Primitive::Circle { .. } => {}
-                    paint::Primitive::Diamond { .. } => {}
                     paint::Primitive::RulerLabel { .. } => {}
                 }
             }

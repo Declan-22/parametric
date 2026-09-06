@@ -111,10 +111,37 @@ enum Eq {
     // flip that already happened. Deliberate large drags can still invert.
     ArcBend { s: usize, e: usize, c: usize },
     Tangent { l1: usize, l2: usize, o: usize, p: usize },
+    // Residual: cross(line_dir, contact-handle)/mean_len — a line tangent
+    // to a BEZIER at the contact endpoint (handle = the contact's near
+    // handle). Same form as Parallel, different segment pairing.
+    LineBezierTangent { l1: usize, l2: usize, h: usize, p: usize },
+    // Residual: 12-sample polyline arc-length of the cubic - target.
+    BezierLength { p0: usize, c1: usize, c2: usize, p1: usize, target: f64 },
+    // Residual: midpoint span between two edges minus target. axis 0/1 =
+    // signed X/Y span (target carries the placed side); axis 2 = straight
+    // |midB-midA| distance. Linear ±0.5 weights except the normalized case.
+    MidSpan { a1: usize, a2: usize, b1: usize, b2: usize, axis: u8, target: f64 },
     CirclePoint { p: usize, o: usize, radius: f64 },
     Parallel { a1: usize, a2: usize, b1: usize, b2: usize },
     Perpendicular { a1: usize, a2: usize, b1: usize, b2: usize },
 }
+
+/// Cubic Bernstein weights at t.
+fn bernstein(t: f64) -> [f64; 4] {
+    let u = 1. - t;
+    [u * u * u, 3. * u * u * t, 3. * u * t * t, t * t * t]
+}
+
+/// Cubic point from four control positions at t.
+fn ctrl_point(ctrl: &[Point2; 4], t: f64) -> Point2 {
+    let w = bernstein(t);
+    Point2::new(
+        w[0] * ctrl[0].x + w[1] * ctrl[1].x + w[2] * ctrl[2].x + w[3] * ctrl[3].x,
+        w[0] * ctrl[0].y + w[1] * ctrl[1].y + w[2] * ctrl[2].y + w[3] * ctrl[3].y,
+    )
+}
+
+const BEZ_SAMPLES: usize = 12;
 
 // A residual evaluated at one iterate: value plus sparse gradient over
 // FREE variable indices.
@@ -202,27 +229,96 @@ impl Solver {
                     }
                 }
                 ConstraintKind::Tangent => {
+                    use crate::core::document::SegmentKind as SK;
+                    // Order-independent: classify by kind, not by position
+                    // in the pair (pen chains store them in either order).
                     let inferred = || {
-                        let mut line = None; let mut arc = None;
+                        let mut line = None;
+                        let mut curve = None;
                         for (sid, s) in doc.all_segments() {
-                            if s.start != c.a && s.end != c.a { continue; }
-                            if s.kind == crate::core::document::SegmentKind::Line { line = Some(sid); }
-                            if s.kind == crate::core::document::SegmentKind::Arc { arc = Some(sid); }
+                            if s.start != c.a && s.end != c.a {
+                                continue;
+                            }
+                            if s.kind == SK::Line && line.is_none() {
+                                line = Some(sid);
+                            } else if matches!(s.kind, SK::Arc | SK::Bezier) && curve.is_none() {
+                                curve = Some(sid);
+                            }
                         }
-                        line.zip(arc)
+                        line.zip(curve)
                     };
-                    let Some((line_id, arc_id)) = c.tangent_segments.or_else(inferred) else { continue };
-                    let (Some(line), Some(arc)) = (doc.segment(line_id), doc.segment(arc_id)) else { continue };
-                    let (Some(l1), Some(l2), Some(o), Some(p)) = (
-                        slot_of(line.start), slot_of(line.end), arc.center.and_then(|id| slot_of(id)), slot_of(c.a)) else { continue };
-                    eqs.push(Eq::Tangent { l1, l2, o, p });
-                    if let (Some(center_id), Some(contact)) = (arc.center, doc.point(c.a))
-                        && let Some(center) = doc.point(center_id)
-                    {
-                        let radius = ((contact.x - center.x).powi(2) + (contact.y - center.y).powi(2)).sqrt();
-                        if radius > 1e-9 {
-                            eqs.push(Eq::CirclePoint { p, o, radius });
+                    let Some((first_id, second_id)) = c.tangent_segments.or_else(inferred) else {
+                        continue;
+                    };
+                    let (Some(first), Some(second)) =
+                        (doc.segment(first_id), doc.segment(second_id))
+                    else {
+                        continue;
+                    };
+                    // (line, curve) in either order.
+                    let (line_id, curve_id, line, curve) = match (first.kind, second.kind) {
+                        (SK::Line, SK::Arc) | (SK::Line, SK::Bezier) => {
+                            (first_id, second_id, first, second)
                         }
+                        (SK::Arc, SK::Line) | (SK::Bezier, SK::Line) => {
+                            (second_id, first_id, second, first)
+                        }
+                        _ => continue,
+                    };
+                    let (Some(l1), Some(l2)) = (slot_of(line.start), slot_of(line.end)) else {
+                        continue;
+                    };
+                    let _ = line_id;
+                    if curve.kind == SK::Arc {
+                        let (Some(o), Some(p)) = (
+                            curve.center.and_then(|id| slot_of(id)),
+                            slot_of(c.a),
+                        ) else {
+                            continue;
+                        };
+                        eqs.push(Eq::Tangent { l1, l2, o, p });
+                        if let (Some(center_id), Some(contact)) = (curve.center, doc.point(c.a))
+                            && let Some(center) = doc.point(center_id)
+                        {
+                            let radius = ((contact.x - center.x).powi(2) + (contact.y - center.y).powi(2)).sqrt();
+                            if radius > 1e-9 {
+                                eqs.push(Eq::CirclePoint { p, o, radius });
+                            }
+                        }
+                    } else {
+                        // Bezier: the contact must be an endpoint; the
+                        // equation constrains the line against that end's
+                        // near handle (true G1 at the joint).
+                        let handle = if curve.start == c.a {
+                            curve.ctrl
+                        } else if curve.end == c.a {
+                            curve.center
+                        } else {
+                            // Unmerged joint: nearest endpoint's handle.
+                            let (Some(sp), Some(ep)) = (
+                                doc.point(curve.start),
+                                doc.point(curve.end),
+                            ) else {
+                                continue;
+                            };
+                            let Some(cp) = doc.point(c.a) else {
+                                continue;
+                            };
+                            let ds = (cp.x - sp.x).powi(2) + (cp.y - sp.y).powi(2);
+                            let de = (cp.x - ep.x).powi(2) + (cp.y - ep.y).powi(2);
+                            if ds <= de {
+                                curve.ctrl
+                            } else {
+                                curve.center
+                            }
+                        };
+                        let (Some(h), Some(p)) =
+                            (handle.and_then(|id| slot_of(id)), slot_of(c.a))
+                        else {
+                            continue;
+                        };
+                        eqs.push(Eq::LineBezierTangent { l1, l2, h, p });
+                        let _ = curve_id;
                     }
                 }
                 ConstraintKind::Parallel => {
@@ -340,6 +436,53 @@ impl Solver {
                     let signed = (b1p.x - a1p.x) * (-dy / l) + (b1p.y - a1p.y) * (dx / l);
                     eqs.push(Eq::LineDist { a1, a2, b1, target: signed.signum() * d.value });
                 }
+                DimTarget::EdgeMid { a, b, mode } => {
+                    // Midpoint span between two edges: X/Y width/height or
+                    // straight displacement between chord midpoints. Linear
+                    // in the four endpoints (±0.5 weights), except the
+                    // straight case which normalizes like Distance.
+                    let Some(sega) = doc.segment(*a) else { continue };
+                    let Some(segb) = doc.segment(*b) else { continue };
+                    let (Some(a1), Some(a2), Some(b1), Some(b2)) = (
+                        slot_of(sega.start),
+                        slot_of(sega.end),
+                        slot_of(segb.start),
+                        slot_of(segb.end),
+                    ) else {
+                        continue;
+                    };
+                    let axis = match mode {
+                        crate::core::constraints::DimMode::X => 0,
+                        crate::core::constraints::DimMode::Y => 1,
+                        crate::core::constraints::DimMode::Aligned => 2,
+                    };
+                    // Width/height keep the placed side; displacement uses
+                    // the absolute span like a Distance.
+                    let target = match mode {
+                        crate::core::constraints::DimMode::Aligned => d.value.abs(),
+                        _ => {
+                            let (Some(a1p), Some(a2p), Some(b1p), Some(b2p)) = (
+                                doc.point(sega.start),
+                                doc.point(sega.end),
+                                doc.point(segb.start),
+                                doc.point(segb.end),
+                            ) else {
+                                continue;
+                            };
+                            let (mxa, mya) = (
+                                (a1p.x + a2p.x) / 2.,
+                                (a1p.y + a2p.y) / 2.,
+                            );
+                            let (mxb, myb) = (
+                                (b1p.x + b2p.x) / 2.,
+                                (b1p.y + b2p.y) / 2.,
+                            );
+                            let cur = if axis == 0 { mxb - mxa } else { myb - mya };
+                            cur.signum() * d.value.abs()
+                        }
+                    };
+                    eqs.push(Eq::MidSpan { a1, a2, b1, b2, axis, target });
+                }
                 DimTarget::Radius { seg } => {
                     // Radius constraint: circumradius of the arc's defining
                     // triangle equals the placed value.
@@ -353,6 +496,34 @@ impl Solver {
                     eqs.push(Eq::Distance { a: o, b: s, target: d.value.abs() });
                     eqs.push(Eq::Distance { a: o, b: e, target: d.value.abs() });
                     eqs.push(Eq::Distance { a: o, b: cc, target: d.value.abs() });
+                }
+                DimTarget::CurveLength { seg } => {
+                    // Bezier-only arc-length: a real equation over the
+                    // span's four points (12-sample polyline), so the
+                    // length genuinely constrains drags and edits — not
+                    // just the one-shot exact post-pass.
+                    let Some(seg_d) = doc.segment(*seg) else {
+                        continue;
+                    };
+                    if seg_d.kind != crate::core::document::SegmentKind::Bezier {
+                        continue;
+                    }
+                    let (h1, h2) = (seg_d.ctrl, seg_d.center);
+                    let (Some(p0), Some(c1), Some(c2), Some(p1)) = (
+                        slot_of(seg_d.start),
+                        h1.and_then(|id| slot_of(id)),
+                        h2.and_then(|id| slot_of(id)),
+                        slot_of(seg_d.end),
+                    ) else {
+                        continue;
+                    };
+                    eqs.push(Eq::BezierLength {
+                        p0,
+                        c1,
+                        c2,
+                        p1,
+                        target: d.value.abs(),
+                    });
                 }
                 DimTarget::Angle { a, b } => {
                     let Some(sega) = doc.segment(*a) else { continue };
@@ -589,14 +760,33 @@ impl Solver {
         for c in &doc.constraints {
             let (ids, touched) = match c.kind {
                 crate::core::constraints::ConstraintKind::Tangent => {
-                    let Some((line_id, arc_id)) = c.tangent_segments else { continue };
-                    let (Some(line), Some(arc)) = (doc.segment(line_id), doc.segment(arc_id)) else { continue };
+                    use crate::core::document::SegmentKind as SK;
+                    let Some((first_id, second_id)) = c.tangent_segments else { continue };
+                    let (Some(first), Some(second)) =
+                        (doc.segment(first_id), doc.segment(second_id))
+                    else {
+                        continue;
+                    };
+                    let (line, curve) = match (first.kind, second.kind) {
+                        (SK::Line, SK::Arc) | (SK::Line, SK::Bezier) => (first, second),
+                        (SK::Arc, SK::Line) | (SK::Bezier, SK::Line) => (second, first),
+                        _ => continue,
+                    };
                     let mut v = vec![line.start, line.end, c.a, c.b];
-                    v.push(arc.start);
-                    v.push(arc.end);
-                    if let Some(id) = arc.ctrl { v.push(id); }
-                    if let Some(id) = arc.center { v.push(id); }
+                    v.push(curve.start);
+                    v.push(curve.end);
+                    if let Some(id) = curve.ctrl {
+                        v.push(id);
+                    }
+                    if let Some(id) = curve.center {
+                        v.push(id);
+                    }
                     let touched = drag.iter().any(|(id, _)| v.contains(id));
+                    // Free the LINE's far endpoints only, so tangency
+                    // resolves by line rotation. Bezier handles stay put:
+                    // freeing them lets the solver swing the curve onto
+                    // the other tangent branch (the "flip") instead of
+                    // rotating the line.
                     (vec![line.start, line.end], touched)
                 }
                 crate::core::constraints::ConstraintKind::Parallel => {
@@ -633,11 +823,14 @@ impl Solver {
                     Eq::LineDist { a1, a2, b1, .. } => [a1, a2, b1, usize::MAX],
                     Eq::Angle { a1, a2, b1, b2, .. }
                     | Eq::Parallel { a1, a2, b1, b2 }
-                    | Eq::Perpendicular { a1, a2, b1, b2 } => [a1, a2, b1, b2],
+                    | Eq::Perpendicular { a1, a2, b1, b2 }
+                    | Eq::MidSpan { a1, a2, b1, b2, .. } => [a1, a2, b1, b2],
                     Eq::ArcRadius { s, e, c, .. }
                     | Eq::ArcBend { s, e, c } => [s, e, c, usize::MAX],
                     Eq::EqualRadius { o, a, b } => [o, a, b, usize::MAX],
                     Eq::Tangent { l1, l2, o, p } => [l1, l2, o, p],
+                    Eq::LineBezierTangent { l1, l2, h, p } => [l1, l2, h, p],
+                    Eq::BezierLength { p0, c1, c2, p1, .. } => [p0, c1, c2, p1],
                     Eq::CirclePoint { p, o, .. } => [p, o, usize::MAX, usize::MAX],
                 };
                 slots.iter().any(|&slot| {
@@ -759,9 +952,12 @@ impl Solver {
             Eq::EqualRadius { o, a, b } => [o, a, b, usize::MAX],
             Eq::ArcBend { s, e, c } => [s, e, c, usize::MAX],
             Eq::Tangent { l1, l2, o, p } => [l1, l2, o, p],
+            Eq::LineBezierTangent { l1, l2, h, p } => [l1, l2, h, p],
+            Eq::BezierLength { p0, c1, c2, p1, .. } => [p0, c1, c2, p1],
             Eq::CirclePoint { p, o, .. } => [p, o, usize::MAX, usize::MAX],
             Eq::Parallel { a1, a2, b1, b2 }
-            | Eq::Perpendicular { a1, a2, b1, b2 } => [a1, a2, b1, b2],
+            | Eq::Perpendicular { a1, a2, b1, b2 }
+            | Eq::MidSpan { a1, a2, b1, b2, .. } => [a1, a2, b1, b2],
         };
         slots
             .iter()
@@ -837,6 +1033,51 @@ impl Solver {
                         grad.push((v * 2 + 1, 1.0));
                     }
                     out.push(Residual { value: pb.y - pa.y - target, grad, weight: DIM_WEIGHT });
+                }
+                Eq::MidSpan { a1, a2, b1, b2, axis, target } => {
+                    let (pa1, pa2, pb1, pb2) =
+                        (self.pos(a1, x), self.pos(a2, x), self.pos(b1, x), self.pos(b2, x));
+                    let (mxa, mya) = ((pa1.x + pa2.x) / 2., (pa1.y + pa2.y) / 2.);
+                    let (mxb, myb) = ((pb1.x + pb2.x) / 2., (pb1.y + pb2.y) / 2.);
+                    let mut grad = Vec::new();
+                    // d(midB-midA)/d(each endpoint) = ±0.5 per axis.
+                    let push = |grad: &mut Vec<(usize, f64)>, slot: usize, gx: f64, gy: f64| {
+                        if let Some(v) = self.free_of[slot] {
+                            grad.push((v * 2, gx));
+                            grad.push((v * 2 + 1, gy));
+                        }
+                    };
+                    match axis {
+                        0 => {
+                            // value is (midB-midA)-target: a-slots -0.5,
+                            // b-slots +0.5 on x.
+                            push(&mut grad, a1, -0.5, 0.0);
+                            push(&mut grad, a2, -0.5, 0.0);
+                            push(&mut grad, b1, 0.5, 0.0);
+                            push(&mut grad, b2, 0.5, 0.0);
+                            out.push(Residual { value: mxb - mxa - target, grad, weight: DIM_WEIGHT });
+                        }
+                        1 => {
+                            let mut g = Vec::new();
+                            push(&mut g, a1, 0.0, -0.5);
+                            push(&mut g, a2, 0.0, -0.5);
+                            push(&mut g, b1, 0.0, 0.5);
+                            push(&mut g, b2, 0.0, 0.5);
+                            out.push(Residual { value: myb - mya - target, grad: g, weight: DIM_WEIGHT });
+                        }
+                        _ => {
+                            let dx = mxb - mxa;
+                            let dy = myb - mya;
+                            let len = (dx * dx + dy * dy).sqrt().max(1e-9);
+                            let (ux, uy) = (dx / len, dy / len);
+                            let mut g = Vec::new();
+                            push(&mut g, a1, -0.5 * ux, -0.5 * uy);
+                            push(&mut g, a2, -0.5 * ux, -0.5 * uy);
+                            push(&mut g, b1, 0.5 * ux, 0.5 * uy);
+                            push(&mut g, b2, 0.5 * ux, 0.5 * uy);
+                            out.push(Residual { value: len - target, grad: g, weight: DIM_WEIGHT });
+                        }
+                    }
                 }
                 Eq::PointLineDist { p, l1, l2, target } => {
                     let (pp, pl1, pl2) = (self.pos(p, x), self.pos(l1, x), self.pos(l2, x));
@@ -1065,6 +1306,76 @@ impl Solver {
                     if let Some(i) = self.free_of[b1] { grad.push((i * 2, -dvx)); grad.push((i * 2 + 1, -dvy)); }
                     if let Some(i) = self.free_of[b2] { grad.push((i * 2, dvx)); grad.push((i * 2 + 1, dvy)); }
                     out.push(Residual { value, grad, weight: EQ_WEIGHT });
+                }
+                Eq::LineBezierTangent { l1, l2, h, p } => {
+                    // Line direction crossed with the bezier's end-handle
+                    // direction (contact -> its near handle), over the
+                    // mean length: zero exactly at G1. Same form as
+                    // Parallel with segments (l1->l2) and (h->p).
+                    let (a, b, c, d) = (self.pos(l1, x), self.pos(l2, x), self.pos(h, x), self.pos(p, x));
+                    let ux = b.x - a.x; let uy = b.y - a.y;
+                    let vx = d.x - c.x; let vy = d.y - c.y;
+                    let lu = (ux * ux + uy * uy).sqrt().max(1e-9);
+                    let lv = (vx * vx + vy * vy).sqrt().max(1e-9);
+                    let m = ((lu + lv) / 2.).max(1e-9);
+                    let cross = ux * vy - uy * vx;
+                    let value = cross / m;
+                    let dux = vy / m - cross * ux / (2. * lu * m * m);
+                    let duy = -vx / m - cross * uy / (2. * lu * m * m);
+                    let dvx = -uy / m - cross * vx / (2. * lv * m * m);
+                    let dvy = ux / m - cross * vy / (2. * lv * m * m);
+                    let mut grad = Vec::new();
+                    if let Some(i) = self.free_of[l1] { grad.push((i * 2, -dux)); grad.push((i * 2 + 1, -duy)); }
+                    if let Some(i) = self.free_of[l2] { grad.push((i * 2, dux)); grad.push((i * 2 + 1, duy)); }
+                    if let Some(i) = self.free_of[h] { grad.push((i * 2, -dvx)); grad.push((i * 2 + 1, -dvy)); }
+                    if let Some(i) = self.free_of[p] { grad.push((i * 2, dvx)); grad.push((i * 2 + 1, dvy)); }
+                    out.push(Residual { value, grad, weight: EQ_WEIGHT });
+                }
+                Eq::BezierLength { p0, c1, c2, p1, target } => {
+                    // 12-sample polyline arc-length minus target. Gradient
+                    // chains polyline-segment derivatives through the
+                    // Bernstein weights onto the four control points.
+                    let ctrl = [self.pos(p0, x), self.pos(c1, x), self.pos(c2, x), self.pos(p1, x)];
+                    let n = BEZ_SAMPLES;
+                    let mut samp = Vec::with_capacity(n + 1);
+                    let mut wts = Vec::with_capacity(n + 1);
+                    for k in 0..=n {
+                        let t = k as f64 / n as f64;
+                        let w = bernstein(t);
+                        wts.push(w);
+                        samp.push(Point2::new(
+                            w[0] * ctrl[0].x + w[1] * ctrl[1].x + w[2] * ctrl[2].x + w[3] * ctrl[3].x,
+                            w[0] * ctrl[0].y + w[1] * ctrl[1].y + w[2] * ctrl[2].y + w[3] * ctrl[3].y,
+                        ));
+                    }
+                    // dL/d sample j (polyline vertex derivatives).
+                    let mut dlen = vec![(0.0f64, 0.0f64); n + 1];
+                    let mut len = 0.0;
+                    for k in 0..n {
+                        let dx = samp[k + 1].x - samp[k].x;
+                        let dy = samp[k + 1].y - samp[k].y;
+                        let l = (dx * dx + dy * dy).sqrt().max(1e-9);
+                        len += l;
+                        let (ux, uy) = (dx / l, dy / l);
+                        dlen[k].0 -= ux;
+                        dlen[k].1 -= uy;
+                        dlen[k + 1].0 += ux;
+                        dlen[k + 1].1 += uy;
+                    }
+                    let slots = [p0, c1, c2, p1];
+                    let mut grad = Vec::new();
+                    for (i, &slot) in slots.iter().enumerate() {
+                        if let Some(v) = self.free_of[slot] {
+                            let (mut gx, mut gy) = (0.0, 0.0);
+                            for (k, w) in wts.iter().enumerate() {
+                                gx += w[i] * dlen[k].0;
+                                gy += w[i] * dlen[k].1;
+                            }
+                            grad.push((v * 2, gx));
+                            grad.push((v * 2 + 1, gy));
+                        }
+                    }
+                    out.push(Residual { value: len - target, grad, weight: DIM_WEIGHT });
                 }
                 Eq::Perpendicular { a1, a2, b1, b2 } => {
                     // Normalized dot product: zero exactly when the two
@@ -1455,6 +1766,30 @@ impl Solver {
                     lin = lin.max(v);
                     continue;
                 }
+                Eq::LineBezierTangent { l1, l2, h, p } => {
+                    let (a, b, c, d) = (self.pos(l1, x), self.pos(l2, x), self.pos(h, x), self.pos(p, x));
+                    let ux = b.x - a.x;
+                    let uy = b.y - a.y;
+                    let vx = d.x - c.x;
+                    let vy = d.y - c.y;
+                    let lu = (ux * ux + uy * uy).sqrt().max(1e-9);
+                    let lv = (vx * vx + vy * vy).sqrt().max(1e-9);
+                    let m = ((lu + lv) / 2.).max(1e-9);
+                    lin = lin.max((ux * vy - uy * vx).abs() / m);
+                    continue;
+                }
+                Eq::BezierLength { p0, c1, c2, p1, target } => {
+                    let ctrl = [self.pos(p0, x), self.pos(c1, x), self.pos(c2, x), self.pos(p1, x)];
+                    let mut len = 0.0;
+                    let mut prev = ctrl_point(&ctrl, 0.0);
+                    for k in 1..=BEZ_SAMPLES {
+                        let s = ctrl_point(&ctrl, k as f64 / BEZ_SAMPLES as f64);
+                        len += ((s.x - prev.x).powi(2) + (s.y - prev.y).powi(2)).sqrt();
+                        prev = s;
+                    }
+                    lin = lin.max((len - target).abs());
+                    continue;
+                }
                 Eq::Perpendicular { a1, a2, b1, b2 } => {
                     let (a, b, c, d) = (self.pos(a1, x), self.pos(a2, x), self.pos(b1, x), self.pos(b2, x));
                     let ux = b.x - a.x;
@@ -1482,6 +1817,18 @@ impl Solver {
                     let lv = (vx * vx + vy * vy).sqrt().max(1e-9);
                     let m = ((lu + lv) / 2.).max(1e-9);
                     let v = (ux * vy - uy * vx).abs() / m;
+                    lin = lin.max(v);
+                    continue;
+                }
+                Eq::MidSpan { a1, a2, b1, b2, axis, target } => {
+                    let (a, b, c, d) = (self.pos(a1, x), self.pos(a2, x), self.pos(b1, x), self.pos(b2, x));
+                    let (mxa, mya) = ((a.x + b.x) / 2., (a.y + b.y) / 2.);
+                    let (mxb, myb) = ((c.x + d.x) / 2., (c.y + d.y) / 2.);
+                    let v = match axis {
+                        0 => (mxb - mxa - target).abs(),
+                        1 => (myb - mya - target).abs(),
+                        _ => (((mxb - mxa).powi(2) + (myb - mya).powi(2)).sqrt() - target).abs(),
+                    };
                     lin = lin.max(v);
                     continue;
                 }

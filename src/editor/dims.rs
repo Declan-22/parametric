@@ -84,9 +84,28 @@ pub struct AngleDimRender {
     pub editing: bool,
 }
 
+/// Screen-space render data for one CURVE-LENGTH dimension (bezier-only):
+/// the offset replica of the exact curve path as a screen polyline, with
+/// the value container riding on it at the placed arclength fraction.
+#[derive(Clone, Debug)]
+pub struct CurveDimRender {
+    pub pts: Vec<[f32; 2]>,
+    /// Offset dashed stubs clamping the replica to the real curve
+    /// endpoints: (replica_end -> curve_end) in screen px.
+    pub stubs: Vec<[f32; 4]>,
+    pub label_cx: f32,
+    pub label_cy: f32,
+    pub text: String,
+    pub constraint: bool,
+    pub dim_index: Option<usize>,
+    pub hovered: bool,
+    pub editing: bool,
+}
+
 pub fn update(ed: &mut Editor) {
     ed.dim_renders.clear();
     ed.angle_dim_renders.clear();
+    ed.curve_dim_renders.clear();
 
     // Ruler interactions suppress dims entirely (labels are part of the
     // ruler's own vector rendering in paint).
@@ -117,9 +136,15 @@ pub fn update(ed: &mut Editor) {
                 .or_else(|| ed.doc.point(pid))
         };
         let mut edges: Vec<(Point2, Point2, Option<Point2>)> = Vec::new();
+        // Curve spans (arc/bezier) whose endpoints are dragged get a
+        // transient arc-length replica (see the curve block below); skip
+        // them here so they don't also emit a chord dim.
+        let _dragged_ids: std::collections::HashSet<_> =
+            drag.points.iter().map(|(id, _)| *id).collect();
         for (sid, seg) in ed.doc.all_segments() {
             if seg.kind == crate::core::document::SegmentKind::Ruler
                 || seg.kind == crate::core::document::SegmentKind::Arc
+                || seg.kind == crate::core::document::SegmentKind::Bezier
             {
                 continue;
             }
@@ -196,6 +221,99 @@ pub fn update(ed: &mut Editor) {
                     &ed.doc, &ed.camera, center, c, 0., r,
                 ));
             }
+        }
+    }
+
+    // Curve-length resize (BEZIER ONLY): dragging endpoints/handles of a
+    // bezier shows a transient offset replica of the EXACT curve with the
+    // live arc-length — the same role the slanted chord dim plays for
+    // lines. Suppressed when a stored CurveLength dim owns the annotation.
+    // Arcs never show this (they keep the radius dim above).
+    if let Some(drag) = &ed.dragging {
+        let dragged: std::collections::HashSet<_> =
+            drag.points.iter().map(|(id, _)| *id).collect();
+        // Gesture-start lengths for the >0.5 change gate.
+        let mut starts: Vec<(crate::core::ids::PointId, Point2)> = drag.points.clone();
+        for &(pid, s) in &drag.aux {
+            if !starts.iter().any(|&(id, _)| id == pid) {
+                starts.push((pid, s));
+            }
+        }
+        let start_of = |pid: crate::core::ids::PointId| -> Option<Point2> {
+            starts
+                .iter()
+                .find(|&&(id, _)| id == pid)
+                .map(|&(_, s)| s)
+                .or_else(|| ed.doc.point(pid))
+        };
+        for (seg_id, seg) in ed.doc.all_segments() {
+            if seg.kind != crate::core::document::SegmentKind::Bezier {
+                continue;
+            }
+            if ed.doc.dimensions.iter().any(|d| {
+                matches!(
+                    d.target,
+                    crate::core::constraints::DimTarget::CurveLength { seg: sid } if sid == seg_id
+                )
+            }) {
+                continue;
+            }
+            let members = [
+                Some(seg.start),
+                Some(seg.end),
+                seg.ctrl,
+                seg.center,
+            ];
+            if !members.into_iter().flatten().any(|p| dragged.contains(&p)) {
+                continue;
+            }
+            // Start vs current arc-length of the EXACT curve.
+            let bez = |p0: Point2, c1: Point2, c2: Point2, p1: Point2| {
+                crate::editor::bezier::samples(p0, c1, c2, p1, 48)
+            };
+            let (h1, h2) = seg.bezier_handles();
+            let (Some(p0), Some(c1), Some(c2), Some(p1)) = (
+                ed.doc.point(seg.start),
+                h1.and_then(|id| ed.doc.point(id)),
+                h2.and_then(|id| ed.doc.point(id)),
+                ed.doc.point(seg.end),
+            ) else {
+                continue;
+            };
+            let cur_pts = bez(p0, c1, c2, p1);
+            let cur_len: f64 =
+                cur_pts.windows(2).map(|w| pick::distance(w[0], w[1])).sum();
+            let (Some(s0), Some(s1), Some(s2), Some(s3)) = (
+                start_of(seg.start),
+                h1.and_then(|id| start_of(id)),
+                h2.and_then(|id| start_of(id)),
+                start_of(seg.end),
+            ) else {
+                continue;
+            };
+            let start_pts = bez(s0, s1, s2, s3);
+            let start_len: f64 =
+                start_pts.windows(2).map(|w| pick::distance(w[0], w[1])).sum();
+            if (cur_len - start_len).abs() <= 0.5 {
+                continue;
+            }
+            // Transient replica of the exact curve: fixed small pixel
+            // offset, label mid-curve.
+            let zoom = ed.camera.zoom;
+            let Some((pts, stubs, lcx, lcy)) = bezier_replica(ed, seg_id, 18. / zoom, 0.5) else {
+                continue;
+            };
+            ed.curve_dim_renders.push(CurveDimRender {
+                pts,
+                stubs,
+                label_cx: lcx,
+                label_cy: lcy,
+                text: crate::ui::canvas::fmt_dim(cur_len),
+                constraint: false,
+                dim_index: None,
+                hovered: false,
+                editing: false,
+            });
         }
     }
 
@@ -304,6 +422,105 @@ pub fn update(ed: &mut Editor) {
 /// (empty_text_secondary); `text` overrides the formatted value (typed
 /// input). Distances get the standard px/in container; angles get the
 /// dashed arc with a degree readout.
+/// Shared render for a measured position pair — point-pair dims and
+/// edge-midpoint spans alike. Extension stubs run from each measured
+/// point to the offset dim line; the container rides at `slide`.
+#[allow(clippy::too_many_arguments)]
+fn push_points_dim(
+    ed: &mut Editor,
+    pa: Point2,
+    pb: Point2,
+    mode: crate::core::constraints::DimMode,
+    offset: f64,
+    slide: f64,
+    value: f64,
+    text: Option<String>,
+    dim_index: Option<usize>,
+    hovered: bool,
+    editing: bool,
+) {
+    use crate::core::constraints::DimMode;
+    let zoom = ed.camera.zoom;
+    let scr = |p: Point2| ed.camera.unit_to_screen(p);
+    let mut r = match mode {
+        DimMode::Aligned => {
+            let mut r = linear_dim(&ed.doc, &ed.camera, pa, pb, offset * zoom, value);
+            r.text = text.unwrap_or_else(|| crate::ui::canvas::fmt_dim(value));
+            // Container rides the dim line FROM ITS START (the first
+            // endpoint's foot) — anchoring it to the line's midpoint made
+            // it unreachable past halfway.
+            let (sa, sb) = (scr(pa), scr(pb));
+            let dx = sb.x - sa.x;
+            let dy = sb.y - sa.y;
+            let l = (dx * dx + dy * dy).sqrt().max(1e-9);
+            let s = slide.clamp(0., pick::distance(pa, pb));
+            r.label_cx = r.lax + (dx / l * s * zoom) as f32;
+            r.label_cy = r.lay + (dy / l * s * zoom) as f32;
+            r
+        }
+        // X/Y modes: the dim line is an axis-aligned span measuring
+        // |dx| / |dy|, with vertical/horizontal extension stubs
+        // down to each measured point. `offset` is the signed
+        // distance of the dim line from the FIRST point along the
+        // other axis; `slide` positions the container along it.
+        DimMode::X => {
+            let y_off = pa.y + offset;
+            let (sa, sb) = (scr(pa), scr(pb));
+            let ly = scr(Point2::new(pa.x, y_off)).y;
+            let (lax, lbx) = (sa.x, sb.x);
+            let t = (slide / (pb.x - pa.x).abs().max(1e-9)).clamp(0., 1.);
+            DimRender {
+                ax: sa.x as f32,
+                ay: sa.y as f32,
+                bx: sb.x as f32,
+                by: sb.y as f32,
+                lax: lax as f32,
+                lay: ly as f32,
+                lbx: lbx as f32,
+                lby: ly as f32,
+                label_cx: (lax + (lbx - lax) * t) as f32,
+                label_cy: ly as f32,
+                text: text.unwrap_or_else(|| crate::ui::canvas::fmt_dim(value)),
+                extra_ext: Vec::new(),
+                constraint: true,
+                dim_index,
+                hovered,
+                editing,
+            }
+        }
+        DimMode::Y => {
+            let x_off = pa.x + offset;
+            let (sa, sb) = (scr(pa), scr(pb));
+            let lx = scr(Point2::new(x_off, pa.y)).x;
+            let (lay, lby) = (sa.y, sb.y);
+            let t = (slide / (pb.y - pa.y).abs().max(1e-9)).clamp(0., 1.);
+            DimRender {
+                ax: sa.x as f32,
+                ay: sa.y as f32,
+                bx: sb.x as f32,
+                by: sb.y as f32,
+                lax: lx as f32,
+                lay: lay as f32,
+                lbx: lx as f32,
+                lby: lby as f32,
+                label_cx: lx as f32,
+                label_cy: (lay + (lby - lay) * t) as f32,
+                text: text.unwrap_or_else(|| crate::ui::canvas::fmt_dim(value)),
+                extra_ext: Vec::new(),
+                constraint: true,
+                dim_index,
+                hovered,
+                editing,
+            }
+        }
+    };
+    r.constraint = true;
+    r.dim_index = dim_index;
+    r.hovered = hovered;
+    r.editing = editing;
+    ed.dim_renders.push(r);
+}
+
 fn push_dim_target(
     ed: &mut Editor,
     target: &crate::core::constraints::DimTarget,
@@ -322,86 +539,18 @@ fn push_dim_target(
             let (Some(pa), Some(pb)) = (ed.doc.point(*a), ed.doc.point(*b)) else {
                 return;
             };
-            let zoom = ed.camera.zoom;
-            let scr = |p: Point2| ed.camera.unit_to_screen(p);
-            use crate::core::constraints::DimMode;
-            let mut r = match mode {
-                DimMode::Aligned => {
-                    let mut r = linear_dim(&ed.doc, &ed.camera, pa, pb, offset * zoom, value);
-                    r.text = text.unwrap_or_else(|| crate::ui::canvas::fmt_dim(value));
-                    // Container rides the dim line FROM ITS START (the first
-                    // endpoint's foot) — anchoring it to the line's midpoint made
-                    // it unreachable past halfway.
-                    let (sa, sb) = (scr(pa), scr(pb));
-                    let dx = sb.x - sa.x;
-                    let dy = sb.y - sa.y;
-                    let l = (dx * dx + dy * dy).sqrt().max(1e-9);
-                    let s = slide.clamp(0., pick::distance(pa, pb));
-                    r.label_cx = r.lax + (dx / l * s * zoom) as f32;
-                    r.label_cy = r.lay + (dy / l * s * zoom) as f32;
-                    r
-                }
-                // X/Y modes: the dim line is an axis-aligned span measuring
-                // |dx| / |dy|, with vertical/horizontal extension stubs
-                // down to each measured point. `offset` is the signed
-                // distance of the dim line from the FIRST point along the
-                // other axis; `slide` positions the container along it.
-                DimMode::X => {
-                    let y_off = pa.y + offset;
-                    let (sa, sb) = (scr(pa), scr(pb));
-                    let ly = scr(Point2::new(pa.x, y_off)).y;
-                    let (lax, lbx) = (sa.x, sb.x);
-                    let t = (slide / (pb.x - pa.x).abs().max(1e-9)).clamp(0., 1.);
-                    DimRender {
-                        ax: sa.x as f32,
-                        ay: sa.y as f32,
-                        bx: sb.x as f32,
-                        by: sb.y as f32,
-                        lax: lax as f32,
-                        lay: ly as f32,
-                        lbx: lbx as f32,
-                        lby: ly as f32,
-                        label_cx: (lax + (lbx - lax) * t) as f32,
-                        label_cy: ly as f32,
-                        text: text.unwrap_or_else(|| crate::ui::canvas::fmt_dim(value)),
-                        extra_ext: Vec::new(),
-                        constraint: true,
-                        dim_index,
-                        hovered,
-                        editing,
-                    }
-                }
-                DimMode::Y => {
-                    let x_off = pa.x + offset;
-                    let (sa, sb) = (scr(pa), scr(pb));
-                    let lx = scr(Point2::new(x_off, pa.y)).x;
-                    let (lay, lby) = (sa.y, sb.y);
-                    let t = (slide / (pb.y - pa.y).abs().max(1e-9)).clamp(0., 1.);
-                    DimRender {
-                        ax: sa.x as f32,
-                        ay: sa.y as f32,
-                        bx: sb.x as f32,
-                        by: sb.y as f32,
-                        lax: lx as f32,
-                        lay: lay as f32,
-                        lbx: lx as f32,
-                        lby: lby as f32,
-                        label_cx: lx as f32,
-                        label_cy: (lay + (lby - lay) * t) as f32,
-                        text: text.unwrap_or_else(|| crate::ui::canvas::fmt_dim(value)),
-                        extra_ext: Vec::new(),
-                        constraint: true,
-                        dim_index,
-                        hovered,
-                        editing,
-                    }
-                }
+            push_points_dim(ed, pa, pb, *mode, offset, slide, value, text, dim_index, hovered, editing);
+        }
+        DimTarget::EdgeMid { a, b, mode } => {
+            // Midpoint span between two edges (chord midpoints for curves).
+            let (Some((aa, ab)), Some((ba, bb))) =
+                (ed.doc.segment_geom(*a), ed.doc.segment_geom(*b))
+            else {
+                return;
             };
-            r.constraint = true;
-            r.dim_index = dim_index;
-            r.hovered = hovered;
-            r.editing = editing;
-            ed.dim_renders.push(r);
+            let ma = Point2::new((aa.x + ab.x) / 2., (aa.y + ab.y) / 2.);
+            let mb = Point2::new((ba.x + bb.x) / 2., (ba.y + bb.y) / 2.);
+            push_points_dim(ed, ma, mb, *mode, offset, slide, value, text, dim_index, hovered, editing);
         }
         DimTarget::PointLine { p, line } => {
             let (Some(sp), Some((la, lb))) =
@@ -573,7 +722,177 @@ fn push_dim_target(
                 editing,
             });
         }
+        DimTarget::CurveLength { seg } => {
+            // Bezier-only: the dim line IS the exact curve shape — an
+            // offset replica of the sampled path, NOT the chord. Offset is
+            // user-controlled (doc units, like a line dim); the label rides
+            // the replica at the placed arclength fraction.
+            let Some((pts, stubs, lcx, lcy)) = bezier_replica(ed, *seg, offset, slide) else {
+                return;
+            };
+            ed.curve_dim_renders.push(CurveDimRender {
+                pts,
+                stubs,
+                label_cx: lcx,
+                label_cy: lcy,
+                text: text.unwrap_or_else(|| crate::ui::canvas::fmt_dim(value)),
+                constraint: true,
+                dim_index,
+                hovered,
+                editing,
+            });
+        }
     }
+}
+
+/// Offset replica of a bezier span: resamples the exact curve, pushes each
+/// sample along the chord normal by `offset` (doc units), projects to
+/// screen. Returns (screen polyline, offset stubs clamping the replica to
+/// the real endpoints, label_cx, label_cy). None for non-beziers or
+/// degenerate spans.
+pub(crate) fn bezier_replica(
+    ed: &Editor,
+    sid: crate::core::ids::SegmentId,
+    offset: f64,
+    slide: f64,
+) -> Option<(Vec<[f32; 2]>, Vec<[f32; 4]>, f32, f32)> {
+    let seg_d = ed.doc.segment(sid)?;
+    if seg_d.kind != crate::core::document::SegmentKind::Bezier {
+        return None;
+    }
+    let (h1, h2) = seg_d.bezier_handles();
+    let (p0, c1, c2, p1) = (
+        ed.doc.point(seg_d.start)?,
+        ed.doc.point(h1?)?,
+        ed.doc.point(h2?)?,
+        ed.doc.point(seg_d.end)?,
+    );
+    let pts = crate::editor::bezier::samples(
+        p0,
+        c1,
+        c2,
+        p1,
+        bezier_sample_count(ed.camera.zoom, p0, c1, c2, p1),
+    );
+    if pts.len() < 2 {
+        return None;
+    }
+    let (a0, b0) = (pts[0], pts[pts.len() - 1]);
+    let (_, n) = dim_axes(b0.x - a0.x, b0.y - a0.y);
+    let off: Vec<Point2> = pts
+        .iter()
+        .map(|p| Point2::new(p.x + n.0 * offset, p.y + n.1 * offset))
+        .collect();
+    // Arclength fraction for the label ride, interpolated between
+    // samples so the container glides instead of stepping vertex to
+    // vertex.
+    let mut total = 0.;
+    let mut cum = vec![0.];
+    for w in off.windows(2) {
+        total += pick::distance(w[0], w[1]);
+        cum.push(total);
+    }
+    let target_len = total * slide.clamp(0., 1.);
+    let mut li = 0;
+    let mut lt = 0.;
+    for i in 0..off.len().saturating_sub(1) {
+        if cum[i + 1] <= target_len {
+            li = i + 1;
+            continue;
+        }
+        let seg = (cum[i + 1] - cum[i]).max(1e-12);
+        lt = ((target_len - cum[i]) / seg).clamp(0., 1.);
+        li = i;
+        break;
+    }
+    let lerp_off = |i: usize| -> Point2 {
+        let j = (i + 1).min(off.len() - 1);
+        Point2::new(
+            off[i].x + (off[j].x - off[i].x) * lt,
+            off[i].y + (off[j].y - off[i].y) * lt,
+        )
+    };
+    let scr: Vec<[f32; 2]> = off
+        .iter()
+        .map(|p| {
+            let s = ed.camera.unit_to_screen(*p);
+            [s.x as f32, s.y as f32]
+        })
+        .collect();
+    // Clamping stubs: replica ends back to the real curve endpoints.
+    let (r0, r1) = (
+        ed.camera.unit_to_screen(pts[0]),
+        ed.camera.unit_to_screen(pts[pts.len() - 1]),
+    );
+    let stubs = vec![
+        [scr[0][0], scr[0][1], r0.x as f32, r0.y as f32],
+        [
+            scr[scr.len() - 1][0],
+            scr[scr.len() - 1][1],
+            r1.x as f32,
+            r1.y as f32,
+        ],
+    ];
+    let lp = ed.camera.unit_to_screen(lerp_off(li.min(off.len() - 1)));
+    Some((scr, stubs, lp.x as f32, lp.y as f32))
+}
+
+/// Adaptive bezier sample count from viewport cost: ~1 sample per 4px of
+/// control-polygon length, clamped. Keeps replicas and placement math
+/// cheap at any zoom instead of a fixed 64.
+pub(crate) fn bezier_sample_count(
+    zoom: f64,
+    p0: Point2,
+    c1: Point2,
+    c2: Point2,
+    p1: Point2,
+) -> usize {
+    let poly =
+        pick::distance(p0, c1) + pick::distance(c1, c2) + pick::distance(c2, p1);
+    ((poly * zoom / 4.).ceil() as usize).clamp(16, 64)
+}
+
+/// Continuous projection of a cursor onto a polyline: (arclength position,
+/// total length, signed distance via the winning segment's left normal).
+/// Unlike nearest-vertex lookup this glides smoothly — no teleporting
+/// when the cursor sits equidistant to distant samples.
+pub(crate) fn project_polyline(pts: &[Point2], at: Point2) -> (f64, f64, f64) {
+    let mut total = 0f64;
+    let mut cum = vec![0f64];
+    for w in pts.windows(2) {
+        total += pick::distance(w[0], w[1]);
+        cum.push(total);
+    }
+    if pts.len() < 2 || total < 1e-9 {
+        return (0., total.max(0.), f64::MAX);
+    }
+    let mut best = (0usize, 0f64, f64::MAX, 0f64);
+    for (i, w) in pts.windows(2).enumerate() {
+        let (ax, ay) = (w[0].x, w[0].y);
+        let (dx, dy) = (w[1].x - ax, w[1].y - ay);
+        let len2 = dx * dx + dy * dy;
+        let t = if len2 < 1e-12 {
+            0.
+        } else {
+            ((at.x - ax) * dx + (at.y - ay) * dy) / len2
+        }
+        .clamp(0., 1.);
+        let px = ax + dx * t;
+        let py = ay + dy * t;
+        let d = ((at.x - px) * (at.x - px) + (at.y - py) * (at.y - py)).sqrt();
+        if d < best.2 {
+            let seglen = len2.sqrt();
+            let (nx, ny) = if seglen < 1e-12 {
+                (0., 0.)
+            } else {
+                (-dy / seglen, dx / seglen)
+            };
+            best = (i, t, d, (at.x - px) * nx + (at.y - py) * ny);
+        }
+    }
+    let (i, t, _, signed) = best;
+    let seglen = if i + 1 < cum.len() { cum[i + 1] - cum[i] } else { 0. };
+    (cum[i] + t * seglen, total, signed)
 }
 
 /// Unit direction + LEFT normal of a vector (doc space is y-down like the
@@ -760,7 +1079,14 @@ fn update_constraint_markers(ed: &mut Editor) {
                 ))
             })
         });
-        let (cx, cy) = if matches!(c.kind, crate::core::constraints::ConstraintKind::Parallel | crate::core::constraints::ConstraintKind::Perpendicular)
+        let (cx, cy) = if matches!(c.kind, crate::core::constraints::ConstraintKind::Tangent)
+            && let Some(junction) = pair_junction.or(Some(a))
+        {
+            // Tangent chips hover ABOVE the contact junction (like point
+            // chips) so the joint point itself stays clickable.
+            let p = ed.camera.unit_to_screen(junction);
+            (p.x as f32, p.y as f32 - HANDLE_R - 2. - CHIP_ABOVE_PX)
+        } else if matches!(c.kind, crate::core::constraints::ConstraintKind::Parallel | crate::core::constraints::ConstraintKind::Perpendicular)
             && let Some(junction) = pair_junction
         {
             let p = ed.camera.unit_to_screen(junction);

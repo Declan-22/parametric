@@ -19,9 +19,7 @@ actions!(
         Paste,
         DeleteSelection,
         SelectAll,
-        // Snap-bond choice menu (points dropped onto points)
-        BondCoincident,
-        BondCombinePoints,
+        // Global escape cascade.
         BondDismiss,
         // Tools
         ToolMove,
@@ -31,6 +29,14 @@ actions!(
         ToolLine,
         ToolRectangle,
         ToolCircle,
+        ToolPen,
+        PenLine,
+        PenBezier,
+        PenArc,
+        DimWidth,
+        DimHeight,
+        DimDisplacement,
+        DimDistance,
         // View
         ZoomIn,
         ZoomOut,

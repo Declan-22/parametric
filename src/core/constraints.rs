@@ -108,6 +108,7 @@ impl DimTarget {
     pub fn with_mode(self, mode: DimMode) -> Self {
         match self {
             DimTarget::Points { a, b, .. } => DimTarget::Points { a, b, mode },
+            DimTarget::EdgeMid { a, b, .. } => DimTarget::EdgeMid { a, b, mode },
             other => other,
         }
     }
@@ -118,6 +119,10 @@ impl DimTarget {
 pub enum DimTarget {
     /// Distance between two points — straight (Aligned) or the X/Y span.
     Points { a: PointId, b: PointId, mode: DimMode },
+    /// Width/height/straight-displacement between two EDGES, measured
+    /// between their midpoints (chord midpoints for curves) — straight
+    /// (Aligned) or the X/Y span. The perpendicular gap lives on Lines.
+    EdgeMid { a: SegmentId, b: SegmentId, mode: DimMode },
     /// Perpendicular distance from a point to a line.
     PointLine { p: PointId, line: SegmentId },
     /// Perpendicular distance between two parallel lines.
@@ -126,6 +131,10 @@ pub enum DimTarget {
     Angle { a: SegmentId, b: SegmentId },
     /// Radius of an arc/circle: dashed line from its center to the bend.
     Radius { seg: SegmentId },
+    /// Total arc-length of a curve (arc or bezier): an offset replica of
+    /// the exact path with a distance label. Offset is user-controlled
+    /// (doc units, like a line dim); slide rides 0..1 along the curve.
+    CurveLength { seg: SegmentId },
 }
 
 // A reference to any first-class document element.

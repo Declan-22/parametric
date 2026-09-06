@@ -15,11 +15,104 @@ pub enum Tool {
     Circle,
     Ruler,
     Dimension,
+    Pen,
     ConstraintHorizontalVertical,
     ConstraintTangent,
     ConstraintCoincident,
     ConstraintParallel,
     ConstraintPerpendicular,
+}
+
+/// Pen sub-mode: one tool draws lines, arcs, and beziers.
+/// Explicit switch only (menu or L/B/A) — drag never changes mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum PenMode {
+    #[default]
+    Line,
+    Bezier,
+    Arc,
+}
+
+impl PenMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PenMode::Line => "line",
+            PenMode::Bezier => "bezier",
+            PenMode::Arc => "arc",
+        }
+    }
+}
+
+// In-progress bezier span. Clicks are points ON the curve, and every
+// point owns TWO handles (in/out — like the committed spans, whose joint
+// shows the previous span's far handle plus the next span's near handle):
+//  - click, release, click: straight span p0 -> p1 (handles auto);
+//  - second press + drag, release: p1 fixes at press, the drag shapes the
+//    handle NEAREST the cursor (h1 at the p0 side, h2 at the p1 side).
+// `cursor` tracks the live preview.
+#[derive(Clone, Copy, Debug)]
+pub struct PendingBezier {
+    pub p0: Point2,
+    pub p1: Option<Point2>,
+    pub h1: Option<Point2>,
+    pub h2: Option<Point2>,
+    pub cursor: Point2,
+}
+
+impl PendingBezier {
+    /// Effective handles for preview/commit. The drag point is the FORWARD
+    /// handle (the visible pair pulled out of the placed point); the curve
+    /// itself rides the OPPOSITE side — `c2` mirrors the drag across the
+    /// endpoint — so the bend goes opposite the drag, smooth-point style.
+    /// Untouched sides fall back to auto thirds.
+    pub fn effective(&self, end: Point2) -> (Point2, Point2) {
+        let lerp = |t: f64| {
+            Point2::new(
+                self.p0.x + (end.x - self.p0.x) * t,
+                self.p0.y + (end.y - self.p0.y) * t,
+            )
+        };
+        let c1 = self.h1.unwrap_or_else(|| lerp(1. / 3.));
+        let c2 = self
+            .h2
+            .map(|h| Point2::new(2. * end.x - h.x, 2. * end.y - h.y))
+            .unwrap_or_else(|| lerp(2. / 3.));
+        (c1, c2)
+    }
+}
+
+// Unified pen preview: exactly one arm is live, matching `PenMode`.
+#[derive(Clone, Copy, Debug)]
+pub struct PendingPen {
+    pub mode: PenMode,
+    pub line: Option<PendingLine>,
+    pub bezier: Option<PendingBezier>,
+    pub circle: Option<PendingCircle>,
+}
+
+impl PendingPen {
+    pub fn for_mode(mode: PenMode, at: Point2) -> Self {
+        match mode {
+            PenMode::Line => Self {
+                mode,
+                line: Some(PendingLine { start: at, cursor: at }),
+                bezier: None,
+                circle: None,
+            },
+            PenMode::Bezier => Self {
+                mode,
+                line: None,
+                bezier: Some(PendingBezier { p0: at, p1: None, h1: None, h2: None, cursor: at }),
+                circle: None,
+            },
+            PenMode::Arc => Self {
+                mode,
+                line: None,
+                bezier: None,
+                circle: Some(PendingCircle { a: Some(at), b: None, cursor: at }),
+            },
+        }
+    }
 }
 
 // In-progress rectangle being dragged out (tool-side preview only).

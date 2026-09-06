@@ -7,7 +7,6 @@ use gpui::{
 use crate::editor::{Editor, Tool};
 use crate::ui::shell::title_bar::TITLE_BAR_HEIGHT;
 
-pub mod context_menu;
 pub mod paint;
 
 // Canvas view: renders the document through the editor camera and owns the
@@ -159,11 +158,6 @@ impl RenderOnce for CanvasView {
             .child(self.constraint_chip_layer(cx))
             .child(self.dimension_layer())
             .child(self.snap_cursor_layer(cx))
-            .children(context_menu::draw(
-                self.editor.clone(),
-                self.shell.clone(),
-                cx,
-            ))
     }
 }
 
@@ -296,6 +290,19 @@ impl CanvasView {
                     border(a.constraint, a.hovered, a.editing),
                     a.dim_index,
                     a.editing,
+                )
+            }));
+            labels.extend(ed.curve_dim_renders.iter().map(|c| {
+                make_label(
+                    window,
+                    c.text.clone(),
+                    c.label_cx,
+                    c.label_cy,
+                    rgb(t.bg_primary).into(),
+                    ink(c.constraint, c.hovered, c.editing),
+                    border(c.constraint, c.hovered, c.editing),
+                    c.dim_index,
+                    c.editing,
                 )
             }));
             labels
@@ -592,12 +599,15 @@ impl CanvasView {
                 ed.hover.filter(|_| ed.dragging.is_none()),
                 &ed.dim_renders,
                 &ed.angle_dim_renders,
+                &ed.curve_dim_renders,
                 &ed.snap_guides,
                 ed.marquee,
                 pending_ruler,
                 pending_line,
                 &ed.constraint_markers,
                 ed.pending_circle,
+                ed.pending_pen,
+                ed.pending_bezier,
                 ed.show_grid,
                 ed.tool,
                 cursor_doc,
@@ -731,6 +741,39 @@ impl CanvasView {
                             rgb(crate::theme::active(cx).accent),
                             gpui::BorderStyle::Solid,
                         ));
+                    }
+                    paint::Primitive::Diamond { cx: mcx, cy: mcy, radius } => {
+                        // Bezier handles: white diamond with a 1px accent
+                        // border — unmistakably not a point dot.
+                        let (r, ir) = (radius, (radius - 1.).max(1.));
+                        let diamond = |rad: f32| {
+                            let mut path = gpui::Path::new(Point {
+                                x: px(mcx) + ox,
+                                y: px(mcy - rad) + oy,
+                            });
+                            path.line_to(Point {
+                                x: px(mcx + rad) + ox,
+                                y: px(mcy) + oy,
+                            });
+                            path.line_to(Point {
+                                x: px(mcx) + ox,
+                                y: px(mcy + rad) + oy,
+                            });
+                            path.line_to(Point {
+                                x: px(mcx - rad) + ox,
+                                y: px(mcy) + oy,
+                            });
+                            path.line_to(Point {
+                                x: px(mcx) + ox,
+                                y: px(mcy - rad) + oy,
+                            });
+                            path
+                        };
+                        let accent_bg: gpui::Background =
+                            rgb(crate::theme::active(cx).accent).into();
+                        let white_bg: gpui::Background = rgb(0xFFFFFF).into();
+                        window.paint_path(diamond(r), accent_bg);
+                        window.paint_path(diamond(ir), white_bg);
                     }
                     paint::Primitive::RulerLabel {
                         center_x,

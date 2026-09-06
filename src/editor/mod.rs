@@ -1,4 +1,5 @@
 pub mod arc;
+pub mod bezier;
 mod clipboard;
 mod camera;
 pub mod dims;
@@ -13,7 +14,7 @@ use std::cell::RefCell;
 pub use camera::Camera;
 
 pub use snapping::SnapGuide;
-pub use tools::{DimInput, DimPick, PendingCircle, PendingLine, PendingRuler, PendingShape, Tool};
+pub use tools::{DimInput, DimPick, PenMode, PendingBezier, PendingCircle, PendingLine, PendingPen, PendingRuler, PendingShape, Tool};
 
 use crate::core::constraints::{ConstraintKind, DimTarget, ElementRef};
 use crate::core::document::{Document, Layer};
@@ -74,6 +75,20 @@ pub struct Editor {
     // Existing edge and prospective line geometry for the creation preview.
     pub perpendicular_preview: Option<(SegmentId, Point2, Point2)>,
     pub pending_circle: Option<PendingCircle>,
+    // Pen tool: ONE unified path tool. `pen_anchor` is the live chain point
+    // shared by every sub-mode — switching Line/Bezier/Arc never breaks the
+    // path, it only changes what the NEXT span draws. `pending_pen` stages
+    // the in-progress span for the active mode. `pen_down_at` tracks the
+    // press point so a second-press drag can shape bezier handles.
+    pub pen_mode: PenMode,
+    pub pending_pen: Option<PendingPen>,
+    pub pending_bezier: Option<PendingBezier>,
+    pub pen_anchor: Option<Point2>,
+    /// Document id of the chain anchor: chained spans MERGE their touching
+    /// endpoints into this id (one shared point per joint), so lines,
+    /// arcs and beziers chain as a single path and joints show both
+    /// handles (prev far handle + next near handle).
+    pub pen_anchor_id: Option<PointId>,
     // Pending shape created by a single click (commit on next click).
     pub pending_via_click: bool,
     pub selection: Vec<ElementRef>,
@@ -99,16 +114,6 @@ pub struct Editor {
     pub constraint_markers: Vec<dims::ConstraintMarker>,
     // Chip currently under the cursor (hit-tested in screen px).
     pub hovered_constraint: Option<String>,
-    // Pending snap-bond choice menu: points ended on top of other points.
-    pub context_menu: Option<crate::ui::canvas::context_menu::ContextMenu>,
-    // Pairs awaiting the user's bond choice while the menu is open.
-    pub pending_bonds: Vec<(PointId, PointId)>,
-    // Canvas context menu hover/pop fades — stored on Editor (not Shell) so
-    // reading them during Shell::render doesn't re-entrantly borrow Shell.
-    pub(crate) context_menu_fades: std::collections::HashMap<String, f32>,
-    pub(crate) context_menu_fade_pending: std::collections::HashMap<String, f32>,
-    pub(crate) context_menu_fade_active: std::collections::HashSet<String>,
-    pub(crate) context_menu_pop: f32,
     // Undo/redo history (full-document snapshots; commands/ module drives).
     pub(crate) undo_stack: Vec<Document>,
     pub(crate) redo_stack: Vec<Document>,
@@ -143,8 +148,15 @@ pub struct Editor {
     pub dim_picks: Vec<DimPick>,
     pub dim_target: Option<crate::core::constraints::DimTarget>,
     pub dim_input: Option<DimInput>,
+    /// Explicit dimension-type lock from the floating menu:
+    /// width/height/displacement/distance. When Some, `dim_placement`
+    /// honors it instead of the cursor-zone auto-pick.
+    pub dim_mode_lock: Option<String>,
     // Per-frame angle-dimension render data (dashed arc + container).
     pub angle_dim_renders: Vec<dims::AngleDimRender>,
+    // Per-frame curve-length render data (offset replica polyline +
+    // container). Bezier-only.
+    pub curve_dim_renders: Vec<dims::CurveDimRender>,
     // Bumped on every committed document change; Shell watches it for
     // debounced autosave.
     pub doc_gen: u64,
@@ -183,7 +195,7 @@ const HANDLE_TOL_PX: f64 = 14.0;
 // Tight tolerance for press-to-grab: inside this, a drag moves geometry;
 // outside it (but within HANDLE_TOL_PX), a drag is a marquee.
 const EXACT_TOL_PX: f64 = 7.0;
-const SNAP_TOL_PX: f64 = 10.0;
+pub(crate) const SNAP_TOL_PX: f64 = 10.0;
 
 impl Editor {
     pub fn new() -> Self {
@@ -209,6 +221,11 @@ impl Editor {
             pending_line: None,
             perpendicular_preview: None,
             pending_circle: None,
+            pen_mode: PenMode::Line,
+            pending_pen: None,
+            pending_bezier: None,
+            pen_anchor: None,
+            pen_anchor_id: None,
             pending_via_click: false,
             selection: Vec::new(),
             constraint_picks: Vec::new(),
@@ -223,12 +240,6 @@ impl Editor {
             dim_renders: Vec::new(),
             constraint_markers: Vec::new(),
             hovered_constraint: None,
-            context_menu: None,
-            pending_bonds: Vec::new(),
-            context_menu_fades: std::collections::HashMap::new(),
-            context_menu_fade_pending: std::collections::HashMap::new(),
-            context_menu_fade_active: std::collections::HashSet::new(),
-            context_menu_pop: 0.0,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             gesture_snapshot: None,
@@ -246,7 +257,9 @@ impl Editor {
             dim_picks: Vec::new(),
             dim_target: None,
             dim_input: None,
+            dim_mode_lock: None,
             angle_dim_renders: Vec::new(),
+            curve_dim_renders: Vec::new(),
             doc_gen: 0,
             dim_hitboxes: Vec::new(),
             hovered_dim: None,
@@ -271,13 +284,15 @@ impl Editor {
         self.pending_line = None;
         self.perpendicular_preview = None;
         self.pending_circle = None;
+        self.pending_pen = None;
+        self.pending_bezier = None;
+        self.pen_anchor = None;
+        self.pen_anchor_id = None;
         self.pending_via_click = false;
         self.selection.clear();
         self.constraint_picks.clear();
         self.constraint_point_picks.clear();
         self.selected_constraints.clear();
-        self.context_menu = None;
-        self.pending_bonds = Vec::new();
         self.marquee = None;
         self.group_drag_last = None;
         self.dragging = None;
@@ -287,6 +302,910 @@ impl Editor {
         self.dim_input = None;
         self.overconstrained = false;
         true
+    }
+
+    /// Switches the pen sub-mode (explicit only — drag never changes it).
+    /// The chain anchor is PRESERVED so the path never breaks: the new
+    /// mode stages its next span from the same live endpoint.
+    pub fn set_pen_mode(&mut self, mode: PenMode) -> bool {
+        if self.pen_mode == mode {
+            return false;
+        }
+        self.pen_mode = mode;
+        self.perpendicular_preview = None;
+        self.snap_guides.clear();
+        // Re-stage the new mode from the live chain point (if any) so
+        // Line -> Bezier -> Arc flows as one path. A half-finished arc
+        // chord is dropped — its two clicks belong to the old mode.
+        // Bezier restaging pre-mirrors the near handle (smooth preview).
+        self.pending_pen = self.pen_anchor.map(|a| {
+            let mut pen = PendingPen::for_mode(mode, a);
+            if mode == PenMode::Bezier
+                && let Some(pb) = pen.bezier.as_mut()
+            {
+                pb.h1 = self.pen_mirror_handle();
+            }
+            pen
+        });
+        self.pending_bezier = None;
+        true
+    }
+
+    /// Cancels the live pen path entirely (Esc).
+    pub fn cancel_pen_path(&mut self) -> bool {
+        if self.pending_pen.is_none() && self.pen_anchor.is_none() {
+            return false;
+        }
+        self.pending_pen = None;
+        self.pending_bezier = None;
+        self.pen_anchor = None;
+        self.pen_anchor_id = None;
+        self.perpendicular_preview = None;
+        self.snap_guides.clear();
+        true
+    }
+
+    /// Merges a freshly committed span's start point into the live chain
+    /// anchor id (when one exists) and advances the anchor to the span's
+    /// end point. Every span type chains through shared ids — no stacked
+    /// duplicate points at joints.
+    fn pen_chain_end(&mut self, seg: SegmentId) {
+        let Some(s) = self.doc.segment(seg) else { return };
+        let (fresh_start, end) = (s.start, s.end);
+        if let Some(aid) = self.pen_anchor_id {
+            if self.doc.point(aid).is_some() && fresh_start != aid {
+                self.doc.merge_point(aid, fresh_start);
+            }
+        }
+        self.pen_anchor_id = Some(end);
+        if let Some(p) = self.doc.point(end) {
+            self.pen_anchor = Some(p);
+        }
+    }
+
+    /// Mirror of the previous bezier's far handle across the chain anchor:
+    /// the default near handle for a chained bezier span (smooth joints
+    /// out of the box). Prefers the span ARRIVING at the anchor (its far
+    /// handle) over one leaving it. None when no bezier touches it.
+    fn pen_mirror_handle(&self) -> Option<Point2> {
+        let aid = self.pen_anchor_id?;
+        let anchor = self.doc.point(aid)?;
+        let mut fallback: Option<Point2> = None;
+        for (_, s) in self.doc.all_segments() {
+            if s.kind != crate::core::document::SegmentKind::Bezier {
+                continue;
+            }
+            // Arriving span first: its far handle mirrors into our near one.
+            if s.end == aid
+                && let Some(hp) = s.center.and_then(|h| self.doc.point(h))
+                && pick::distance(hp, anchor) > 1e-6
+            {
+                return Some(Point2::new(
+                    2. * anchor.x - hp.x,
+                    2. * anchor.y - hp.y,
+                ));
+            }
+            if s.start == aid && fallback.is_none() {
+                fallback = s.ctrl.and_then(|h| self.doc.point(h)).and_then(|hp| {
+                    (pick::distance(hp, anchor) > 1e-6).then_some(Point2::new(
+                        2. * anchor.x - hp.x,
+                        2. * anchor.y - hp.y,
+                    ))
+                });
+            }
+        }
+        fallback
+    }
+
+    /// Explicit dimension-type lock from the floating menu.
+    pub fn set_dim_mode_lock(&mut self, lock: Option<String>) -> bool {
+        if self.dim_mode_lock == lock {
+            return false;
+        }
+        self.dim_mode_lock = lock;
+        self.refresh_dim_target();
+        true
+    }
+
+    /// Drops the lock when the armed target can't honor it, so the menu
+    /// never shows a stale restriction.
+    fn drop_stale_dim_lock(&mut self) {
+        if !Self::dim_lock_keeps(&self.dim_target, &self.dim_mode_lock) {
+            self.dim_mode_lock = None;
+        }
+    }
+
+    /// Whether the current lock can apply to an armed target. Radius,
+    /// angle, gap and point-line spans imply their own type and lift any
+    /// lock; CurveLength only honors an explicit distance lock; EdgeMid
+    /// honors the matching width/height/displacement lock.
+    fn dim_lock_keeps(target: &Option<crate::core::constraints::DimTarget>, lock: &Option<String>) -> bool {
+        use crate::core::constraints::{DimMode, DimTarget};
+        match target {
+            Some(DimTarget::Points { .. }) => true,
+            Some(DimTarget::CurveLength { .. }) => {
+                lock.as_deref() == Some("distance")
+            }
+            Some(DimTarget::EdgeMid { mode, .. }) => {
+                let want = match mode {
+                    DimMode::X => "width",
+                    DimMode::Y => "height",
+                    DimMode::Aligned => "displacement",
+                };
+                lock.as_deref() == Some(want)
+            }
+            Some(_) => false,
+            None => true,
+        }
+    }
+
+    /// Whether two segments cross (sine of their directions above epsilon).
+    /// Shared by pick resolution and the Angle/Distance kind switch.
+    fn geoms_cross(
+        ga: (crate::core::geometry::Point2, crate::core::geometry::Point2),
+        gb: (crate::core::geometry::Point2, crate::core::geometry::Point2),
+    ) -> bool {
+        let (u1, _) = dims::dim_axes(ga.1.x - ga.0.x, ga.1.y - ga.0.y);
+        let (u2, _) = dims::dim_axes(gb.1.x - gb.0.x, gb.1.y - gb.0.y);
+        (u1.0 * u2.1 - u1.1 * u2.0).abs() >= 1e-3
+    }
+
+    /// Whether two segments' directions cross (false for parallel pairs
+    /// and missing geometry).
+    pub(crate) fn lines_cross(
+        &self,
+        a: crate::core::ids::SegmentId,
+        b: crate::core::ids::SegmentId,
+    ) -> bool {
+        match (self.doc.segment_geom(a), self.doc.segment_geom(b)) {
+            (Some(ga), Some(gb)) => Self::geoms_cross(ga, gb),
+            _ => false,
+        }
+    }
+
+    /// Angle <-> midpoint-displacement switch for a picked edge pair.
+    /// `to_angle=true` arms Angle{a,b} (crossing pairs only); false arms
+    /// EdgeMid{a,b,Aligned} — the midpoint displacement between the edges.
+    /// Type locks are cleared (neither target honors them). There is no
+    /// gap dimension: parallel pairs measure midpoint to midpoint.
+    /// Returns true on change.
+    pub fn set_dim_edge_kind(&mut self, to_angle: bool) -> bool {
+        use crate::core::constraints::{DimMode, DimTarget};
+        let pair = match self.dim_target {
+            Some(DimTarget::Lines { a, b })
+            | Some(DimTarget::Angle { a, b })
+            | Some(DimTarget::EdgeMid { a, b, .. }) => Some((a, b)),
+            _ => None,
+        };
+        let Some((a, b)) = pair else {
+            return false;
+        };
+        let is_angle = matches!(self.dim_target, Some(DimTarget::Angle { .. }));
+        if to_angle == is_angle {
+            return false;
+        }
+        if to_angle && !self.lines_cross(a, b) {
+            return false;
+        }
+        self.dim_target = Some(if to_angle {
+            DimTarget::Angle { a, b }
+        } else {
+            DimTarget::EdgeMid {
+                a,
+                b,
+                mode: DimMode::Aligned,
+            }
+        });
+        self.dim_mode_lock = None;
+        true
+    }
+
+    /// Toggles the armed edge-pair dimension between Angle and midpoint
+    /// displacement. Parallel pairs stay displacement (no angle exists).
+    pub fn toggle_dim_edge_kind(&mut self) -> bool {
+        use crate::core::constraints::DimTarget;
+        match self.dim_target {
+            Some(DimTarget::Angle { .. }) => self.set_dim_edge_kind(false),
+            Some(DimTarget::Lines { .. }) | Some(DimTarget::EdgeMid { .. }) => {
+                self.set_dim_edge_kind(true)
+            }
+            _ => false,
+        }
+    }
+
+    /// Re-derives the armed dimension target after a lock change so the
+    /// pending type follows the new restriction instead of sticking to
+    /// whatever was armed before (e.g. Distance -> Width on one bezier).
+    /// A lock the picks can't satisfy (e.g. Width on an arc or an armed
+    /// edge pair) is dropped immediately so the menu never shows a stale
+    /// restriction. No-op while a value input is open or nothing is
+    /// picked yet.
+    fn refresh_dim_target(&mut self) {
+        if self.dim_input.is_some() || self.dim_picks.is_empty() {
+            return;
+        }
+        self.dim_target = self.resolve_dim_target(&self.dim_picks);
+        self.drop_stale_dim_lock();
+        // Mirror the picks as selection so they stay highlighted.
+        self.selection = self
+            .dim_picks
+            .iter()
+            .map(|p| match p {
+                DimPick::Point(id) => ElementRef::Point(*id),
+                DimPick::Line(id) => ElementRef::Segment(*id),
+            })
+            .collect();
+    }
+
+    // -- floating-menu constraint gating (single source of truth) --
+    //
+    // The associated functions below decide which constraint rows a
+    // selection can actually take. The menu calls them (as
+    // `Editor::gate_*`) to decide what to SHOW; the apply arms call the
+    // same functions, so a shown row can never be a dead click. Each
+    // encodes real feasibility, not shape counting:
+    //   - same-segment point pairs are ineligible (collapsing an edge),
+    //   - merge needs close, unglued points (the old bond-popup rule),
+    //   - tangent/parallel/perpendicular consult existing H/V locks,
+    //   - coincident checks forced-coordinate conflicts.
+
+    /// Valid bare-point selections (live positions only).
+    pub(crate) fn gate_points(
+        doc: &Document,
+        selection: &[ElementRef],
+    ) -> Vec<PointId> {
+        selection
+            .iter()
+            .filter_map(|el| el.as_point())
+            .filter(|id| doc.point(*id).is_some())
+            .collect()
+    }
+
+    /// Valid explicitly-selected segments.
+    pub(crate) fn gate_segs(
+        doc: &Document,
+        selection: &[ElementRef],
+    ) -> Vec<SegmentId> {
+        selection
+            .iter()
+            .filter_map(|el| el.as_segment())
+            .filter(|id| doc.segment(*id).is_some())
+            .collect()
+    }
+
+    /// First segment owning pid as an endpoint (arena order).
+    pub(crate) fn owner_segment(doc: &Document, pid: PointId) -> Option<SegmentId> {
+        doc.all_segments()
+            .find(|(_, s)| s.start == pid || s.end == pid)
+            .map(|(id, _)| id)
+    }
+
+    /// True when one segment owns both points as its endpoints (gluing
+    /// them would collapse that edge — never offered).
+    pub(crate) fn same_segment_owner(doc: &Document, a: PointId, b: PointId) -> bool {
+        doc.all_segments().any(|(_, s)| {
+            (s.start == a && s.end == b) || (s.start == b && s.end == a)
+        })
+    }
+
+    /// Coordinates forced onto pid by the H/V/coincident network, if any
+    /// (first found per axis; point-on-edge relations don't fix a coord).
+    /// Used to reject pairs whose existing constraints already force
+    /// different positions on the constrained axis.
+    pub(crate) fn required_coords(doc: &Document, pid: PointId) -> (Option<f64>, Option<f64>) {
+        use std::collections::HashSet;
+        let mut seen: HashSet<PointId> = HashSet::new();
+        let mut stack = vec![pid];
+        let (mut rx, mut ry) = (None, None);
+        while let Some(p) = stack.pop() {
+            if !seen.insert(p) {
+                continue;
+            }
+            for c in &doc.constraints {
+                let other = if c.a == p {
+                    Some(c.b)
+                } else if c.b == p {
+                    Some(c.a)
+                } else {
+                    None
+                };
+                let Some(o) = other else { continue };
+                let Some(op) = doc.point(o) else { continue };
+                match c.kind {
+                    ConstraintKind::Horizontal => {
+                        if ry.is_none() {
+                            ry = Some(op.y);
+                        }
+                        stack.push(o);
+                    }
+                    ConstraintKind::Vertical => {
+                        if rx.is_none() {
+                            rx = Some(op.x);
+                        }
+                        stack.push(o);
+                    }
+                    ConstraintKind::Coincident if c.point_on_segment.is_none() => {
+                        if rx.is_none() {
+                            rx = Some(op.x);
+                        }
+                        if ry.is_none() {
+                            ry = Some(op.y);
+                        }
+                        stack.push(o);
+                    }
+                    _ => {}
+                }
+            }
+            if rx.is_some() && ry.is_some() {
+                break;
+            }
+        }
+        (rx, ry)
+    }
+
+    /// Locked direction of a line whose endpoints carry a matching H/V
+    /// constraint, if any.
+    pub(crate) fn locked_dir(doc: &Document, sid: SegmentId) -> Option<(f64, f64)> {
+        let s = doc.segment(sid)?;
+        if s.kind != crate::core::document::SegmentKind::Line {
+            return None;
+        }
+        doc.constraints.iter().find_map(|c| {
+            let pair = (c.a == s.start && c.b == s.end) || (c.a == s.end && c.b == s.start);
+            if !pair {
+                return None;
+            }
+            match c.kind {
+                ConstraintKind::Horizontal => Some((1.0, 0.0)),
+                ConstraintKind::Vertical => Some((0.0, 1.0)),
+                _ => None,
+            }
+        })
+    }
+
+    /// Curve tangent direction at the document location nearest `near`.
+    /// Orientation-agnostic (callers compare with abs dot).
+    pub(crate) fn curve_tangent_at(
+        doc: &Document,
+        sid: SegmentId,
+        near: Point2,
+    ) -> Option<(f64, f64)> {
+        use crate::core::document::SegmentKind as SK;
+        let s = doc.segment(sid)?;
+        match s.kind {
+            SK::Arc => {
+                let (Some(a), Some(b), Some(c)) = (
+                    doc.point(s.start),
+                    doc.point(s.end),
+                    s.ctrl.and_then(|id| doc.point(id)),
+                ) else {
+                    return None;
+                };
+                let (o, r) = crate::editor::arc::circumcircle(a, b, c)?;
+                if r < 1e-9 {
+                    return None;
+                }
+                // Project `near` onto the circle, then perpendicular.
+                let (dx, dy) = (near.x - o.x, near.y - o.y);
+                let l = (dx * dx + dy * dy).sqrt().max(1e-9);
+                Some((-dy / l, dx / l))
+            }
+            SK::Bezier => {
+                let (h1, h2) = s.bezier_handles();
+                let (Some(p0), Some(c1), Some(c2), Some(p1)) = (
+                    doc.point(s.start),
+                    h1.and_then(|id| doc.point(id)),
+                    h2.and_then(|id| doc.point(id)),
+                    doc.point(s.end),
+                ) else {
+                    return None;
+                };
+                Some(crate::editor::bezier::nearest_on_curve(p0, c1, c2, p1, near, 48).2)
+            }
+            _ => None,
+        }
+    }
+
+    /// HV candidate: (a, b, segment-if-from-line). Explicit line segments
+    /// win; else two bare points that don't share one segment and whose
+    /// inferred axis isn't already forced apart.
+    pub(crate) fn hv_candidates(
+        doc: &Document,
+        selection: &[ElementRef],
+    ) -> Option<(PointId, PointId, Option<SegmentId>)> {
+        use crate::core::document::SegmentKind as SK;
+        if let Some(sid) = selection.iter().find_map(|el| el.as_segment()) {
+            if let Some(s) = doc.segment(sid) {
+                if s.kind == SK::Line
+                    && doc.point(s.start).is_some()
+                    && doc.point(s.end).is_some()
+                {
+                    return Some((s.start, s.end, Some(sid)));
+                }
+            }
+        }
+        let pts = Self::gate_points(doc, selection);
+        if pts.len() < 2 {
+            return None;
+        }
+        let (a, b) = (pts[0], pts[1]);
+        if Self::same_segment_owner(doc, a, b) {
+            return None;
+        }
+        let (Some(pa), Some(pb)) = (doc.point(a), doc.point(b)) else {
+            return None;
+        };
+        // Same dominant-axis inference as the apply path.
+        let horizontal = (pa.y - pb.y).abs() <= (pa.x - pb.x).abs();
+        let (ra, rb) = (
+            Self::required_coords(doc, a),
+            Self::required_coords(doc, b),
+        );
+        let conflict = if horizontal {
+            matches!((ra.1, rb.1), (Some(x), Some(y)) if (x - y).abs() > 1e-6)
+        } else {
+            matches!((ra.0, rb.0), (Some(x), Some(y)) if (x - y).abs() > 1e-6)
+        };
+        if conflict {
+            return None;
+        }
+        Some((a, b, None))
+    }
+
+    /// Whether gluing a and b is compatible with forced coordinates.
+    fn coincident_feasible(doc: &Document, a: PointId, b: PointId) -> bool {
+        let (ra, rb) = (
+            Self::required_coords(doc, a),
+            Self::required_coords(doc, b),
+        );
+        let x_ok = match (ra.0, rb.0) {
+            (Some(x), Some(y)) => (x - y).abs() <= 1e-6,
+            _ => true,
+        };
+        let y_ok = match (ra.1, rb.1) {
+            (Some(x), Some(y)) => (x - y).abs() <= 1e-6,
+            _ => true,
+        };
+        x_ok && y_ok
+    }
+
+    /// Coincident candidate: explicit point pairs (never same-segment),
+    /// else a lone point to its nearest selected-segment endpoint (never
+    /// itself), else the nearest cross-segment endpoint pair. All pairs
+    /// feasibility-checked.
+    pub(crate) fn coincident_candidates(
+        doc: &Document,
+        selection: &[ElementRef],
+    ) -> Option<(PointId, PointId)> {
+        let points = Self::gate_points(doc, selection);
+        let segs = Self::gate_segs(doc, selection);
+        if points.len() >= 2 {
+            let (a, b) = (points[0], points[1]);
+            if a != b
+                && !Self::same_segment_owner(doc, a, b)
+                && Self::coincident_feasible(doc, a, b)
+            {
+                return Some((a, b));
+            }
+            return None;
+        }
+        let mut ends: Vec<(usize, PointId, Point2)> = Vec::new();
+        for (si, sid) in segs.iter().enumerate() {
+            if let Some(s) = doc.segment(*sid) {
+                if let Some(p) = doc.point(s.start) {
+                    ends.push((si, s.start, p));
+                }
+                if let Some(p) = doc.point(s.end) {
+                    ends.push((si, s.end, p));
+                }
+            }
+        }
+        if points.len() == 1 && !ends.is_empty() {
+            let Some(p) = doc.point(points[0]) else {
+                return None;
+            };
+            let best = ends
+                .iter()
+                .filter(|(_, id, _)| *id != points[0])
+                .min_by(|(_, _, a), (_, _, b)| {
+                    pick::distance(*a, p)
+                        .partial_cmp(&pick::distance(*b, p))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            if let Some(&(_, id, _)) = best {
+                if Self::coincident_feasible(doc, points[0], id) {
+                    return Some((points[0], id));
+                }
+            }
+            return None;
+        }
+        if ends.len() >= 2 {
+            let mut best: Option<(f64, PointId, PointId)> = None;
+            for (i, &(sa, a, pa)) in ends.iter().enumerate() {
+                for &(sb, b, pb) in &ends[i + 1..] {
+                    if sa == sb || a == b {
+                        continue;
+                    }
+                    let d = pick::distance(pa, pb);
+                    if best.map_or(true, |(bd, _, _)| d < bd)
+                        && Self::coincident_feasible(doc, a, b)
+                    {
+                        best = Some((d, a, b));
+                    }
+                }
+            }
+            return best.map(|(_, a, b)| (a, b));
+        }
+        None
+    }
+
+    /// Merge pairs: close (within tol), unglued bare-point pairs — the old
+    /// bond-popup condition. Only these may merge; mass selections never
+    /// collapse to one point.
+    pub(crate) fn merge_candidate_pairs(
+        doc: &Document,
+        selection: &[ElementRef],
+        tol: f64,
+    ) -> Vec<(PointId, PointId)> {
+        let points = Self::gate_points(doc, selection);
+        let mut out = Vec::new();
+        for (i, &a) in points.iter().enumerate() {
+            let Some(pa) = doc.point(a) else { continue };
+            for &b in &points[i + 1..] {
+                if a == b {
+                    continue;
+                }
+                let Some(pb) = doc.point(b) else { continue };
+                if pick::distance(pa, pb) > tol {
+                    continue;
+                }
+                let glued = doc.constraints.iter().any(|c| {
+                    c.kind == ConstraintKind::Coincident
+                        && ((c.a == a && c.b == b) || (c.a == b && c.b == a))
+                });
+                if glued {
+                    continue;
+                }
+                out.push((a, b));
+            }
+        }
+        out
+    }
+
+    /// Tangent candidate: (line, other, contact, collinear). Explicit
+    /// segments first, then segments implied by bare-point owners, so two
+    /// bare points on two lines can still go tangent-collinear. Ids are
+    /// always distinct; contact is the joint (nearest line end to the
+    /// other's ends).
+    pub(crate) fn tangent_candidate(
+        doc: &Document,
+        selection: &[ElementRef],
+    ) -> Option<(SegmentId, SegmentId, PointId, bool)> {
+        use crate::core::document::SegmentKind as SK;
+        let mut lines: Vec<SegmentId> = Vec::new();
+        let mut curves: Vec<SegmentId> = Vec::new();
+        let mut push_seg = |sid: SegmentId| {
+            let Some(s) = doc.segment(sid) else { return };
+            if s.kind == SK::Line {
+                if !lines.contains(&sid) && lines.len() < 2 {
+                    lines.push(sid);
+                }
+            } else if s.is_curve() {
+                if !curves.contains(&sid) && curves.is_empty() {
+                    curves.push(sid);
+                }
+            }
+        };
+        for el in selection {
+            if let Some(sid) = el.as_segment() {
+                push_seg(sid);
+            }
+        }
+        for pid in Self::gate_points(doc, selection) {
+            if let Some(oid) = Self::owner_segment(doc, pid) {
+                push_seg(oid);
+            }
+        }
+        let line = *lines.first()?;
+        let (other, collinear) = if let Some(&c) = curves.first() {
+            if c == line {
+                return None;
+            }
+            (c, false)
+        } else if lines.len() >= 2 && lines[1] != line {
+            (lines[1], true)
+        } else {
+            return None;
+        };
+        let (Some(lseg), Some(cseg)) = (doc.segment(line), doc.segment(other)) else {
+            return None;
+        };
+        let mut best: Option<(f64, PointId)> = None;
+        for lid in [lseg.start, lseg.end] {
+            let Some(lp) = doc.point(lid) else { continue };
+            for cid in [cseg.start, cseg.end] {
+                let Some(cp) = doc.point(cid) else { continue };
+                let d = pick::distance(lp, cp);
+                if best.map_or(true, |(bd, _)| d < bd) {
+                    best = Some((d, lid));
+                }
+            }
+        }
+        let (_, contact) = best?;
+        Some((line, other, contact, collinear))
+    }
+
+    /// Tangent feasibility against existing locks. Free lines always pass
+    /// (the solver swings them into place). Locked lines must already ride
+    /// the curve tangent (~12°); collinear pairs need parallel lock dirs.
+    pub(crate) fn tangent_feasible(
+        doc: &Document,
+        line: SegmentId,
+        other: SegmentId,
+        contact: PointId,
+    ) -> bool {
+        use crate::core::document::SegmentKind as SK;
+        let Some(oseg) = doc.segment(other) else {
+            return false;
+        };
+        let parallel_dirs = |a: (f64, f64), b: (f64, f64)| {
+            (a.0 * b.1 - a.1 * b.0).abs() < 0.05
+        };
+        if oseg.kind == SK::Line {
+            match (Self::locked_dir(doc, line), Self::locked_dir(doc, other)) {
+                (Some(a), Some(b)) => parallel_dirs(a, b),
+                _ => true,
+            }
+        } else {
+            let Some(d) = Self::locked_dir(doc, line) else {
+                return true;
+            };
+            let Some(cp) = doc.point(contact) else {
+                return false;
+            };
+            let Some(t) = Self::curve_tangent_at(doc, other, cp) else {
+                return true;
+            };
+            (d.0 * t.0 + d.1 * t.1).abs() > 0.978
+        }
+    }
+
+    /// Two distinct explicitly-selected lines, if present.
+    pub(crate) fn line_pair(
+        doc: &Document,
+        selection: &[ElementRef],
+    ) -> Option<(SegmentId, SegmentId)> {
+        use crate::core::document::SegmentKind as SK;
+        let mut lines = Vec::new();
+        for el in selection {
+            if let Some(sid) = el.as_segment()
+                && let Some(s) = doc.segment(sid)
+                && s.kind == SK::Line
+                && !lines.contains(&sid)
+            {
+                lines.push(sid);
+                if lines.len() == 2 {
+                    break;
+                }
+            }
+        }
+        if lines.len() == 2 {
+            Some((lines[0], lines[1]))
+        } else {
+            None
+        }
+    }
+
+    /// Parallel/perpendicular feasibility against H/V locks. A free side
+    /// always passes; two locked sides must already satisfy the relation.
+    pub(crate) fn line_pair_feasible(
+        doc: &Document,
+        a: SegmentId,
+        b: SegmentId,
+        want_parallel: bool,
+    ) -> bool {
+        match (Self::locked_dir(doc, a), Self::locked_dir(doc, b)) {
+            (Some(x), Some(y)) => {
+                let cross = (x.0 * y.1 - x.1 * y.0).abs();
+                let dot = (x.0 * y.0 + x.1 * y.1).abs();
+                if want_parallel { cross < 0.05 } else { dot < 0.05 }
+            }
+            _ => true,
+        }
+    }
+
+    /// Applies a constraint from the floating menu based on selection.
+    /// Returns true when the document changed.
+    pub fn apply_constraint_from_menu(&mut self, kind: ConstraintKind) -> bool {
+        match kind {
+            ConstraintKind::Horizontal | ConstraintKind::Vertical => {
+                // Shared candidates (same function the menu gates on).
+                let Some((pa, pb, sid)) =
+                    Self::hv_candidates(&self.doc, &self.selection)
+                else {
+                    return false;
+                };
+                let (Some(a), Some(b)) = (self.doc.point(pa), self.doc.point(pb)) else {
+                    return false;
+                };
+                // Infer purely from geometry: the dominant axis wins. (The
+                // menu passes Horizontal as a selector, never a decision.)
+                let k = if (a.y - b.y).abs() <= (a.x - b.x).abs() {
+                    ConstraintKind::Horizontal
+                } else {
+                    ConstraintKind::Vertical
+                };
+                // Toggle: remove if present, else add.
+                if let Some(pos) = self.doc.constraints.iter().position(|c| {
+                    (c.kind == ConstraintKind::Horizontal
+                        || c.kind == ConstraintKind::Vertical)
+                        && ((c.a == pa && c.b == pb) || (c.a == pb && c.b == pa))
+                }) {
+                    self.doc.constraints.remove(pos);
+                    self.doc_gen += 1;
+                    return true;
+                }
+                self.history_begin();
+                self.doc.add_constraint(k, pa, pb);
+                let els = match sid {
+                    Some(sid) => vec![ElementRef::Segment(sid)],
+                    None => vec![ElementRef::Point(pa), ElementRef::Point(pb)],
+                };
+                let ok = self.solve_constraint_now(&els);
+                if ok {
+                    self.flush_pending_history();
+                } else {
+                    self.gesture_snapshot = None;
+                }
+                ok
+            }
+            ConstraintKind::Coincident => {
+                // Shared candidates (same function the menu gates on).
+                let Some((a, b)) =
+                    Self::coincident_candidates(&self.doc, &self.selection)
+                else {
+                    return false;
+                };
+                self.history_begin();
+                self.doc.add_constraint(ConstraintKind::Coincident, a, b);
+                let ok = self.solve_constraint_now(&[ElementRef::Point(a), ElementRef::Point(b)]);
+                if ok {
+                    self.flush_pending_history();
+                } else {
+                    self.gesture_snapshot = None;
+                }
+                ok
+            }
+            ConstraintKind::Tangent => {
+                // Shared candidates (same function the menu gates on),
+                // re-checked for lock feasibility: a shown row always has
+                // valid inputs, and locked geometry can never reach here.
+                let Some((line, other, contact, collinear)) =
+                    Self::tangent_candidate(&self.doc, &self.selection)
+                else {
+                    return false;
+                };
+                if !Self::tangent_feasible(&self.doc, line, other, contact) {
+                    return false;
+                }
+                self.history_begin();
+                if collinear {
+                    // Line + line collinearity, decomposed into Parallel +
+                    // a Coincident joint (parallel lines sharing an
+                    // endpoint are one line).
+                    let (a, b) = (line, other);
+                    let (Some(sa), Some(sb)) =
+                        (self.doc.segment(a), self.doc.segment(b))
+                    else {
+                        self.gesture_snapshot = None;
+                        return false;
+                    };
+                    // Nearest cross endpoint pair becomes the joint.
+                    let mut best: Option<(f64, PointId, PointId)> = None;
+                    for lid in [sa.start, sa.end] {
+                        let Some(lp) = self.doc.point(lid) else {
+                            continue;
+                        };
+                        for cid in [sb.start, sb.end] {
+                            let Some(cp) = self.doc.point(cid) else {
+                                continue;
+                            };
+                            let d = pick::distance(lp, cp);
+                            if best.map_or(true, |(bd, _, _)| d < bd) {
+                                best = Some((d, lid, cid));
+                            }
+                        }
+                    }
+                    let Some((_, ja, jb)) = best else {
+                        self.gesture_snapshot = None;
+                        return false;
+                    };
+                    self.make_line_parallel(b, a);
+                    self.doc.add_parallel_constraint(a, b);
+                    if ja != jb {
+                        self.doc.add_constraint(ConstraintKind::Coincident, ja, jb);
+                    }
+                    let ok = self.solve_constraint_now(&[
+                        ElementRef::Segment(a),
+                        ElementRef::Segment(b),
+                    ]);
+                    if ok {
+                        self.flush_pending_history();
+                    } else {
+                        self.gesture_snapshot = None;
+                    }
+                    return ok;
+                }
+                self.doc.add_tangent_constraint(line, other, contact);
+                let ok = self.solve_constraint_now(&[
+                    ElementRef::Segment(line),
+                    ElementRef::Segment(other),
+                ]);
+                if ok {
+                    self.flush_pending_history();
+                } else {
+                    self.gesture_snapshot = None;
+                }
+                ok
+            }
+            ConstraintKind::Parallel | ConstraintKind::Perpendicular => {
+                // Shared candidates + lock feasibility (same as the menu).
+                let Some((a, b)) = Self::line_pair(&self.doc, &self.selection) else {
+                    return false;
+                };
+                if !Self::line_pair_feasible(
+                    &self.doc,
+                    a,
+                    b,
+                    kind == ConstraintKind::Parallel,
+                ) {
+                    return false;
+                }
+                self.history_begin();
+                if kind == ConstraintKind::Parallel {
+                    self.make_line_parallel(b, a);
+                    self.doc.add_parallel_constraint(a, b);
+                } else {
+                    self.doc.add_perpendicular_constraint(a, b);
+                }
+                let ok =
+                    self.solve_constraint_now(&[ElementRef::Segment(a), ElementRef::Segment(b)]);
+                if ok {
+                    self.flush_pending_history();
+                } else {
+                    self.gesture_snapshot = None;
+                }
+                ok
+            }
+        }
+    }
+
+    /// Emits a standalone cubic bezier: 4 points + 1 stroked segment.
+    /// Handles are free; only endpoints participate in constraints.
+    pub fn create_bezier(
+        &mut self,
+        layer_id: u64,
+        p0: Point2,
+        c1: Point2,
+        c2: Point2,
+        p1: Point2,
+    ) -> SegmentId {
+        const BEZIER_STROKE_PX: f64 = 1.0;
+        let a = self.doc.add_point(p0);
+        let h1 = self.doc.add_point(c1);
+        let h2 = self.doc.add_point(c2);
+        let b = self.doc.add_point(p1);
+        let seg = self.doc.add_bezier_segment(a, h1, h2, b);
+        // Stamp stroke width directly (no dedicated setter on Document).
+        if let Some(slot) = self.doc.segment_mut(seg) {
+            slot.stroke_width = BEZIER_STROKE_PX;
+        }
+        self.doc.push_to_layer(layer_id, ElementRef::Point(a));
+        self.doc.push_to_layer(layer_id, ElementRef::Point(h1));
+        self.doc.push_to_layer(layer_id, ElementRef::Point(h2));
+        self.doc.push_to_layer(layer_id, ElementRef::Point(b));
+        self.doc.push_to_layer(layer_id, ElementRef::Segment(seg));
+        seg
     }
 
     // True while no drag or pan is in progress (gates hover tracking).
@@ -424,10 +1343,6 @@ impl Editor {
         shift: bool,
         click_count: usize,
     ) -> bool {
-        // Any click dismisses the pending bond-choice menu first.
-        if self.context_menu.take().is_some() {
-            return true;
-        }
         match button {
             gpui::MouseButton::Middle => {
                 // MMB always pans, whatever tool is active. No history: a
@@ -658,6 +1573,10 @@ impl Editor {
                             }
                         }
                         self.dim_target = self.resolve_dim_target(&self.dim_picks);
+                        // A pick implying its own type (arc radius, angle,
+                        // point-line, ...) lifts a lock that can't apply to
+                        // it, so the menu never shows a stale restriction.
+                        self.drop_stale_dim_lock();
                         // Mirror the picks as selection so they highlight —
                         // without visible feedback a pick looks like it failed.
                         self.selection = self
@@ -687,6 +1606,7 @@ impl Editor {
                     }
                     false
                 }
+                Tool::Pen => self.pen_tool_click(cursor, shift),
                 // Constraint tools are handled before this mode match so
                 // their clicks never enter shape/dimension creation. Keep an
                 // explicit arm for exhaustive enum matching.
@@ -699,6 +1619,662 @@ impl Editor {
             }
             _ => false,
         }
+    }
+
+    /// Pen clicks by sub-mode. Stays in Pen (chains like the legacy line
+    /// tool); `Esc` / tool switch cancels via `set_tool`.
+    fn pen_tool_click(&mut self, cursor: gpui::Point<gpui::Pixels>, shift: bool) -> bool {
+        let (at, guides) = self.snap_creation_point(self.cursor_doc(cursor));
+        self.snap_guides = guides;
+        match self.pen_mode {
+            PenMode::Line => self.pen_line_click(at, shift),
+            PenMode::Arc => self.pen_arc_click(at, shift),
+            PenMode::Bezier => self.pen_bezier_click(at),
+        }
+    }
+
+    /// Commits one pen line span anchor -> b. Shared by press-commit and
+    /// release-commit; re-stages the next span from b.
+    fn commit_pen_line(&mut self, b: Point2, shift: bool) {
+        let Some(anchor) = self.pen_anchor else { return };
+        self.snap_guides.clear();
+        let layer_id = self.doc.layers[0].id;
+        let seg = self.create_line(layer_id, anchor, b);
+        // Merge FIRST: constraint creation below must reference the live
+        // (post-merge) point ids, or the constraints dangle on a destroyed
+        // point and their chips never render.
+        self.pen_chain_end(seg);
+        if let Some((source, _, _)) = self.perpendicular_preview.take() {
+            self.doc.add_perpendicular_constraint(source, seg);
+        }
+        if shift {
+            self.maybe_add_tangent(seg, b);
+        }
+        self.auto_tangent_for_pen(seg);
+        self.selection = vec![ElementRef::Segment(seg)];
+        let chained = self.pen_anchor.unwrap_or(b);
+        self.pending_pen = Some(PendingPen {
+            mode: PenMode::Line,
+            line: Some(tools::PendingLine { start: chained, cursor: chained }),
+            bezier: None,
+            circle: None,
+        });
+    }
+
+    fn pen_line_click(&mut self, at: Point2, shift: bool) -> bool {
+        // Press commits the LIVE preview (mirror the legacy line tool):
+        // the preview has been tracking the cursor via moves, so commit
+        // anchor -> preview end. A fresh/zero-length staging re-anchors.
+        if let Some(pending) = self.pending_pen.take() {
+            if let Some(line) = pending.line {
+                let (_, mut b) = line.snapped(shift);
+                if shift {
+                    if let Some(q) = self.tangent_snap_for_line(line.start, line.cursor) {
+                        b = q;
+                    }
+                }
+                if pick::distance(b, line.start) > 1e-6 {
+                    self.pending_pen = Some(pending);
+                    self.commit_pen_line(b, shift);
+                } else {
+                    // Fresh link: re-anchor at the press point.
+                    let (nat, g) = self.snap_creation_point(at);
+                    self.snap_guides = g;
+                    self.pen_anchor = Some(nat);
+                    self.pending_pen = Some(PendingPen {
+                        mode: PenMode::Line,
+                        line: Some(tools::PendingLine { start: nat, cursor: nat }),
+                        bezier: None,
+                        circle: None,
+                    });
+                }
+                self.pending_via_click = true;
+                return true;
+            }
+            self.pending_pen = Some(pending);
+        }
+        // No staging (fresh tool or just switched with no anchor): anchor.
+        let (nat, g) = self.snap_creation_point(at);
+        self.snap_guides = g;
+        self.pen_anchor = Some(nat);
+        self.pending_pen = Some(PendingPen::for_mode(PenMode::Line, nat));
+        self.pending_via_click = true;
+        true
+    }
+
+    fn pen_arc_click(&mut self, at: Point2, shift: bool) -> bool {
+        // 3-press arc through the shared chain anchor: press1 fixes the
+        // chord start at the anchor, press2 fixes the chord end, press3
+        // (on-arc point) commits and chains from the chord end.
+        if let Some(pending) = self.pending_pen.take() {
+            if let Some(mut pc) = pending.circle {
+                if pc.a.is_some() && pc.b.is_some() {
+                    self.pending_via_click = false;
+                    self.snap_guides.clear();
+                    if let (Some(a), Some(b)) = (pc.a, pc.b) {
+                        let c = pc.cursor;
+                        let layer_id = self.doc.layers[0].id;
+                        let seg = self.create_arc(layer_id, a, b, c);
+                        // Merge before constraining (see commit_pen_line).
+                        self.pen_chain_end(seg);
+                        self.auto_tangent_for_pen(seg);
+                        self.selection = vec![ElementRef::Segment(seg)];
+                        let chained = self.pen_anchor.unwrap_or(b);
+                        self.pending_pen =
+                            Some(PendingPen::for_mode(PenMode::Arc, chained));
+                    } else {
+                        self.pending_pen = Some(pending);
+                    }
+                    return true;
+                }
+                match (&pc.a, &pc.b) {
+                    (Some(_), None) => {
+                        let mut nat = at;
+                        if shift && let Some(a) = pc.a {
+                            nat = tools::snap_angle(a, nat);
+                        }
+                        pc.b = Some(nat);
+                        pc.cursor = nat;
+                        self.pending_via_click = true;
+                    }
+                    _ => {
+                        // Anchor the chord start (anchor wins when set).
+                        let start = self.pen_anchor.unwrap_or(at);
+                        pc.a = Some(start);
+                        pc.cursor = at;
+                        self.pen_anchor = Some(start);
+                        self.pending_via_click = true;
+                    }
+                }
+                self.pending_pen = Some(PendingPen {
+                    mode: PenMode::Arc,
+                    line: None,
+                    bezier: None,
+                    circle: Some(pc),
+                });
+                return true;
+            }
+            self.pending_pen = Some(pending);
+        }
+        // Fresh staging starts at the live anchor when chaining.
+        let start = self.pen_anchor.unwrap_or(at);
+        self.pen_anchor = Some(start);
+        let mut pc = PendingCircle { a: Some(start), b: None, cursor: at };
+        // Single-press anchor set: cursor stays on the press.
+        if self.pen_anchor == Some(at) {
+            pc.cursor = at;
+        }
+        self.pending_pen = Some(PendingPen {
+            mode: PenMode::Arc,
+            line: None,
+            bezier: None,
+            circle: Some(pc),
+        });
+        self.pending_via_click = true;
+        true
+    }
+
+    fn pen_bezier_click(&mut self, at: Point2) -> bool {
+        // Press fixes geometry, release commits:
+        //  - press 1 (no staging): anchor p0, await the second press;
+        //  - press 2: fix the endpoint p1 = press point; the drag that
+        //    follows shapes the far handle, release commits the span.
+        if let Some(pending) = self.pending_pen.take() {
+            if let Some(mut pb) = pending.bezier {
+                // (Re-)fix the endpoint at the press point; the drag that
+                // follows shapes the nearest handle, release commits.
+                // The near side defaults to the smooth mirror of the
+                // previous span (a later drag near that side overrides it).
+                let (nat, g) = self.snap_creation_point(at);
+                self.snap_guides = g;
+                let mirror = self.pen_mirror_handle();
+                pb.p1 = Some(nat);
+                pb.h1 = mirror;
+                pb.h2 = None;
+                pb.cursor = nat;
+                self.pending_pen = Some(PendingPen {
+                    mode: PenMode::Bezier,
+                    line: None,
+                    bezier: Some(pb),
+                    circle: None,
+                });
+                self.pending_via_click = true;
+                return true;
+            }
+            self.pending_pen = Some(pending);
+        }
+        // Fresh staging starts at the live anchor when chaining, with the
+        // near handle pre-mirrored so the preview already guesses the
+        // smooth continuation curve (never a straight chord).
+        let start = self.pen_anchor.unwrap_or(at);
+        let (nat, g) = if self.pen_anchor.is_some() {
+            (start, Vec::new())
+        } else {
+            self.snap_creation_point(at)
+        };
+        self.snap_guides = g;
+        self.pen_anchor = Some(nat);
+        let h1 = self.pen_mirror_handle();
+        self.pending_pen = Some(PendingPen {
+            mode: PenMode::Bezier,
+            line: None,
+            bezier: Some(PendingBezier {
+                p0: nat,
+                p1: None,
+                h1,
+                h2: None,
+                cursor: at,
+            }),
+            circle: None,
+        });
+        self.pending_via_click = true;
+        true
+    }
+
+    /// Bezier release-commit: straight span on click-click, handled span
+    /// when the second press dragged (handle = release point).
+    fn pen_bezier_release(&mut self) -> bool {
+        let Some(pending) = self.pending_pen.take() else {
+            return false;
+        };
+        let Some(pb) = pending.bezier else {
+            self.pending_pen = Some(pending);
+            return false;
+        };
+        let Some(p1) = pb.p1 else {
+            // First click only anchored p0 — await the second press.
+            self.pending_pen = Some(PendingPen {
+                mode: PenMode::Bezier,
+                line: None,
+                bezier: Some(pb),
+                circle: None,
+            });
+            return true;
+        };
+        let end = p1;
+        if pick::distance(end, pb.p0) <= 1e-6 {
+            // Degenerate: keep staging, await a real endpoint.
+            self.pending_pen = Some(PendingPen {
+                mode: PenMode::Bezier,
+                line: None,
+                bezier: Some(PendingBezier {
+                    p0: pb.p0,
+                    p1: None,
+                    h1: None,
+                    h2: None,
+                    cursor: pb.cursor,
+                }),
+                circle: None,
+            });
+            return true;
+        }
+        let lerp = |t: f64| {
+            Point2::new(
+                pb.p0.x + (end.x - pb.p0.x) * t,
+                pb.p0.y + (end.y - pb.p0.y) * t,
+            )
+        };
+        // Dragged handles win per side (the far drag rides opposite, via
+        // `effective`); an untouched near side mirrors the previous span's
+        // far handle (smooth joints); otherwise thirds (straight).
+        let mirror = self.pen_mirror_handle();
+        let c1 = pb.h1.or(mirror).unwrap_or_else(|| lerp(1. / 3.));
+        let c2 = pb
+            .h2
+            .map(|h| Point2::new(2. * end.x - h.x, 2. * end.y - h.y))
+            .unwrap_or_else(|| lerp(2. / 3.));
+        self.snap_guides.clear();
+        let layer_id = self.doc.layers[0].id;
+        let seg = self.create_bezier(layer_id, pb.p0, c1, c2, end);
+        // Merge before constraining (see commit_pen_line).
+        self.pen_chain_end(seg);
+        self.auto_tangent_for_pen(seg);
+        self.selection = vec![ElementRef::Segment(seg)];
+        let chained = self.pen_anchor.unwrap_or(end);
+        // Restage with the near handle already reflecting the span we
+        // just laid (smooth continuation preview from the first move).
+        let next_h1 = Point2::new(2. * end.x - c2.x, 2. * end.y - c2.y);
+        let next_h1 = (pick::distance(next_h1, end) > 1e-6).then_some(next_h1);
+        self.pending_pen = Some(PendingPen {
+            mode: PenMode::Bezier,
+            line: None,
+            bezier: Some(PendingBezier {
+                p0: chained,
+                p1: None,
+                h1: next_h1,
+                h2: None,
+                cursor: chained,
+            }),
+            circle: None,
+        });
+        self.pending_via_click = true;
+        true
+    }
+
+    /// Release-commit for the pen (mirrors the legacy line release):
+    /// a dragged preview commits, a motionless click keeps staging.
+    fn pen_release_commit(&mut self, shift: bool) -> bool {
+        let Some(pending) = self.pending_pen.take() else {
+            return false;
+        };
+        match pending.mode {
+            PenMode::Bezier => {
+                self.pending_pen = Some(pending);
+                return self.pen_bezier_release();
+            }
+            PenMode::Line => {
+                let Some(line) = pending.line else {
+                    self.pending_pen = Some(pending);
+                    return false;
+                };
+                let (_, mut b) = line.snapped(shift);
+                if shift {
+                    if let Some(q) = self.tangent_snap_for_line(line.start, line.cursor) {
+                        b = q;
+                    }
+                }
+                if self.pending_via_click && pick::distance(b, line.start) <= 1e-6 {
+                    self.pending_pen = Some(pending);
+                    return true;
+                }
+                self.pending_via_click = true;
+                if pick::distance(b, line.start) > 1e-6 {
+                    self.pending_pen = Some(pending);
+                    self.commit_pen_line(b, shift);
+                } else {
+                    self.pending_pen = Some(pending);
+                }
+                return true;
+            }
+            // Arcs commit on the third press, never on release.
+            PenMode::Arc => {
+                self.pending_pen = Some(pending);
+                return false;
+            }
+        }
+    }
+
+    /// Auto-tangent for chained pen spans: when the new span starts where
+    /// the previous span ended (within snap tolerance) and directions align
+    /// (~5°), bond them with a Tangent constraint + coincident endpoints.
+    fn auto_tangent_for_pen(&mut self, fresh: SegmentId) {
+        let Some(cur) = self.doc.segment(fresh) else { return };
+        let (Some(cp0), Some(cp1)) = (self.doc.point(cur.start), self.doc.point(cur.end)) else {
+            return;
+        };
+        let cur_tan = self.span_start_tangent(fresh);
+        let tol = self.snap_tol_doc() * 1.5;
+        // Find a prior span sharing the fresh start point.
+        let mut prev_id: Option<SegmentId> = None;
+        for (sid, _) in self.doc.all_segments() {
+            if sid == fresh {
+                continue;
+            }
+            let Some(s) = self.doc.segment(sid) else { continue };
+            if !matches!(
+                s.kind,
+                crate::core::document::SegmentKind::Line
+                    | crate::core::document::SegmentKind::Arc
+                    | crate::core::document::SegmentKind::Bezier
+            ) {
+                continue;
+            }
+            let touches = [s.start, s.end].iter().any(|&p| {
+                self.doc.point(p).is_some_and(|q| pick::distance(q, cp0) <= tol)
+            });
+            if touches {
+                prev_id = Some(sid);
+                break;
+            }
+        }
+        let Some(prev) = prev_id else { return };
+        let prev_tan = self.span_end_tangent(prev);
+        let (Some(a), Some(b)) = (cur_tan, prev_tan) else { return };
+        // Both tangents point AWAY from the joint; incoming must oppose.
+        let dot = a.0 * b.0 + a.1 * b.1;
+        if dot < -0.996 {
+            let prev_seg = self.doc.segment(prev);
+            // Line-on-line tangency is collinearity: Parallel (+ the joint
+            // is already shared by chaining). A raw Tangent constraint has
+            // no line-line equation and would sit dead.
+            if cur.kind == crate::core::document::SegmentKind::Line
+                && prev_seg.is_some_and(|s| s.kind == crate::core::document::SegmentKind::Line)
+            {
+                self.doc.add_parallel_constraint(prev, fresh);
+                let _ = self.solve_constraint_now(&[
+                    ElementRef::Segment(prev),
+                    ElementRef::Segment(fresh),
+                ]);
+                return;
+            }
+            // Coincident joint (distinct ids from chaining).
+            let pj = self.doc.segment(prev).map(|s| s.end);
+            if let Some(pj) = pj
+                && pj != cur.start
+            {
+                self.doc.add_constraint(ConstraintKind::Coincident, pj, cur.start);
+            }
+            self.doc.add_tangent_constraint(prev, fresh, cur.start);
+            let _ = self.solve_constraint_now(&[ElementRef::Segment(prev), ElementRef::Segment(fresh)]);
+            let _ = cp1;
+        }
+    }
+
+    fn span_start_tangent(&self, sid: SegmentId) -> Option<(f64, f64)> {
+        let s = self.doc.segment(sid)?;
+        let (p0, p1) = (self.doc.point(s.start)?, self.doc.point(s.end)?);
+        match s.kind {
+            crate::core::document::SegmentKind::Line => {
+                let (dx, dy) = (p1.x - p0.x, p1.y - p0.y);
+                let l = (dx * dx + dy * dy).sqrt().max(1e-9);
+                Some((dx / l, dy / l))
+            }
+            crate::core::document::SegmentKind::Arc => {
+                let c = s.ctrl.and_then(|id| self.doc.point(id))?;
+                let (o, _) = crate::editor::arc::circumcircle(p0, p1, c)?;
+                let (dx, dy) = (p0.x - o.x, p0.y - o.y);
+                let l = (dx * dx + dy * dy).sqrt().max(1e-9);
+                // Tangent at p0, oriented away (p0 -> along sweep). Sign from
+                // sweep side: use perpendicular, pick the one leaving p0.
+                let (tx, ty) = (-dy / l, dx / l);
+                // Orient along the arc: dot with (c - p0) tangent side.
+                let mx = c.x - p0.x;
+                let my = c.y - p0.y;
+                let s = tx * mx + ty * my;
+                Some(if s >= 0. { (tx, ty) } else { (-tx, -ty) })
+            }
+            crate::core::document::SegmentKind::Bezier => {
+                let (h1, h2) = s.bezier_handles();
+                let c1 = h1.and_then(|id| self.doc.point(id)).unwrap_or(p1);
+                let c2 = h2.and_then(|id| self.doc.point(id)).unwrap_or(p0);
+                Some(bezier::end_tangent(p0, c1, c2, p1, true))
+            }
+            _ => None,
+        }
+    }
+
+    fn span_end_tangent(&self, sid: SegmentId) -> Option<(f64, f64)> {
+        let s = self.doc.segment(sid)?;
+        let (p0, p1) = (self.doc.point(s.start)?, self.doc.point(s.end)?);
+        match s.kind {
+            crate::core::document::SegmentKind::Line => {
+                let (dx, dy) = (p1.x - p0.x, p1.y - p0.y);
+                let l = (dx * dx + dy * dy).sqrt().max(1e-9);
+                Some((dx / l, dy / l))
+            }
+            crate::core::document::SegmentKind::Arc => {
+                let c = s.ctrl.and_then(|id| self.doc.point(id))?;
+                let (o, _) = crate::editor::arc::circumcircle(p0, p1, c)?;
+                let (dx, dy) = (p1.x - o.x, p1.y - o.y);
+                let l = (dx * dx + dy * dy).sqrt().max(1e-9);
+                let (tx, ty) = (-dy / l, dx / l);
+                let mx = c.x - p1.x;
+                let my = c.y - p1.y;
+                let sg = tx * mx + ty * my;
+                Some(if sg >= 0. { (tx, ty) } else { (-tx, -ty) })
+            }
+            crate::core::document::SegmentKind::Bezier => {
+                let (h1, h2) = s.bezier_handles();
+                let c1 = h1.and_then(|id| self.doc.point(id)).unwrap_or(p1);
+                let c2 = h2.and_then(|id| self.doc.point(id)).unwrap_or(p0);
+                Some(bezier::end_tangent(p0, c1, c2, p1, false))
+            }
+            _ => None,
+        }
+    }
+
+    /// Live pen preview tracking (called from `canvas_drag`).
+    fn pen_drag_update(&mut self, cursor: gpui::Point<gpui::Pixels>, shift: bool) -> bool {
+        let Some(pending) = self.pending_pen else {
+            return false;
+        };
+        let at = self.cursor_doc(cursor);
+        let (at, guides) = self.snap_creation_point(at);
+        self.snap_guides = guides;
+        match pending.mode {
+            PenMode::Line => {
+                let Some(line) = pending.line else {
+                    return true;
+                };
+                // Free: plain object/grid snap only. Shift arms the whole
+                // constraint layer — 45° lock, arc-tangent lock and the
+                // perpendicular snap. Never yank the preview otherwise.
+                let (tangent_at, perpendicular) = if shift {
+                    let tan = self.tangent_snap_for_line(line.start, at);
+                    let perp =
+                        self.perpendicular_snap_for_line(line.start, tan.unwrap_or(at));
+                    (tan, perp)
+                } else {
+                    (self.bezier_tangent_snap(line.start, at), None)
+                };
+                let final_at =
+                    perpendicular.map(|(p, _)| p).unwrap_or(tangent_at.unwrap_or(at));
+                self.perpendicular_preview =
+                    perpendicular.map(|(p, sid)| (sid, line.start, p));
+                if let Some(dst) = self.pending_pen.as_mut().and_then(|p| p.line.as_mut()) {
+                    dst.cursor = final_at;
+                }
+            }
+            PenMode::Arc => {
+                let Some(mut pc) = pending.circle else {
+                    return true;
+                };
+                let (nat, shifted) =
+                    Self::arc_creation_shift(pc.stage(), pc.a, pc.b, at, shift);
+                if shifted {
+                    self.snap_guides.clear();
+                }
+                pc.cursor = nat;
+                if let Some(dst) = self.pending_pen.as_mut().and_then(|p| p.circle.as_mut()) {
+                    *dst = pc;
+                }
+            }
+            PenMode::Bezier => {
+                let Some(mut pb) = pending.bezier else {
+                    return true;
+                };
+                // After the endpoint press, the drag shapes the handle
+                // NEAREST the cursor (h1 at the p0 side, h2 at the p1
+                // side) — the handle under the cursor follows it.
+                if pb.p1.is_some() {
+                    let (d0, d1) = (
+                        pick::distance(at, pb.p0),
+                        pb.p1.map(|p| pick::distance(at, p)).unwrap_or(f64::MAX),
+                    );
+                    if d1 <= d0 {
+                        pb.h2 = Some(at);
+                    } else {
+                        pb.h1 = Some(at);
+                    }
+                }
+                pb.cursor = at;
+                if let Some(dst) = self.pending_pen.as_mut().and_then(|p| p.bezier.as_mut()) {
+                    *dst = pb;
+                }
+            }
+        }
+        // Tangent preview: the preview span leaves the anchor along an
+        // existing span's tangent — dashed ray off the anchor. Commit
+        // applies the real constraint (chip appears then).
+        if let (Some(anchor), Some((_, out))) = (self.pen_anchor, self.pen_preview_tangent()) {
+            let ray = 28. / self.camera.zoom;
+            self.snap_guides.push(snapping::SnapGuide {
+                vertical: false,
+                from: anchor,
+                to: Point2::new(anchor.x + out.0 * ray, anchor.y + out.1 * ray),
+                kind: snapping::SnapKind::Edge,
+                solid: true,
+                linked: false,
+                span_is_x: false,
+                span_lo: 0.,
+                span_hi: 0.,
+            });
+        }
+        true
+    }
+
+    /// Preview tangent alignment for the live pen span: the existing span
+    /// id when the preview leaves the chain anchor along that span's own
+    /// tangent (~5°). The drag layer draws a dashed guide off the anchor;
+    /// commit applies the real Tangent constraint via
+    /// `auto_tangent_for_pen` (whose chip then appears).
+    fn pen_preview_tangent(&self) -> Option<(SegmentId, (f64, f64))> {
+        let aid = self.pen_anchor_id?;
+        if self.doc.point(aid).is_none() {
+            return None;
+        }
+        let pending = self.pending_pen?;
+        let unit = |v: (f64, f64)| {
+            let l = (v.0 * v.0 + v.1 * v.1).sqrt();
+            if l < 1e-6 { None } else { Some((v.0 / l, v.1 / l)) }
+        };
+        let out: Option<(f64, f64)> = match pending.mode {
+            PenMode::Line => {
+                let l = pending.line?;
+                unit((l.cursor.x - l.start.x, l.cursor.y - l.start.y))
+            }
+            PenMode::Bezier => {
+                let pb = pending.bezier?;
+                let end = pb.p1.unwrap_or(pb.cursor);
+                if pick::distance(end, pb.p0) < 1e-6 {
+                    return None;
+                }
+                let (c1, c2) = pb.effective(end);
+                Some(bezier::end_tangent(pb.p0, c1, c2, end, true))
+            }
+            PenMode::Arc => {
+                let pc = pending.circle?;
+                let a = pc.a?;
+                let b = pc.b.unwrap_or(pc.cursor);
+                unit((b.x - a.x, b.y - a.y))
+            }
+        };
+        let out = out?;
+        for (sid, s) in self.doc.all_segments() {
+            if !matches!(
+                s.kind,
+                crate::core::document::SegmentKind::Line
+                    | crate::core::document::SegmentKind::Arc
+                    | crate::core::document::SegmentKind::Bezier
+            ) {
+                continue;
+            }
+            // Prev-span direction AWAY from the joint.
+            let prev = if s.end == aid {
+                self.span_end_tangent(sid)
+            } else if s.start == aid {
+                self.span_start_tangent(sid)
+            } else {
+                continue;
+            };
+            if let Some(p) = prev
+                && out.0 * p.0 + out.1 * p.1 < -0.996
+            {
+                return Some((sid, out));
+            }
+        }
+        None
+    }
+
+    /// Free (no-shift) pen tangent: ONLY continues a tangent when the span
+    /// starts ON an existing bezier (smooth chaining). Never touches arcs
+    /// so the preview is never yanked onto a distant external tangent.
+    fn bezier_tangent_snap(&self, start: Point2, cursor: Point2) -> Option<Point2> {
+        // Bezier targets: nearest-sample tangent ray through `start`.
+        let mut best: Option<(f64, Point2)> = None;
+        let tol = self.snap_tol_doc();
+        for (sid, seg) in self.doc.all_segments() {
+            if seg.kind != crate::core::document::SegmentKind::Bezier {
+                continue;
+            }
+            let (h1, h2) = seg.bezier_handles();
+            let (Some(p0), Some(c1), Some(c2), Some(p1)) = (
+                self.doc.point(seg.start),
+                h1.and_then(|id| self.doc.point(id)),
+                h2.and_then(|id| self.doc.point(id)),
+                self.doc.point(seg.end),
+            ) else {
+                continue;
+            };
+            // Only snap when starting ON the curve (chaining / G1).
+            let (near, d, tan) = bezier::nearest_on_curve(p0, c1, c2, p1, start, 48);
+            if d > tol {
+                continue;
+            }
+            let len = pick::distance(start, cursor).max(tol);
+            for side in [-1.0, 1.0] {
+                let q = Point2::new(
+                    near.x + tan.0 * len * side,
+                    near.y + tan.1 * len * side,
+                );
+                let score = pick::distance(q, cursor);
+                if best.map_or(true, |(s, _)| score < s) {
+                    best = Some((score, q));
+                }
+            }
+            let _ = sid;
+        }
+        best.map(|(_, q)| q)
     }
 
     fn move_tool_down(
@@ -1087,6 +2663,11 @@ impl Editor {
             return true;
         }
 
+        // Pen rubber band (unified line/arc/bezier preview).
+        if self.pending_pen.is_some() {
+            return self.pen_drag_update(cursor, shift);
+        }
+
         if self.dragging.is_none() {
             // Marquee band update.
             if let Some((start, _)) = self.marquee {
@@ -1098,14 +2679,140 @@ impl Editor {
             // clearing them wiped the crosshair highlight every move.
             // (update_creation_cursor refreshes them above; non-creation
             // tools still clear stale drag leftovers.)
-            if !matches!(self.tool, Tool::Line | Tool::Rectangle | Tool::Ruler | Tool::Circle) {
+            if !matches!(self.tool, Tool::Line | Tool::Rectangle | Tool::Ruler | Tool::Circle | Tool::Pen) {
                 self.snap_guides.clear();
             }
             return changed;
         }
 
         changed |= self.solve_drag(shift);
+        changed |= self.post_handle_drag();
         changed
+    }
+
+    /// Bezier handle post-pass, runs after every solved drag frame:
+    /// dragging ONE handle mirrors its joint partner across the shared
+    /// endpoint (symmetric handles, lengths preserved) and snaps the
+    /// dragged direction onto a neighboring span's tangent rail when
+    /// close (~10°). Alt-held drags stay fully free. Multi-drags never
+    /// touch handles symmetrically (they translate).
+    fn post_handle_drag(&mut self) -> bool {
+        if self.alt_down {
+            return false;
+        }
+        let Some(drag) = self.dragging.as_ref() else {
+            return false;
+        };
+        if drag.points.len() != 1 {
+            return false;
+        }
+        let hid = drag.points[0].0;
+        // Locate the dragged handle: its span + the joint endpoint.
+        let mut found: Option<(SegmentId, PointId)> = None;
+        for (sid, s) in self.doc.all_segments() {
+            if s.kind != crate::core::document::SegmentKind::Bezier {
+                continue;
+            }
+            if s.ctrl == Some(hid) {
+                found = Some((sid, s.start));
+                break;
+            }
+            if s.center == Some(hid) {
+                found = Some((sid, s.end));
+                break;
+            }
+        }
+        let Some((sid, joint)) = found else {
+            return false;
+        };
+        let (Some(hpos), Some(jpos)) = (self.doc.point(hid), self.doc.point(joint)) else {
+            return false;
+        };
+        let hlen = pick::distance(hpos, jpos);
+        if hlen < 1e-6 {
+            return false;
+        }
+        // Tangent rail: any OTHER span touching the joint lends its
+        // tangent; snap the dragged direction onto it when close.
+        let mut hpos = hpos;
+        let mut best_rail: Option<(f64, f64)> = None;
+        let mut best_ang = 0.21f64; // ~12°
+        for (osid, s) in self.doc.all_segments() {
+            if osid == sid {
+                continue;
+            }
+            if !matches!(
+                s.kind,
+                crate::core::document::SegmentKind::Line
+                    | crate::core::document::SegmentKind::Arc
+                    | crate::core::document::SegmentKind::Bezier
+            ) {
+                continue;
+            }
+            let touches = s.start == joint || s.end == joint;
+            if !touches {
+                continue;
+            }
+            // Neighbor direction AWAY from the joint.
+            let rail = if s.end == joint {
+                self.span_end_tangent(osid)
+            } else {
+                self.span_start_tangent(osid)
+            };
+            let Some((rx, ry)) = rail else {
+                continue;
+            };
+            // G1 allows either orientation; snap to the nearer rail side.
+            let (dx, dy) = ((hpos.x - jpos.x) / hlen, (hpos.y - jpos.y) / hlen);
+            for (sx, sy) in [(rx, ry), (-rx, -ry)] {
+                let dot = (dx * sx + dy * sy).clamp(-1., 1.);
+                let ang = dot.acos();
+                if ang < best_ang {
+                    best_ang = ang;
+                    best_rail = Some((sx, sy));
+                }
+            }
+        }
+        if let Some((rx, ry)) = best_rail {
+            hpos = Point2::new(jpos.x + rx * hlen, jpos.y + ry * hlen);
+            self.doc.move_point(hid, hpos);
+        }
+        // Mirror the partner handle (the other handle sharing this joint)
+        // across the joint, preserving the partner's own length.
+        let mut partner: Option<PointId> = None;
+        for (osid, s) in self.doc.all_segments() {
+            if s.kind != crate::core::document::SegmentKind::Bezier {
+                continue;
+            }
+            if osid == sid {
+                continue;
+            }
+            if s.start == joint && s.ctrl.is_some_and(|h| h != hid) {
+                partner = s.ctrl;
+                break;
+            }
+            if s.end == joint && s.center.is_some_and(|h| h != hid) {
+                partner = s.center;
+                break;
+            }
+        }
+        let Some(pid) = partner else {
+            return best_rail.is_some();
+        };
+        let (Some(ppos), ) = (self.doc.point(pid),) else {
+            return best_rail.is_some();
+        };
+        let plen = pick::distance(ppos, jpos);
+        if plen < 1e-6 {
+            return best_rail.is_some();
+        }
+        let (dx, dy) = (hpos.x - jpos.x, hpos.y - jpos.y);
+        let l = (dx * dx + dy * dy).sqrt().max(1e-9);
+        self.doc.move_point(
+            pid,
+            Point2::new(jpos.x - dx / l * plen, jpos.y - dy / l * plen),
+        );
+        true
     }
 
     // Live constraint-solve drag: cursor targets go in, solved positions
@@ -1768,7 +3475,7 @@ impl Editor {
                 // 30 landing back at the old 35). Trust the solve; the
                 // pinned center only anchors when points were moved by hand.
                 let locked_radius = self.doc.dimensions.iter().find_map(|d| match d.target {
-                    DimTarget::Radius { seg } if seg == seg_id => Some(d.value),
+                    DimTarget::Radius { seg: s } if s == seg_id => Some(d.value),
                     _ => None,
                 });
                 if locked_radius.is_none() && moved.contains(&seg.start) && moved.contains(&seg.end) && moved.contains(&ctrl_id) {
@@ -1880,10 +3587,12 @@ impl Editor {
         // Creation tools: the crosshair itself snap-locks and highlights
         // targets BEFORE any button press.
         match self.tool {
-            Tool::Line | Tool::Rectangle | Tool::Ruler
+            Tool::Line | Tool::Rectangle | Tool::Ruler | Tool::Pen
                 if self.pending_shape.is_none()
                     && self.pending_line.is_none()
-                    && self.pending_ruler.is_none() =>
+                    && self.pending_ruler.is_none()
+                    && self.pending_pen.is_none()
+                    && self.pending_bezier.is_none() =>
             {
                 let (at, guides) = self.snap_creation_point(self.cursor_doc(cursor));
                 let changed = match (&self.snap_guides, &guides) {
@@ -2061,7 +3770,7 @@ impl Editor {
     fn update_creation_cursor(&mut self, cursor: gpui::Point<gpui::Pixels>) -> bool {
         let is_creation = matches!(
             self.tool,
-            Tool::Rectangle | Tool::Line | Tool::Ruler | Tool::Circle
+            Tool::Rectangle | Tool::Line | Tool::Ruler | Tool::Circle | Tool::Pen
         );
         if !is_creation || self.pan_start.is_some() {
             if self.creation_cursor.is_some() {
@@ -2071,21 +3780,57 @@ impl Editor {
             return false;
         }
         let (pos, guides) = self.snap_creation_point(self.cursor_doc(cursor));
-        if self.tool == Tool::Line && self.shift {
-            if let Some(pending) = self.pending_line {
-                if let Some(at) = self.tangent_snap_for_line(pending.start, pos) {
-                    self.snap_guides.clear();
-                    let next = Some((at.x, at.y, true));
-                    let changed = self.creation_cursor != next;
-                    self.creation_cursor = next;
-                    return changed;
-                }
+        // Tangent lock mirrors the preview exactly: shift-gated arc/line
+        // tangents (legacy behavior), plus the free on-curve bezier
+        // continuation. Anything else leaves the plain snap crosshair.
+        // Bezier staging never detaches the crosshair (the endpoint press
+        // + drag owns the handles; a tangent ray would fight it and read
+        // as the cursor "following the handle axis"). Shift still arms
+        // the arc-tangent lock for every mode.
+        let anchor = if self.tool == Tool::Pen {
+            let bezier_active = self
+                .pending_pen
+                .is_some_and(|p| p.mode == PenMode::Bezier && p.bezier.is_some());
+            if bezier_active && !self.shift {
+                None
+            } else {
+                self.pending_pen.and_then(|p| match p.mode {
+                    PenMode::Line => p.line.map(|l| l.start),
+                    PenMode::Bezier => p.bezier.map(|b| b.p0),
+                    PenMode::Arc => p.circle.and_then(|c| c.a),
+                })
+            }
+        } else if self.tool == Tool::Line && self.shift {
+            self.pending_line.map(|p| p.start)
+        } else {
+            None
+        };
+        if let Some(start) = anchor {
+            let tan = if self.shift {
+                self.tangent_snap_for_line(start, pos)
+            } else {
+                self.bezier_tangent_snap(start, pos)
+            };
+            if let Some(at) = tan {
+                self.snap_guides.clear();
+                let next = Some((at.x, at.y, true));
+                let changed = self.creation_cursor != next;
+                self.creation_cursor = next;
+                return changed;
             }
         }
         // Apply the arc-tool shift constraints so the crosshair matches the
         // pending preview exactly; a sweep transform invalidates the raw
         // cursor's alignment guides (the arc IS the constraint now).
-        let pending = self.pending_circle.map(|p| (p.stage(), p.a, p.b));
+        // Covers the legacy circle tool AND the pen's arc staging.
+        let pending = self
+            .pending_circle
+            .map(|p| (p.stage(), p.a, p.b))
+            .or_else(|| {
+                self.pending_pen.and_then(|p| {
+                    p.circle.map(|c| (c.stage(), c.a, c.b))
+                })
+            });
         let at = if let Some((stage, a, b)) = pending {
             let (at, shifted) = Self::arc_creation_shift(stage, a, b, pos, self.shift);
             if shifted {
@@ -2187,17 +3932,37 @@ impl Editor {
                 .segment(l)
                 .is_some_and(|s| s.kind == SegmentKind::Arc)
         };
+        let is_bezier = |l: crate::core::ids::SegmentId| {
+            self.doc
+                .segment(l)
+                .is_some_and(|s| s.kind == SegmentKind::Bezier)
+        };
         // An arc's circumcenter is a REAL document point — distance dims
         // to an arc run to its center (Fusion-style), not to a chord.
         let arc_center = |l: crate::core::ids::SegmentId| -> Option<PointId> {
             self.doc.segment(l)?.center
         };
         match picks {
-            // A single pick already completes for lines/arcs: an edge
-            // measures its own length; an arc measures its radius.
+            // A single pick already completes: an edge measures its own
+            // length; an arc measures its radius; a BEZIER measures its
+            // total curve length (the Distance dim — never the chord)
+            // UNLESS a width/height/displacement lock restricts it to the
+            // span between its two endpoints.
             [DimPick::Line(l)] => {
                 if is_arc(*l) {
                     Some(DimTarget::Radius { seg: *l })
+                } else if is_bezier(*l) {
+                    match self.dim_mode_lock.as_deref() {
+                        Some("width") | Some("height") | Some("displacement") => {
+                            let seg = self.doc.segment(*l)?;
+                            Some(DimTarget::Points {
+                                a: seg.start,
+                                b: seg.end,
+                                mode: DimMode::Aligned,
+                            })
+                        }
+                        _ => Some(DimTarget::CurveLength { seg: *l }),
+                    }
                 } else {
                     let seg = self.doc.segment(*l)?;
                     Some(DimTarget::Points { a: seg.start, b: seg.end, mode: DimMode::Aligned })
@@ -2237,14 +4002,39 @@ impl Editor {
                         None => return Some(DimTarget::Radius { seg: *b }),
                     }
                 }
-                let (ga, gb) = (self.doc.segment_geom(*a)?, self.doc.segment_geom(*b)?);
-                let (u1, _) = dims::dim_axes(ga.1.x - ga.0.x, ga.1.y - ga.0.y);
-                let (u2, _) = dims::dim_axes(gb.1.x - gb.0.x, gb.1.y - gb.0.y);
-                let sin = u1.0 * u2.1 - u1.1 * u2.0;
-                if sin.abs() < 1e-3 {
-                    Some(DimTarget::Lines { a: *a, b: *b })
-                } else {
-                    Some(DimTarget::Angle { a: *a, b: *b })
+                // A width/height/displacement lock restricts the pair to a
+                // midpoint span; otherwise angle for crossing pairs and
+                // midpoint displacement for parallel ones (measured
+                // between chord midpoints — no gap dimension is offered).
+                match self.dim_mode_lock.as_deref() {
+                    Some("width") => Some(DimTarget::EdgeMid {
+                        a: *a,
+                        b: *b,
+                        mode: DimMode::X,
+                    }),
+                    Some("height") => Some(DimTarget::EdgeMid {
+                        a: *a,
+                        b: *b,
+                        mode: DimMode::Y,
+                    }),
+                    Some("displacement") => Some(DimTarget::EdgeMid {
+                        a: *a,
+                        b: *b,
+                        mode: DimMode::Aligned,
+                    }),
+                    _ => {
+                        let (ga, gb) =
+                            (self.doc.segment_geom(*a)?, self.doc.segment_geom(*b)?);
+                        if Self::geoms_cross(ga, gb) {
+                            Some(DimTarget::Angle { a: *a, b: *b })
+                        } else {
+                            Some(DimTarget::EdgeMid {
+                                a: *a,
+                                b: *b,
+                                mode: DimMode::Aligned,
+                            })
+                        }
+                    }
                 }
             }
             _ => None,
@@ -2261,6 +4051,81 @@ impl Editor {
     /// left/right of center, X when above/below. The mode is part of the
     /// result — callers must apply it via DimTarget::with_mode or it never
     /// reaches the render.
+    /// Shared placement math for a measured position pair — point-pair
+    /// dims and edge-midpoint spans alike. Cursor-zone auto mode unless
+    /// `forced` carries an explicit row/lock choice. Returns
+    /// (mode, offset, slide, measured).
+    fn place_point_pair(
+        pa: Point2,
+        pb: Point2,
+        cursor: Point2,
+        forced: Option<crate::core::constraints::DimMode>,
+    ) -> (
+        crate::core::constraints::DimMode,
+        f64,
+        f64,
+        f64,
+    ) {
+        use crate::core::constraints::DimMode;
+        let (u, n) = dims::dim_axes(pb.x - pa.x, pb.y - pa.y);
+        let rel = (cursor.x - pa.x, cursor.y - pa.y);
+        let len = pick::distance(pa, pb);
+        let dx = pb.x - pa.x;
+        let dy = pb.y - pa.y;
+        // Mode from where the cursor sits relative to the pair's
+        // midpoint (not its first endpoint — endpoint-relative zones
+        // slide around as the pair moves and feel arbitrary).
+        //  - axis-aligned edges never offer the zero span: a vertical
+        //    edge is ALWAYS Y (height), a horizontal edge ALWAYS X
+        //    (width), wherever the cursor is;
+        //  - slanted pairs: the perpendicular cone around the edge
+        //    (±30° of the normal) gives the Aligned displacement;
+        //  - elsewhere left/right of center means height (Y) and
+        //    above/below means width (X).
+        let mid = Point2::new((pa.x + pb.x) / 2., (pa.y + pb.y) / 2.);
+        let vm = (cursor.x - mid.x, cursor.y - mid.y);
+        let is_vertical = dy.abs() > 1e-9 && dx.abs() <= dy.abs() * 0.0875;
+        let is_horizontal = dx.abs() > 1e-9 && dy.abs() <= dx.abs() * 0.0875;
+        let auto = if is_vertical {
+            DimMode::Y
+        } else if is_horizontal {
+            DimMode::X
+        } else {
+            let vm_len = (vm.0 * vm.0 + vm.1 * vm.1).sqrt();
+            let cos_perp = if vm_len < 1e-9 {
+                1.0
+            } else {
+                ((vm.0 * n.0 + vm.1 * n.1).abs()) / vm_len
+            };
+            if cos_perp > 0.866 {
+                DimMode::Aligned
+            } else if vm.0.abs() >= vm.1.abs() {
+                DimMode::Y
+            } else {
+                DimMode::X
+            }
+        };
+        let mode = forced.unwrap_or(auto);
+        let along = rel.0 * u.0 + rel.1 * u.1;
+        let perp = rel.0 * n.0 + rel.1 * n.1;
+        let (offset, slide, measured) = match mode {
+            DimMode::Aligned => (perp, along.clamp(0., len), len),
+            DimMode::X => (
+                // Dim line rides horizontally at the cursor's height
+                // above the pair; slide along the X span.
+                rel.1,
+                (rel.0 * dx.signum()).clamp(0., dx.abs()),
+                dx.abs(),
+            ),
+            DimMode::Y => (
+                rel.0,
+                (rel.1 * dy.signum()).clamp(0., dy.abs()),
+                dy.abs(),
+            ),
+        };
+        (mode, offset, slide, measured)
+    }
+
     fn dim_placement(
         &self,
         target: crate::core::constraints::DimTarget,
@@ -2270,68 +4135,24 @@ impl Editor {
         Some(match target {
             DimTarget::Points { a, b, .. } => {
                 let (pa, pb) = (self.doc.point(a)?, self.doc.point(b)?);
-                let (u, n) = dims::dim_axes(pb.x - pa.x, pb.y - pa.y);
-                let rel = (cursor.x - pa.x, cursor.y - pa.y);
-                let len = pick::distance(pa, pb);
-                let dx = pb.x - pa.x;
-                let dy = pb.y - pa.y;
-                // Mode from where the cursor sits relative to the pair's
-                // midpoint (not its first endpoint — endpoint-relative zones
-                // slide around as the pair moves and feel arbitrary).
-                //  - axis-aligned edges never offer the zero span: a vertical
-                //    edge is ALWAYS Y (height), a horizontal edge ALWAYS X
-                //    (width), wherever the cursor is;
-                //  - slanted pairs: the perpendicular cone around the edge
-                //    (±30° of the normal) gives the Aligned displacement;
-                //  - elsewhere left/right of center means height (Y) and
-                //    above/below means width (X).
-                let mid = Point2::new((pa.x + pb.x) / 2., (pa.y + pb.y) / 2.);
-                let vm = (cursor.x - mid.x, cursor.y - mid.y);
-                let is_vertical =
-                    dy.abs() > 1e-9 && dx.abs() <= dy.abs() * 0.0875;
-                let is_horizontal =
-                    dx.abs() > 1e-9 && dy.abs() <= dx.abs() * 0.0875;
-                let mode = if is_vertical {
-                    DimMode::Y
-                } else if is_horizontal {
-                    DimMode::X
-                } else {
-                    let vm_len = (vm.0 * vm.0 + vm.1 * vm.1).sqrt();
-                    let cos_perp = if vm_len < 1e-9 {
-                        1.0
-                    } else {
-                        ((vm.0 * n.0 + vm.1 * n.1).abs()) / vm_len
-                    };
-                    if cos_perp > 0.866 {
-                        DimMode::Aligned
-                    } else if vm.0.abs() >= vm.1.abs() {
-                        DimMode::Y
-                    } else {
-                        DimMode::X
-                    }
+                // Floating-menu lock overrides the cursor-zone auto-pick.
+                let forced = match self.dim_mode_lock.as_deref() {
+                    Some("width") => Some(DimMode::X),
+                    Some("height") => Some(DimMode::Y),
+                    Some("displacement") => Some(DimMode::Aligned),
+                    _ => None,
                 };
-                let along = rel.0 * u.0 + rel.1 * u.1;
-                let perp = rel.0 * n.0 + rel.1 * n.1;
-                let (offset, slide, measured) = match mode {
-                    DimMode::Aligned => (
-                        perp,
-                        along.clamp(0., len),
-                        len,
-                    ),
-                    DimMode::X => (
-                        // Dim line rides horizontally at the cursor's height
-                        // above the pair; slide along the X span.
-                        rel.1,
-                        (rel.0 * dx.signum()).clamp(0., dx.abs()),
-                        dx.abs(),
-                    ),
-                    DimMode::Y => (
-                        rel.0,
-                        (rel.1 * dy.signum()).clamp(0., dy.abs()),
-                        dy.abs(),
-                    ),
-                };
-                (mode, offset, slide, measured)
+                Self::place_point_pair(pa, pb, cursor, forced)
+            }
+            DimTarget::EdgeMid { a, b, mode } => {
+                // Width/height/displacement between chord midpoints. The
+                // mode rides in the target itself (set by the kind rows),
+                // so placement never second-guesses it.
+                let (aa, ab) = self.doc.segment_geom(a)?;
+                let (ba, bb) = self.doc.segment_geom(b)?;
+                let ma = Point2::new((aa.x + ab.x) / 2., (aa.y + ab.y) / 2.);
+                let mb = Point2::new((ba.x + bb.x) / 2., (ba.y + bb.y) / 2.);
+                Self::place_point_pair(ma, mb, cursor, Some(mode))
             }
             DimTarget::PointLine { p, line } => {
                 let sp = self.doc.point(p)?;
@@ -2400,6 +4221,40 @@ impl Editor {
                     1.0
                 };
                 (DimMode::Aligned, r, frac, r)
+            }
+            DimTarget::CurveLength { seg } => {
+                // BEZIER ONLY. Offset = cursor's signed distance from the
+                // curve, slide = continuous arclength projection (segment
+                // interpolation, never vertex-quantized — the label glides
+                // instead of vibrating). Measured = total length OF THE
+                // CURVE.
+                let Some(seg_d) = self.doc.segment(seg) else {
+                    return None;
+                };
+                if seg_d.kind != crate::core::document::SegmentKind::Bezier {
+                    return None;
+                }
+                let (h1, h2) = seg_d.bezier_handles();
+                let (Some(p0), Some(c1), Some(c2), Some(p1)) = (
+                    self.doc.point(seg_d.start),
+                    h1.and_then(|id| self.doc.point(id)),
+                    h2.and_then(|id| self.doc.point(id)),
+                    self.doc.point(seg_d.end),
+                ) else {
+                    return None;
+                };
+                let pts: Vec<Point2> = crate::editor::bezier::samples(
+                    p0,
+                    c1,
+                    c2,
+                    p1,
+                    dims::bezier_sample_count(self.camera.zoom, p0, c1, c2, p1),
+                );
+                let (pos, total, signed) = dims::project_polyline(&pts, cursor);
+                if total < 1e-9 {
+                    return None;
+                }
+                (DimMode::Aligned, signed, (pos / total).clamp(0., 1.), total)
             }
         })
     }
@@ -2539,7 +4394,9 @@ impl Editor {
                 }
                 v
             }
-            crate::core::constraints::DimTarget::Lines { a, b } | crate::core::constraints::DimTarget::Angle { a, b } => {
+            crate::core::constraints::DimTarget::Lines { a, b }
+            | crate::core::constraints::DimTarget::Angle { a, b }
+            | crate::core::constraints::DimTarget::EdgeMid { a, b, .. } => {
                 let mut v = Vec::new();
                 for sid in [a, b] {
                     if let Some(seg) = trial.segment(sid) {
@@ -2549,7 +4406,8 @@ impl Editor {
                 }
                 v
             }
-            crate::core::constraints::DimTarget::Radius { seg } => {
+            crate::core::constraints::DimTarget::Radius { seg }
+            | crate::core::constraints::DimTarget::CurveLength { seg } => {
                 let mut v = Vec::new();
                 if let Some(seg) = trial.segment(seg) {
                     v.push(seg.start);
@@ -2672,6 +4530,9 @@ impl Editor {
         // the center back to the exact circumcenter.
         if let crate::core::constraints::DimTarget::Radius { seg } = target {
             self.enforce_arc_radius_exact(seg);
+        }
+        if let crate::core::constraints::DimTarget::CurveLength { seg } = target {
+            self.enforce_curve_length_exact(seg);
         }
         self.flush_pending_history();
         true
@@ -3016,6 +4877,48 @@ impl Editor {
         let _ = center;
     }
 
+    /// Exact arc-length enforcement for CurveLength dims (BEZIER ONLY):
+    /// uniform scale of end + handles about the start point so the curve's
+    /// total length matches the placed value (handles ride proportionally,
+    /// preserving shape).
+    fn enforce_curve_length_exact(&mut self, sid: crate::core::ids::SegmentId) {
+        let Some(seg) = self.doc.segment(sid) else { return };
+        if seg.kind != crate::core::document::SegmentKind::Bezier {
+            return;
+        }
+        let Some(dim) = self.doc.dimensions.iter().find(|d| {
+            matches!(d.target, crate::core::constraints::DimTarget::CurveLength { seg: s } if s == sid)
+        }).copied() else { return };
+        if dim.value <= 1e-9 {
+            return;
+        }
+        let (h1, h2) = seg.bezier_handles();
+        let (Some(p0), Some(c1), Some(c2), Some(p1)) = (
+            self.doc.point(seg.start),
+            h1.and_then(|id| self.doc.point(id)),
+            h2.and_then(|id| self.doc.point(id)),
+            self.doc.point(seg.end),
+        ) else {
+            return;
+        };
+        let cur = crate::editor::bezier::arc_length(p0, c1, c2, p1);
+        if cur < 1e-9 {
+            return;
+        }
+        let s = dim.value.abs() / cur;
+        if !s.is_finite() || (s - 1.).abs() < 1e-9 {
+            return;
+        }
+        for id in [seg.end, h1.unwrap_or(seg.end), h2.unwrap_or(seg.end)] {
+            if let Some(p) = self.doc.point(id) {
+                self.doc.move_point(
+                    id,
+                    Point2::new(p0.x + (p.x - p0.x) * s, p0.y + (p.y - p0.y) * s),
+                );
+            }
+        }
+    }
+
     /// Projects the free end of each tangent line onto the exact tangent at
     /// the stored arc contact. This keeps the relationship exact after
     /// radius edits and ordinary point drags without asking the solver to
@@ -3086,6 +4989,33 @@ impl Editor {
 
     /// Repositions a placed dimension by dragging its container. Placement
     /// only — values never change from a drag.
+    /// Shared container-drag math for a measured position pair. Returns
+    /// the (offset, slide) the container follows the cursor with.
+    fn drag_point_pair(
+        pa: Point2,
+        pb: Point2,
+        mode: crate::core::constraints::DimMode,
+        cur: Point2,
+    ) -> (f64, f64) {
+        let (u, n) = dims::dim_axes(pb.x - pa.x, pb.y - pa.y);
+        let rel = (cur.x - pa.x, cur.y - pa.y);
+        let len = pick::distance(pa, pb);
+        let dx = pb.x - pa.x;
+        let dy = pb.y - pa.y;
+        match mode {
+            crate::core::constraints::DimMode::Aligned => (
+                rel.0 * n.0 + rel.1 * n.1,
+                (rel.0 * u.0 + rel.1 * u.1).clamp(0., len),
+            ),
+            crate::core::constraints::DimMode::X => {
+                (rel.1, (rel.0 * dx.signum()).clamp(0., dx.abs()))
+            }
+            crate::core::constraints::DimMode::Y => {
+                (rel.0, (rel.1 * dy.signum()).clamp(0., dy.abs()))
+            }
+        }
+    }
+
     fn dim_drag_update(&mut self, idx: usize, cursor: gpui::Point<gpui::Pixels>) {
         use crate::core::constraints::DimTarget;
         let cur = self.cursor_doc(cursor);
@@ -3097,29 +5027,26 @@ impl Editor {
                 let (Some(pa), Some(pb)) = (self.doc.point(a), self.doc.point(b)) else {
                     return;
                 };
-                let (u, n) = dims::dim_axes(pb.x - pa.x, pb.y - pa.y);
-                let rel = (cur.x - pa.x, cur.y - pa.y);
-                let len = pick::distance(pa, pb);
-                let dx = pb.x - pa.x;
-                let dy = pb.y - pa.y;
-                let dim = &mut self.doc.dimensions[idx];
                 // The stored mode is kept on drag (flipping modes of a live
                 // constraint would re-solve the geometry mid-gesture); the
                 // placement follows the cursor within that mode's frame.
-                match mode {
-                    crate::core::constraints::DimMode::Aligned => {
-                        dim.offset = rel.0 * n.0 + rel.1 * n.1;
-                        dim.slide = (rel.0 * u.0 + rel.1 * u.1).clamp(0., len);
-                    }
-                    crate::core::constraints::DimMode::X => {
-                        dim.offset = rel.1;
-                        dim.slide = (rel.0 * dx.signum()).clamp(0., dx.abs());
-                    }
-                    crate::core::constraints::DimMode::Y => {
-                        dim.offset = rel.0;
-                        dim.slide = (rel.1 * dy.signum()).clamp(0., dy.abs());
-                    }
-                }
+                let (offset, slide) = Self::drag_point_pair(pa, pb, mode, cur);
+                let dim = &mut self.doc.dimensions[idx];
+                dim.offset = offset;
+                dim.slide = slide;
+            }
+            DimTarget::EdgeMid { a, b, mode } => {
+                let (Some((aa, ab)), Some((ba, bb))) =
+                    (self.doc.segment_geom(a), self.doc.segment_geom(b))
+                else {
+                    return;
+                };
+                let ma = Point2::new((aa.x + ab.x) / 2., (aa.y + ab.y) / 2.);
+                let mb = Point2::new((ba.x + bb.x) / 2., (ba.y + bb.y) / 2.);
+                let (offset, slide) = Self::drag_point_pair(ma, mb, mode, cur);
+                let dim = &mut self.doc.dimensions[idx];
+                dim.offset = offset;
+                dim.slide = slide;
             }
             DimTarget::PointLine { line, .. } => {
                 let Some((la, lb)) = self.doc.segment_geom(line) else {
@@ -3178,6 +5105,38 @@ impl Editor {
                     1.0
                 };
                 self.doc.dimensions[idx].slide = frac;
+            }
+            DimTarget::CurveLength { seg } => {
+                // Bezier-only: offset + slide follow the cursor through a
+                // continuous segment projection (no vertex stepping).
+                let Some(seg_d) = self.doc.segment(seg) else {
+                    return;
+                };
+                if seg_d.kind != crate::core::document::SegmentKind::Bezier {
+                    return;
+                }
+                let (h1, h2) = seg_d.bezier_handles();
+                let (Some(p0), Some(c1), Some(c2), Some(p1)) = (
+                    self.doc.point(seg_d.start),
+                    h1.and_then(|id| self.doc.point(id)),
+                    h2.and_then(|id| self.doc.point(id)),
+                    self.doc.point(seg_d.end),
+                ) else {
+                    return;
+                };
+                let pts: Vec<Point2> = crate::editor::bezier::samples(
+                    p0,
+                    c1,
+                    c2,
+                    p1,
+                    dims::bezier_sample_count(self.camera.zoom, p0, c1, c2, p1),
+                );
+                let (pos, total, signed) = dims::project_polyline(&pts, cur);
+                if total < 1e-9 {
+                    return;
+                }
+                self.doc.dimensions[idx].offset = signed;
+                self.doc.dimensions[idx].slide = (pos / total).clamp(0., 1.);
             }
         }
     }
@@ -3267,6 +5226,14 @@ impl Editor {
             self.marquee_add = false;
         }
 
+        // Pen release: drag-release commits the live span (line mirrors
+        // the legacy line tool; bezier commits its endpoint/handle
+        // staging). Pure clicks keep staging for the next press.
+        if self.tool == Tool::Pen && self.pending_pen.is_some() {
+            if self.pen_release_commit(shift) {
+                return true;
+            }
+        }
         // Click-created pending shapes survive mouse-up ONLY when the
         // cursor never moved (a true click); any real drag commits on
         // release. Only the no-motion case waits for the next click.
@@ -3553,8 +5520,12 @@ impl Editor {
                 self.doc
                     .dimensions
                     .retain(|d| match &d.target {
-                        _DT::PointLine { line, .. } | _DT::Radius { seg: line } => *line != s,
-                        _DT::Lines { a, b } | _DT::Angle { a, b } => *a != s && *b != s,
+                        _DT::PointLine { line, .. }
+                        | _DT::Radius { seg: line }
+                        | _DT::CurveLength { seg: line } => *line != s,
+                        _DT::Lines { a, b }
+                        | _DT::Angle { a, b }
+                        | _DT::EdgeMid { a, b, .. } => *a != s && *b != s,
                         _DT::Points { .. } => true,
                     });
                 let ends: Vec<PointId> = self
@@ -3638,13 +5609,16 @@ impl Editor {
         self.selection.retain(|&e| e != el);
     }
 
-    /// Queues the bond-choice context menu for points dropped onto points.
-    fn queue_bond_menu(&mut self) {
+    /// Drag ended with points dropped onto points: instead of the old
+    /// bond-choice popup, select the overlapping points so the floating
+    /// menu offers Coincident + Merge right where the choice used to be.
+    /// Returns true when overlapping points were found (and selected).
+    fn queue_bond_menu(&mut self) -> bool {
         let tol = self.snap_tol_doc();
-        let Some(drag) = &self.dragging else { return };
+        let Some(drag) = &self.dragging else { return false };
         let dragged: Vec<PointId> =
             drag.points.iter().chain(drag.aux.iter()).map(|&(id, _)| id).collect();
-        let mut pairs: Vec<(PointId, PointId)> = Vec::new();
+        let mut found: Vec<PointId> = Vec::new();
         for &pid in &dragged {
             let Some(p) = self.doc.point(pid) else { continue };
             for (qid, q) in self.doc.all_points() {
@@ -3654,192 +5628,66 @@ impl Editor {
                 if pick::distance(p, q) > tol {
                     continue;
                 }
-                // Skip pairs already glued in either order or queued twice.
-                if pairs.contains(&(pid, qid))
-                    || pairs.contains(&(qid, pid))
-                    || self.doc.constraints.iter().any(|c| {
-                        c.kind == ConstraintKind::Coincident
-                            && ((c.a == pid && c.b == qid) || (c.a == qid && c.b == pid))
-                    })
-                {
+                // Skip pairs already glued in either order.
+                if self.doc.constraints.iter().any(|c| {
+                    c.kind == ConstraintKind::Coincident
+                        && ((c.a == pid && c.b == qid) || (c.a == qid && c.b == pid))
+                }) {
                     continue;
                 }
-                pairs.push((pid, qid));
+                if !found.contains(&pid) {
+                    found.push(pid);
+                }
+                if !found.contains(&qid) {
+                    found.push(qid);
+                }
             }
         }
-        if pairs.is_empty() {
-            return;
-        }
-        // Anchor beside the first junction, then clamp on screen.
-        if let Some(p) = self.doc.point(pairs[0].0) {
-            use crate::ui::canvas::context_menu::{ContextMenu, ContextAction, ContextMenuEntry,
-                ICON_COINCIDENT, ICON_MERGE_POINTS};
-            let s = self.camera.unit_to_screen(p);
-            let mut menu = ContextMenu {
-                x: s.x as f32 + 16.,
-                y: s.y as f32 - 8.,
-                entries: vec![
-                    ContextMenuEntry {
-                        icon: ICON_COINCIDENT,
-                        label: "Coincident",
-                        shortcut: "1",
-                        action: ContextAction::BondCoincident,
-                    },
-                    ContextMenuEntry {
-                        icon: ICON_MERGE_POINTS,
-                        label: "Merge Points",
-                        shortcut: "2",
-                        action: ContextAction::BondMerge,
-                    },
-                ],
-            };
-            let (vw, vh) = (self.viewport_size.0 as f32, self.viewport_size.1 as f32);
-            menu.clamp_to(vw, vh);
-            self.pending_bonds = pairs;
-            self.context_menu_pop = 0.0;
-            self.context_menu = Some(menu);
-        }
-    }
-
-    /// Applies the bond choice to every pending pair.
-    fn apply_bond_choice(&mut self, combine: bool) -> bool {
-        if self.pending_bonds.is_empty() {
+        if found.is_empty() {
             return false;
         }
-        self.context_menu = None;
-        let pairs = std::mem::take(&mut self.pending_bonds);
-        for (a, b) in pairs {
-            if combine {
-                self.doc.merge_point(a, b);
-            } else {
-                self.doc.add_constraint(ConstraintKind::Coincident, a, b);
-            }
-        }
-        self.selection.retain(|el| match *el {
-            ElementRef::Point(p) => self.doc.point(p).is_some(),
-            ElementRef::Segment(s) => self.doc.segment(s).is_some(),
-            _ => true,
-        });
+        self.selection = found.into_iter().map(ElementRef::Point).collect();
         true
     }
 
-    /// Applies a context menu entry's action. Returns whether anything
-    /// changed.
-    pub fn apply_context_action(
-        &mut self,
-        action: crate::ui::canvas::context_menu::ContextAction,
-    ) -> bool {
-        use crate::ui::canvas::context_menu::ContextAction;
+    /// Merges the selected bare points into the first one (floating menu
+    /// "Merge points" row — the old bond menu's combine action).
+    /// Merges only close, unglued point pairs (same pairs the menu gates
+    /// on) — never a mass collapse of the whole selection into one point.
+    pub fn merge_selected_points(&mut self) -> bool {
+        let pairs = Self::merge_candidate_pairs(
+            &self.doc,
+            &self.selection,
+            self.snap_tol_doc(),
+        );
+        if pairs.is_empty() {
+            return false;
+        }
         self.history_begin();
-        let changed = match action {
-            ContextAction::BondCoincident => self.apply_bond_choice(false),
-            ContextAction::BondMerge => self.apply_bond_choice(true),
-        };
-        if !changed {
-            // Drop the useless snapshot.
+        let mut merged_any = false;
+        for (a, b) in pairs {
+            if a == b {
+                continue;
+            }
+            // Either side may have vanished into an earlier pair's merge.
+            if self.doc.point(a).is_none() || self.doc.point(b).is_none() {
+                continue;
+            }
+            self.doc.merge_point(a, b);
+            merged_any = true;
+        }
+        if !merged_any {
             self.gesture_snapshot = None;
-        }
-        changed
-    }
-
-    /// Triggers the Nth context menu entry (keyboard shortcuts).
-    pub fn trigger_context_shortcut(&mut self, index: usize) -> bool {
-        let Some(menu) = &self.context_menu else {
             return false;
-        };
-        let Some(entry) = menu.entries.get(index).map(|e| e.action) else {
-            return false;
-        };
-        self.apply_context_action(entry)
-    }
-
-    /// Closes the context menu without applying anything.
-    pub fn dismiss_context_menu(&mut self) -> bool {
-        let had = self.context_menu.take().is_some();
-        if had {
-            self.pending_bonds.clear();
-            self.context_menu_pop = 0.0;
-            self.context_menu_fades.clear();
-            self.context_menu_fade_pending.clear();
-            self.context_menu_fade_active.clear();
         }
-        had
-    }
-
-    pub(crate) fn context_menu_fade(&self, key: &str) -> f32 {
-        self.context_menu_fades.get(key).copied().unwrap_or(0.0)
-    }
-
-    pub(crate) fn animate_context_menu_fade(
-        &mut self,
-        key: &str,
-        target: f32,
-        cx: &mut gpui::Context<Self>,
-    ) {
-        self.context_menu_fade_pending.insert(key.to_string(), target);
-        if !self.context_menu_fade_active.insert(key.to_string()) {
-            return;
-        }
-        let key_owned = key.to_string();
-        let this = cx.entity().downgrade();
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(12))
-                    .await;
-                let mut done = false;
-                let _ = this.update(cx, |ed, cx| {
-                    if let Some(&target) = ed.context_menu_fade_pending.get(&key_owned) {
-                        let cur = ed.context_menu_fade(&key_owned);
-                        let next = cur + (target - cur) * 0.4;
-                        if (next - target).abs() < 0.01 {
-                            ed.context_menu_fades.insert(key_owned.clone(), target);
-                            done = true;
-                        } else {
-                            ed.context_menu_fades.insert(key_owned.clone(), next);
-                        }
-                        cx.notify();
-                    } else {
-                        done = true;
-                    }
-                });
-                if !done {
-                    continue;
-                }
-                let _ = this.update(cx, |ed, _| {
-                    ed.context_menu_fade_pending.remove(&key_owned);
-                    ed.context_menu_fade_active.remove(&key_owned);
-                });
-                break;
-            }
-        })
-        .detach();
-    }
-
-    pub(crate) fn animate_context_menu_pop(
-        &mut self,
-        target: f32,
-        cx: &mut gpui::Context<Self>,
-    ) {
-        let start = self.context_menu_pop;
-        if (start - target).abs() < f32::EPSILON {
-            return;
-        }
-        let this = cx.entity().downgrade();
-        cx.spawn(async move |this, cx| {
-            let steps = 8;
-            for i in 1..=steps {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(10))
-                    .await;
-                let _ = this.update(cx, |ed, cx| {
-                    let t = i as f32 / steps as f32;
-                    ed.context_menu_pop = start + (target - start) * (1.0 - (1.0 - t).powi(3));
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
+        // Drop ids that no longer exist; keeps survive in place.
+        self.selection.retain(|el| match *el {
+            ElementRef::Point(p) => self.doc.point(p).is_some(),
+            ElementRef::Segment(s) => self.doc.segment(s).is_some(),
+            ElementRef::Fill(f) => self.doc.fill(f).is_some(),
+        });
+        self.flush_pending_history();
+        true
     }
 
     /// Re-derives session state after the document was swapped by
@@ -3852,8 +5700,6 @@ impl Editor {
         });
         self.selected_constraints
             .retain(|c| self.doc.constraints.contains(c));
-        self.pending_bonds.clear();
-        self.context_menu = None;
         self.hovered_constraint = None;
         self.snap_guides.clear();
         self.pending_shape = None;
@@ -4107,5 +5953,59 @@ mod angle_tests {
         let b = doc.add_point(Point2::new(0., 0.));
         doc.add_constraint(ConstraintKind::Coincident, a, b);
         assert!(equivalent_angle_vertex(&doc, a, b));
+    }
+
+    fn bezier_test_editor() -> (Editor, crate::core::ids::SegmentId) {
+        let mut doc = Document::new();
+        let p0 = doc.add_point(Point2::new(0., 0.));
+        let c1 = doc.add_point(Point2::new(100., 0.));
+        let c2 = doc.add_point(Point2::new(100., 100.));
+        let p1 = doc.add_point(Point2::new(200., 100.));
+        let seg = doc.add_bezier_segment(p0, c1, c2, p1);
+        let mut ed = Editor::from_document(doc);
+        ed.tool = Tool::Dimension;
+        (ed, seg)
+    }
+
+    #[test]
+    fn bezier_single_pick_arms_curve_length() {
+        let (mut ed, seg) = bezier_test_editor();
+        ed.dim_picks.push(DimPick::Line(seg));
+        let t = ed.resolve_dim_target(&ed.dim_picks);
+        assert!(
+            matches!(
+                t,
+                Some(crate::core::constraints::DimTarget::CurveLength { .. })
+            ),
+            "single bezier pick must arm CurveLength, got {t:?}"
+        );
+        let placed = ed.dim_placement(t.unwrap(), Point2::new(100., 250.));
+        assert!(placed.is_some(), "CurveLength placement returned None");
+        let (_, _, _, measured) = placed.unwrap();
+        assert!(measured > 200., "measured curve length implausible: {measured}");
+    }
+
+    #[test]
+    fn bezier_curve_length_commits_and_renders() {
+        let (mut ed, seg) = bezier_test_editor();
+        ed.dim_picks.push(DimPick::Line(seg));
+        let target = ed.resolve_dim_target(&ed.dim_picks).unwrap();
+        let (_, offset, slide, measured) = ed
+            .dim_placement(target, Point2::new(100., 250.))
+            .expect("placement");
+        let dim = crate::core::constraints::Dimension {
+            target,
+            value: measured,
+            offset,
+            slide,
+            sweep: 0.,
+        };
+        assert!(ed.try_apply_dimension(dim), "CurveLength commit failed");
+        assert_eq!(ed.doc.dimensions.len(), 1);
+        ed.update_dim_geom();
+        assert!(
+            !ed.curve_dim_renders.is_empty(),
+            "no curve replica render data after commit"
+        );
     }
 }

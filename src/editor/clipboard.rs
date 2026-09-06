@@ -96,6 +96,7 @@ impl Editor {
                 SegmentKind::Line => "L",
                 SegmentKind::Ruler => "M",
                 SegmentKind::Arc => "A",
+                SegmentKind::Bezier => "B",
             };
             s += &format!(
                 "|S:{},{},{},{},{},{}",
@@ -160,6 +161,7 @@ impl Editor {
                         "L" => SegmentKind::Line,
                         "M" => SegmentKind::Ruler,
                         "A" => SegmentKind::Arc,
+                        "B" => SegmentKind::Bezier,
                         _ => continue,
                     };
                     let (Ok(si), Ok(ei)) = (f[1].parse::<usize>(), f[2].parse::<usize>()) else {
@@ -221,6 +223,17 @@ impl Editor {
                         continue;
                     };
                     self.doc.add_arc_segment(sp, *ci, ep, *ce)
+                }
+                SegmentKind::Bezier => {
+                    let (Some(ci), Some(ce)) = (ci.and_then(|i| ids.get(i)), ce.and_then(|i| ids.get(i)))
+                    else {
+                        continue;
+                    };
+                    let seg = self.doc.add_bezier_segment(sp, *ci, *ce, ep);
+                    if let Some(slot) = self.doc.segment_mut(seg) {
+                        slot.stroke_width = *sw;
+                    }
+                    seg
                 }
             };
             new_segs.push(sid);

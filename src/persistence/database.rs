@@ -204,6 +204,7 @@ impl Database {
                     SegmentKind::Line => "line",
                     SegmentKind::Ruler => "ruler",
                     SegmentKind::Arc => "arc",
+                    SegmentKind::Bezier => "bezier",
                 };
                 let (ctrl_idx, ctrl_gen) = match s.ctrl {
                     Some(c) => (Some(c.idx as i64), Some(c.generation as i64)),
@@ -282,7 +283,19 @@ impl Database {
                         ("point_line", Some(*p), None, Some(*line), None)
                     }
                     DimTarget::Lines { a, b } => ("lines", None, None, Some(*a), Some(*b)),
+                    DimTarget::EdgeMid { a, b, mode } => (
+                        match mode {
+                            crate::core::constraints::DimMode::X => "edge_mid_x",
+                            crate::core::constraints::DimMode::Y => "edge_mid_y",
+                            crate::core::constraints::DimMode::Aligned => "edge_mid",
+                        },
+                        None,
+                        None,
+                        Some(*a),
+                        Some(*b),
+                    ),
                     DimTarget::Radius { seg } => ("radius", None, None, Some(*seg), None),
+                    DimTarget::CurveLength { seg } => ("curve_length", None, None, Some(*seg), None),
                     DimTarget::Angle { a, b } => ("angle", None, None, Some(*a), Some(*b)),
                 };
                 let pid = |id: Option<crate::core::ids::PointId>| {
@@ -404,6 +417,7 @@ impl Database {
                 "line" => SegmentKind::Line,
                 "ruler" => SegmentKind::Ruler,
                 "arc" => SegmentKind::Arc,
+                "bezier" => SegmentKind::Bezier,
                 _ => continue,
             };
             let ctrl = {
@@ -559,6 +573,23 @@ impl Database {
                         continue;
                     };
                     DimTarget::Radius { seg: a }
+                }
+                "curve_length" => {
+                    let Some(a) = segment(5) else {
+                        continue;
+                    };
+                    DimTarget::CurveLength { seg: a }
+                }
+                "edge_mid" | "edge_mid_x" | "edge_mid_y" => {
+                    let (Some(a), Some(b)) = (segment(5), segment(7)) else {
+                        continue;
+                    };
+                    let mode = match kind.as_str() {
+                        "edge_mid_x" => crate::core::constraints::DimMode::X,
+                        "edge_mid_y" => crate::core::constraints::DimMode::Y,
+                        _ => crate::core::constraints::DimMode::Aligned,
+                    };
+                    DimTarget::EdgeMid { a, b, mode }
                 }
                 _ => {
                     let (Some(a), Some(b)) = (point(1), point(3)) else {

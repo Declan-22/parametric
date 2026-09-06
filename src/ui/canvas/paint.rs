@@ -12,13 +12,60 @@ use crate::theme::Theme;
 #[derive(Default)]
 pub struct RenderCache {
     arcs: HashMap<crate::core::ids::SegmentId, (u64, Vec<Point2>)>,
+    beziers: HashMap<crate::core::ids::SegmentId, (u64, Vec<Point2>)>,
 }
 
 impl RenderCache {
     fn clear_if_oversized(&mut self) {
-        if self.arcs.len() >= 4096 {
+        if self.arcs.len() + self.beziers.len() >= 4096 {
             self.arcs.clear();
+            self.beziers.clear();
         }
+    }
+
+    pub fn bezier_samples(
+        &mut self,
+        doc: &Document,
+        sid: crate::core::ids::SegmentId,
+        zoom: f64,
+    ) -> Option<&Vec<Point2>> {
+        let seg = doc.segment(sid)?;
+        if seg.kind != SegmentKind::Bezier {
+            return None;
+        }
+        let (h1, h2) = seg.bezier_handles();
+        let (a, b, c, d) = (
+            doc.point(seg.start)?,
+            doc.point(h1?)?,
+            doc.point(h2?)?,
+            doc.point(seg.end)?,
+        );
+        let fingerprint = [
+            zoom.to_bits(),
+            a.x.to_bits(),
+            a.y.to_bits(),
+            b.x.to_bits(),
+            b.y.to_bits(),
+            c.x.to_bits(),
+            c.y.to_bits(),
+            d.x.to_bits(),
+            d.y.to_bits(),
+        ]
+        .iter()
+        .fold(0xcbf29ce484222325, |hash, bits| {
+            (hash ^ bits).wrapping_mul(0x100000001b3)
+        });
+        let needs_refresh = self
+            .beziers
+            .get(&sid)
+            .is_none_or(|(old, _)| *old != fingerprint);
+        if needs_refresh {
+            let n = crate::editor::bezier::adaptive_samples(a, b, c, d, zoom);
+            let samples = crate::editor::bezier::samples(a, b, c, d, n);
+            self.clear_if_oversized();
+            self.beziers.insert(sid, (fingerprint, samples));
+        }
+        self.beziers.get(&sid).map(|(_, s)| s)
     }
 
     fn arc_samples(
@@ -94,6 +141,13 @@ pub enum Primitive {
         cy: f32,
         radius: f32,
     },
+    // Solid accent diamond marking a BEZIER handle point — deliberately
+    // distinct from point dots so handles never read as geometry.
+    Diamond {
+        cx: f32,
+        cy: f32,
+        radius: f32,
+    },
     // Real vector text painted into the canvas (ruler markings etc.) —
     // no DOM overlay containers. Two rows: pixels nearest the dash, inches
     // below; value in ink, unit suffix in empty_text_primary.
@@ -115,12 +169,15 @@ pub fn build_draw_list(
     hover: Option<ElementRef>,
     dim_renders: &[DimRender],
     angle_dim_renders: &[crate::editor::dims::AngleDimRender],
+    curve_dim_renders: &[crate::editor::dims::CurveDimRender],
     snap_guides: &[SnapGuide],
     marquee: Option<(Point2, Point2)>,
     pending_ruler: Option<(Point2, Point2)>,
     pending_line: Option<(Point2, Point2)>,
     constraint_markers: &[crate::editor::dims::ConstraintMarker],
     pending_circle: Option<crate::editor::PendingCircle>,
+    pending_pen: Option<crate::editor::PendingPen>,
+    pending_bezier: Option<crate::editor::PendingBezier>,
     show_grid: bool,
     tool: crate::editor::Tool,
     cursor_doc: Option<Point2>,
@@ -285,6 +342,66 @@ pub fn build_draw_list(
                             dashed_polyline(&mut list, &pts, accent);
                         }
                     }
+                    // Bezier spans: cached flatten, viewport-culled.
+                    if seg.kind == SegmentKind::Bezier {
+                        let (h1, h2) = seg.bezier_handles();
+                        let (Some(p0), Some(c1), Some(c2), Some(p1)) = (
+                            doc.point(seg.start),
+                            h1.and_then(|id| doc.point(id)),
+                            h2.and_then(|id| doc.point(id)),
+                            doc.point(seg.end),
+                        ) else {
+                            continue;
+                        };
+                        let n = crate::editor::bezier::adaptive_samples(p0, c1, c2, p1, camera.zoom);
+                        let _ = n;
+                        let Some(samples) = cache.bezier_samples(doc, sid, camera.zoom) else {
+                            continue;
+                        };
+                        if samples.iter().any(|p| visible.contains(*p)) {
+                            push_polyline(
+                                &mut list,
+                                &samples.iter().map(|p| scr(*p)).collect::<Vec<_>>(),
+                                seg.stroke_width.max(1.) as f32,
+                                color,
+                            );
+                        }
+                        // Handles whenever the span OR any of its four
+                        // points (endpoints included) is selected or
+                        // hovered: dashed arms + diamond dots. Selecting
+                        // just the point still reveals its handles.
+                        let hot = |pid: crate::core::ids::PointId| {
+                            selection.contains(&ElementRef::Point(pid))
+                                || hover.is_some_and(|h| h == ElementRef::Point(pid))
+                        };
+                        let touched = selection.contains(&el)
+                            || hot(seg.start)
+                            || hot(seg.end)
+                            || h1.is_some_and(hot)
+                            || h2.is_some_and(hot);
+                        if touched {
+                            // Handle arms are solid 1px accent lines (never
+                            // dashed) with diamond dots.
+                            let (x0, y0) = scr(p0);
+                            let (x1, y1) = scr(c1);
+                            let (x2, y2) = scr(c2);
+                            let (x3, y3) = scr(p1);
+                            for (ax, ay, bx, by) in
+                                [(x0, y0, x1, y1), (x3, y3, x2, y2)]
+                            {
+                                list.push(Primitive::Line {
+                                    ax,
+                                    ay,
+                                    bx,
+                                    by,
+                                    width: 1.,
+                                    color: accent,
+                                });
+                            }
+                            list.push(Primitive::Diamond { cx: x1, cy: y1, radius: 5. });
+                            list.push(Primitive::Diamond { cx: x2, cy: y2, radius: 5. });
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -375,6 +492,34 @@ pub fn build_draw_list(
         dashed_polyline(&mut list, &pts, ink);
     }
 
+    // 2a2) Curve-length dimensions: the dim line IS the exact curve shape —
+    // a dashed offset replica of the bezier path (never the chord), with
+    // the value container riding on it (label painted by the DOM layer).
+    for c in curve_dim_renders {
+        let ink = if c.constraint {
+            if c.hovered {
+                rgb(t.text_secondary).into()
+            } else {
+                rgb(t.empty_text_secondary).into()
+            }
+        } else {
+            accent
+        };
+        let pts: Vec<(f32, f32)> = c.pts.iter().map(|p| (p[0], p[1])).collect();
+        dashed_polyline(&mut list, &pts, ink);
+        // Offset clamping stubs: replica ends to the real endpoints.
+        for s in &c.stubs {
+            dashed_line(&mut list, s[0], s[1], s[2], s[3], 1., ink);
+        }
+        // Arrowheads along the replica's end tangents.
+        if pts.len() >= 2 {
+            let (a, b) = (pts[0], pts[1]);
+            dim_arrowhead(&mut list, b.0, b.1, a.0, a.1, ink);
+            let (a, b) = (pts[pts.len() - 2], pts[pts.len() - 1]);
+            dim_arrowhead(&mut list, a.0, a.1, b.0, b.1, ink);
+        }
+    }
+
     // 2b) Constraint guide lines (distant pairs), under everything. A guide
     // belongs to its chip: hidden chips must not leave unexplained dashes.
     let guide_color: gpui::Background = rgb(t.empty_text_secondary).into();
@@ -396,6 +541,7 @@ pub fn build_draw_list(
             | crate::editor::Tool::Line
             | crate::editor::Tool::Ruler
             | crate::editor::Tool::Circle
+            | crate::editor::Tool::Pen
     );
     for g in snap_guides {
         let from = camera.unit_to_screen(g.from);
@@ -458,6 +604,15 @@ pub fn build_draw_list(
         for pid in doc.element_points(sel) {
             if let Some(p) = doc.point(pid) {
                 let (x, y) = scr(p);
+                // Bezier handle points render as diamonds, never dots.
+                if is_bezier_handle(doc, pid) {
+                    list.push(Primitive::Diamond {
+                        cx: x,
+                        cy: y,
+                        radius: 5.,
+                    });
+                    continue;
+                }
                 list.push(Primitive::Circle {
                     cx: x,
                     cy: y,
@@ -605,6 +760,113 @@ pub fn build_draw_list(
             }
         }
     }
+
+    // Unified pen preview.
+    if let Some(pen) = pending_pen {
+        match pen.mode {
+            crate::editor::PenMode::Line => {
+                if let Some(l) = pen.line {
+                    let (ax, ay) = scr(l.start);
+                    let (bx, by) = scr(l.cursor);
+                    list.push(Primitive::Line {
+                        ax,
+                        ay,
+                        bx,
+                        by,
+                        width: 1.,
+                        color: accent,
+                    });
+                }
+            }
+            crate::editor::PenMode::Arc => {
+                if let Some(pc) = pen.circle {
+                    match pc.stage() {
+                        2 => {
+                            if let Some(a) = pc.a {
+                                push_chord_preview(&mut list, &scr, a, pc.cursor, accent);
+                            }
+                        }
+                        _ => {
+                            if let (Some(a), Some(b)) = (pc.a, pc.b) {
+                                let n = crate::editor::arc::adaptive_samples(
+                                    a,
+                                    b,
+                                    pc.cursor,
+                                    camera.zoom,
+                                );
+                                let arc = crate::editor::arc::samples_through(a, b, pc.cursor, n);
+                                let pts: Vec<(f32, f32)> =
+                                    arc.iter().map(|p| scr(*p)).collect();
+                                push_polyline(&mut list, &pts, 1.5, color);
+                            }
+                        }
+                    }
+                }
+            }
+            crate::editor::PenMode::Bezier => {
+                if let Some(pb) = pen.bezier {
+                    // On-curve UX: the live end is the fixed endpoint when
+                    // set, else the cursor. Both handle arms preview.
+                    let end = pb.p1.unwrap_or(pb.cursor);
+                    let (c1, c2) = pb.effective(end);
+                    let pts = crate::editor::bezier::samples(pb.p0, c1, c2, end, 32);
+                    push_polyline(
+                        &mut list,
+                        &pts.iter().map(|p| scr(*p)).collect::<Vec<_>>(),
+                        1.5,
+                        accent,
+                    );
+                    // Anchor + live end dots.
+                    for p in [pb.p0, end] {
+                        let (x, y) = scr(p);
+                        list.push(Primitive::Circle { cx: x, cy: y, radius: 3. });
+                    }
+                    // Dragged handle arms (solid 1px accent): h1 rides the
+                    // p0 side; the live end shows the full symmetric pair
+                    // — the forward drag arm plus the working (mirrored)
+                    // arm the curve follows.
+                    let arm = |list: &mut Vec<Primitive>,
+                               ax: f32,
+                               ay: f32,
+                               hx: f32,
+                               hy: f32| {
+                        list.push(Primitive::Line {
+                            ax,
+                            ay,
+                            bx: hx,
+                            by: hy,
+                            width: 1.,
+                            color: accent,
+                        });
+                        list.push(Primitive::Diamond { cx: hx, cy: hy, radius: 5. });
+                    };
+                    if let Some(h) = pb.h1 {
+                        let (ax, ay) = scr(pb.p0);
+                        let (hx, hy) = scr(h);
+                        arm(&mut list, ax, ay, hx, hy);
+                    }
+                    if let Some(h) = pb.h2 {
+                        let (ex, ey) = scr(end);
+                        let (hx, hy) = scr(h);
+                        arm(&mut list, ex, ey, hx, hy);
+                        let (cx2, cy2) = scr(c2);
+                        arm(&mut list, ex, ey, cx2, cy2);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(pb) = pending_bezier {
+        let end = pb.p1.unwrap_or(pb.cursor);
+        let (c1, c2) = pb.effective(end);
+        let pts = crate::editor::bezier::samples(pb.p0, c1, c2, end, 32);
+        push_polyline(
+            &mut list,
+            &pts.iter().map(|p| scr(*p)).collect::<Vec<_>>(),
+            1.5,
+            accent,
+        );
+    }
     list
 }
 
@@ -639,6 +901,13 @@ fn push_chord_preview(
 }
 
 const LINE_W: f32 = 1.5;
+
+/// True when the point is a bezier handle (h1/h2 slot of any span).
+fn is_bezier_handle(doc: &Document, pid: crate::core::ids::PointId) -> bool {
+    doc.all_segments().any(|(_, s)| {
+        s.kind == SegmentKind::Bezier && (s.ctrl == Some(pid) || s.center == Some(pid))
+    })
+}
 
 // Solid polyline (arc rendering).
 fn push_polyline(
@@ -715,21 +984,36 @@ fn element_outline(
     cache: &mut RenderCache,
 ) {
     match el {
-        // Points use the SAME styling everywhere: one clean small dot.
+        // Points use the SAME styling everywhere: one clean small dot —
+        // except bezier handles, which are always diamonds.
         ElementRef::Point(pid) => {
             if let Some(p) = doc.point(pid) {
                 let (x, y) = scr(p);
-                list.push(Primitive::Circle {
-                    cx: x,
-                    cy: y,
-                    radius: 4.,
-                });
+                if is_bezier_handle(doc, pid) {
+                    list.push(Primitive::Diamond {
+                        cx: x,
+                        cy: y,
+                        radius: 5.,
+                    });
+                } else {
+                    list.push(Primitive::Circle {
+                        cx: x,
+                        cy: y,
+                        radius: 4.,
+                    });
+                }
             }
         }
         ElementRef::Segment(sid) => {
             if let Some(seg) = doc.segment(sid)
                 && seg.kind == SegmentKind::Arc
                 && let Some(samples) = cache.arc_samples(doc, sid, zoom)
+            {
+                let pts: Vec<(f32, f32)> = samples.iter().map(|p| scr(*p)).collect();
+                push_polyline(list, &pts, 2.5, accent);
+            } else if let Some(seg) = doc.segment(sid)
+                && seg.kind == SegmentKind::Bezier
+                && let Some(samples) = cache.bezier_samples(doc, sid, zoom)
             {
                 let pts: Vec<(f32, f32)> = samples.iter().map(|p| scr(*p)).collect();
                 push_polyline(list, &pts, 2.5, accent);

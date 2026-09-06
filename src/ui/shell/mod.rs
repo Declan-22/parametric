@@ -70,6 +70,16 @@ pub struct Shell {
     pub(crate) menu_animation: f32,
     pub(crate) icon_animation: f32,
     pub(crate) delete_modal_animation: f32,
+    // Floating contextual menu (pen modes / constraints / dimension
+    // types): slide+fade progress, visibility latch, the last visible
+    // snapshot so the fade-OUT can play after the trigger is gone, the
+    // content signature (replays the slide when rows change), and a tween
+    // generation so rapid toggles never stack competing tickers.
+    pub(crate) floating_anim: f32,
+    pub(crate) floating_shown: bool,
+    pub(crate) floating_cache: Option<crate::ui::floating_menu::FloatingSnap>,
+    pub(crate) floating_parts: String,
+    pub(crate) floating_tween: u64,
     pub(crate) cursor_trail: Vec<(Point<gpui::Pixels>, Instant)>,
     pub(crate) hovered_entry: Option<usize>,
     // Autosave: watches the open editor's doc_gen and writes the file
@@ -111,6 +121,11 @@ impl Shell {
             menu_animation: 0.0,
             icon_animation: 0.0,
             delete_modal_animation: 0.0,
+            floating_anim: 0.0,
+            floating_shown: false,
+            floating_cache: None,
+            floating_parts: String::new(),
+            floating_tween: 0,
             cursor_trail: Vec::new(),
             hovered_entry: None,
             saved_gens: HashMap::new(),
@@ -750,6 +765,79 @@ impl Shell {
         })
         .detach();
     }
+
+    /// Dimension-type lock toggle shared by the X/Y/D keys and the
+    /// floating-menu rows: outside the Dimension tool it enters the tool
+    /// and arms the lock; inside it toggles (second press lifts). Guards
+    /// rename + value-input so keystrokes are never stolen.
+    pub(crate) fn set_dim_lock_or_enter(&mut self, lock: &str, cx: &mut Context<Self>) {
+        if self.renaming.is_some() {
+            return;
+        }
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|ed| ed.read(cx).dim_input.is_some())
+        {
+            return;
+        }
+        if let Some(ed) = self.editor.as_ref() {
+            let lock_owned = lock.to_string();
+            ed.update(cx, |ed, cx| {
+                if ed.tool != crate::editor::Tool::Dimension {
+                    ed.set_tool(crate::editor::Tool::Dimension);
+                }
+                let active = ed.dim_mode_lock.as_deref() == Some(lock_owned.as_str());
+                ed.set_dim_mode_lock(if active {
+                    None
+                } else {
+                    Some(lock_owned.clone())
+                });
+                cx.notify();
+            });
+            cx.notify();
+        }
+    }
+
+    /// Floating menu slide+fade tween toward `target` (1 = in, 0 = out).
+    /// Single ease-out-cubic slide (~110ms, 8 ticks) shared by show, hide,
+    /// and content-change replays — height itself is always auto layout,
+    /// so there is no estimated-height jump at either end. The generation
+    /// guard kills stale tickers, so rapid toggles never stack competing
+    /// notifies (that stacking was the fps dip).
+    pub(crate) fn start_floating_anim(&mut self, target: f32, cx: &mut Context<Self>) {
+        self.floating_tween = self.floating_tween.wrapping_add(1);
+        let tween = self.floating_tween;
+        let from = self.floating_anim;
+        if (from - target).abs() < f32::EPSILON {
+            return;
+        }
+        let this = cx.entity().downgrade();
+        cx.spawn(async move |this, cx| {
+            let steps = 8;
+            for i in 1..=steps {
+                cx.background_executor()
+                    .timer(Duration::from_millis(14))
+                    .await;
+                let done = this
+                    .update(cx, |shell, cx| {
+                        if shell.floating_tween != tween {
+                            return true;
+                        }
+                        let t = i as f32 / steps as f32;
+                        let eased = 1.0 - (1.0 - t).powi(3);
+                        shell.floating_anim = from + (target - from) * eased;
+                        cx.notify();
+                        i == steps
+                    })
+                    .unwrap_or(true);
+                if done {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
 }
 
 // Camera that fits the document's content into a viewport with padding.
@@ -845,10 +933,6 @@ impl Render for Shell {
                         return;
                     }
                 }
-                // Nothing else to unwind: dismiss the editor's bond menu.
-                if let Some(ed) = shell.editor.as_ref() {
-                    let _ = ed.update(cx, |ed, _| ed.dismiss_context_menu());
-                }
                 shell.close_menu(cx);
             }))
             .on_action(cx.listener(|shell, _: &crate::ui::actions::Undo, _, cx| {
@@ -891,50 +975,7 @@ impl Render for Shell {
                     }
                 },
             ))
-            .on_action(cx.listener(|shell, _: &crate::ui::actions::BondCoincident, _, cx| {
-                // While a dimension value input is active, digit keystrokes
-                // feed the input (the binding would otherwise eat them).
-                if let Some(ed) = shell.editor.as_ref() {
-                    let feeding = ed.read(cx).dim_input.is_some();
-                    if feeding {
-                        let _ = ed.update(cx, |ed, cx| {
-                            if ed.dim_input_key("1") {
-                                cx.notify();
-                            }
-                        });
-                        return;
-                    }
-                    let _ = ed.update(cx, |ed, _| ed.trigger_context_shortcut(0));
-                    cx.notify();
-                }
-            }))
-            .on_action(cx.listener(|shell, _: &crate::ui::actions::BondCombinePoints, _, cx| {
-                    // While a dimension value input is active, digit keystrokes
-                    // feed the input (the binding would otherwise eat them).
-                    // This check MUST come before any early return — "2" is
-                    // bound to this action, so without it the digit never
-                    // reaches the input.
-                    if let Some(ed) = shell.editor.as_ref() {
-                        if ed.read(cx).dim_input.is_some() {
-                            let _ = ed.update(cx, |ed, cx| {
-                                if ed.dim_input_key("2") {
-                                    cx.notify();
-                                }
-                            });
-                            return;
-                        }
-                    }
-                    if shell.renaming.is_some() {
-                        return;
-                    }
-                    if let Some(ed) = shell.editor.as_ref() {
-                        let changed = ed.update(cx, |ed, _| ed.trigger_context_shortcut(1));
-                        if changed {
-                            shell.invalidate_thumbs_all();
-                        }
-                        cx.notify();
-                    }
-                })).on_action(cx.listener(|shell, _: &crate::ui::actions::ToolMove, _, cx| {
+            .on_action(cx.listener(|shell, _: &crate::ui::actions::ToolMove, _, cx| {
                 if shell.renaming.is_some()
                     || shell
                         .editor
@@ -979,7 +1020,19 @@ impl Render for Shell {
                 }
                 if let Some(ed) = shell.editor.as_ref() {
                     ed.update(cx, |ed, cx| {
-                        if ed.set_tool(crate::editor::Tool::Dimension) {
+                        // Entering the tool, or toggling the Displacement
+                        // restriction when already in it (D is its key).
+                        if ed.tool != crate::editor::Tool::Dimension {
+                            if ed.set_tool(crate::editor::Tool::Dimension) {
+                                cx.notify();
+                            }
+                        } else {
+                            let active = ed.dim_mode_lock.as_deref() == Some("displacement");
+                            ed.set_dim_mode_lock(if active {
+                                None
+                            } else {
+                                Some("displacement".to_string())
+                            });
                             cx.notify();
                         }
                     });
@@ -1053,6 +1106,127 @@ impl Render for Shell {
                     });
                 }
             }))
+            .on_action(cx.listener(|shell, _: &crate::ui::actions::ToolPen, _, cx| {
+                if shell.renaming.is_some()
+                    || shell
+                        .editor
+                        .as_ref()
+                        .is_some_and(|ed| ed.read(cx).dim_input.is_some())
+                {
+                    return;
+                }
+                if let Some(ed) = shell.editor.as_ref() {
+                    ed.update(cx, |ed, cx| {
+                        if ed.set_tool(crate::editor::Tool::Pen) {
+                            cx.notify();
+                        }
+                    });
+                    shell.fades.remove("floating-menu");
+                    shell.fade_pending.remove("floating-menu");
+                    shell.fade_tween_active.remove("floating-menu");
+                }
+            }))
+            .on_action(cx.listener(|shell, _: &crate::ui::actions::PenLine, _, cx| {
+                if let Some(ed) = shell.editor.as_ref() {
+                    ed.update(cx, |ed, cx| {
+                        ed.set_tool(crate::editor::Tool::Pen);
+                        if ed.set_pen_mode(crate::editor::PenMode::Line) {
+                            cx.notify();
+                        }
+                    });
+                }
+            }))
+            .on_action(cx.listener(|shell, _: &crate::ui::actions::PenBezier, _, cx| {
+                if let Some(ed) = shell.editor.as_ref() {
+                    ed.update(cx, |ed, cx| {
+                        ed.set_tool(crate::editor::Tool::Pen);
+                        if ed.set_pen_mode(crate::editor::PenMode::Bezier) {
+                            cx.notify();
+                        }
+                    });
+                }
+            }))
+            .on_action(cx.listener(|shell, _: &crate::ui::actions::PenArc, _, cx| {
+                if let Some(ed) = shell.editor.as_ref() {
+                    ed.update(cx, |ed, cx| {
+                        ed.set_tool(crate::editor::Tool::Pen);
+                        if ed.set_pen_mode(crate::editor::PenMode::Arc) {
+                            cx.notify();
+                        }
+                    });
+                }
+            }))
+            .on_action(cx.listener(|shell, _: &crate::ui::actions::DimWidth, _, cx| {
+                shell.set_dim_lock_or_enter("width", cx);
+            }))
+            .on_action(cx.listener(|shell, _: &crate::ui::actions::DimHeight, _, cx| {
+                shell.set_dim_lock_or_enter("height", cx);
+            }))
+            .on_action(cx.listener(|shell, _: &crate::ui::actions::DimDisplacement, _, cx| {
+                shell.set_dim_lock_or_enter("displacement", cx);
+            }))
+            .on_action(cx.listener(|shell, _: &crate::ui::actions::DimDistance, _, cx| {
+                // In the Dimension tool C clears any type lock (= back to
+                // the default type for the picks, e.g. curve length for a
+                // bezier). Anywhere else it means Coincident when the
+                // floating menu offers it.
+                if shell.renaming.is_some() {
+                    return;
+                }
+                if shell
+                    .editor
+                    .as_ref()
+                    .is_some_and(|ed| ed.read(cx).dim_input.is_some())
+                {
+                    return;
+                }
+                if shell.editor.as_ref().is_some_and(|ed| {
+                    ed.read(cx).tool == crate::editor::Tool::Dimension
+                }) {
+                    if let Some(ed) = shell.editor.as_ref() {
+                        ed.update(cx, |ed, cx| {
+                            if ed.dim_mode_lock.is_some() {
+                                ed.set_dim_mode_lock(None);
+                                cx.notify();
+                            }
+                        });
+                    }
+                    return;
+                }
+                if let Some(ed) = shell.editor.as_ref() {
+                    let offered = {
+                        let ed = ed.read(cx);
+                        crate::ui::floating_menu::constraints_for_selection(
+                            &ed.selection,
+                            cx,
+                            &shell.editor.as_ref().unwrap().downgrade(),
+                        )
+                        .iter()
+                        .any(|(a, _, _, _)| {
+                            matches!(
+                                a,
+                                crate::ui::floating_menu::MenuAction::Constraint(
+                                    crate::core::constraints::ConstraintKind::Coincident
+                                )
+                            )
+                        })
+                    };
+                    if offered
+                        && ed.update(cx, |ed, cx| {
+                            if ed.apply_constraint_from_menu(
+                                crate::core::constraints::ConstraintKind::Coincident,
+                            ) {
+                                cx.notify();
+                                true
+                            } else {
+                                false
+                            }
+                        })
+                    {
+                        cx.notify();
+                    }
+                }
+            }))
             .on_key_down(move |e: &gpui::KeyDownEvent, _, cx| {
                 let key = e.keystroke.key.clone();
                 // Dimension value input: while a placed dim waits for its
@@ -1081,8 +1255,196 @@ impl Render for Shell {
                         return;
                     }
                 }
+                // Floating-menu action hotkeys (live while the menu is
+                // visible): H/T/P/E apply the offered constraint.
+                // (X/Y/C/D belong to the dimension-lock actions; C doubles
+                // as Coincident via its own action.) P falls through to
+                // the Pen tool when Parallel isn't offered.
+                if !e.keystroke.modifiers.modified() {
+                    let ckey = match key.as_str() {
+                        "h" | "t" | "p" | "e" => Some(key.as_str()),
+                        _ => None,
+                    };
+                    if let Some(k) = ckey {
+                        let mut consumed = false;
+                        let _ = shell_keys.update(cx, |shell, cx| {
+                            use crate::ui::floating_menu::MenuAction as MA;
+                            if shell.renaming.is_some() {
+                                return;
+                            }
+                            let Some(ed) = shell.editor.as_ref() else {
+                                return;
+                            };
+                            if ed.read(cx).dim_input.is_some() {
+                                return;
+                            }
+                            let (tool, selection) = {
+                                let ed = ed.read(cx);
+                                (ed.tool, ed.selection.clone())
+                            };
+                            // Constraints live on Pen/Move; the Dimension
+                            // tool owns C/X/Y/D for type locks above.
+                            if !matches!(
+                                tool,
+                                crate::editor::Tool::Pen | crate::editor::Tool::Move
+                            ) {
+                                return;
+                            }
+                            if !crate::ui::floating_menu::menu_visible(tool, &selection) {
+                                return;
+                            }
+                            let kinds = crate::ui::floating_menu::constraints_for_selection(
+                                &selection,
+                                cx,
+                                &shell.editor.as_ref().unwrap().downgrade(),
+                            );
+                            let want = match k {
+                                "h" => MA::Constraint(
+                                    crate::core::constraints::ConstraintKind::Horizontal,
+                                ),
+                                "t" => MA::Constraint(
+                                    crate::core::constraints::ConstraintKind::Tangent,
+                                ),
+                                "p" => MA::Constraint(
+                                    crate::core::constraints::ConstraintKind::Parallel,
+                                ),
+                                "e" => MA::Constraint(
+                                    crate::core::constraints::ConstraintKind::Perpendicular,
+                                ),
+                                _ => MA::MergePoints,
+                            };
+                            if kinds.iter().any(|(a, _, _, _)| {
+                                match (a, &want) {
+                                    (
+                                        crate::ui::floating_menu::MenuAction::Constraint(x),
+                                        crate::ui::floating_menu::MenuAction::Constraint(y),
+                                    ) => x == y,
+                                    _ => {
+                                        std::mem::discriminant(a)
+                                            == std::mem::discriminant(&want)
+                                    }
+                                }
+                            }) && let Some(ed) = shell.editor.as_ref()
+                                && ed.update(cx, |ed, cx| {
+                                    let changed = match want {
+                                        MA::Constraint(kind) => {
+                                            ed.apply_constraint_from_menu(kind)
+                                        }
+                                        MA::MergePoints => ed.merge_selected_points(),
+                                    };
+                                    if changed {
+                                        cx.notify();
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                })
+                            {
+                                consumed = true;
+                            }
+                            if consumed {
+                                cx.notify();
+                            }
+                        });
+                        if consumed {
+                            cx.stop_propagation();
+                            return;
+                        }
+                    }
+                }
+                // Angle kind (Dimension tool): A toggles the armed edge
+                // pair between Angle and Lines-distance. Consumed whenever
+                // an edge pair is armed (even parallel, where there is
+                // nothing to toggle to) so A never yanks to Pen-arc
+                // mid-dimensioning; otherwise falls through below.
+                if !e.keystroke.modifiers.modified() && key.as_str() == "a" {
+                    let mut consumed = false;
+                    let _ = shell_keys.update(cx, |shell, cx| {
+                        if shell.renaming.is_some() {
+                            return;
+                        }
+                        let Some(ed) = shell.editor.as_ref() else {
+                            return;
+                        };
+                        if ed.read(cx).tool != crate::editor::Tool::Dimension
+                            || ed.read(cx).dim_input.is_some()
+                        {
+                            return;
+                        }
+                        let is_edge = matches!(
+                            ed.read(cx).dim_target,
+                            Some(
+                                crate::core::constraints::DimTarget::Lines { .. }
+                                    | crate::core::constraints::DimTarget::Angle { .. }
+                                    | crate::core::constraints::DimTarget::EdgeMid { .. }
+                            )
+                        );
+                        if !is_edge {
+                            return;
+                        }
+                        ed.update(cx, |ed, cx| {
+                            ed.toggle_dim_edge_kind();
+                            cx.notify();
+                        });
+                        consumed = true;
+                        cx.notify();
+                    });
+                    if consumed {
+                        cx.stop_propagation();
+                        return;
+                    }
+                }
+                // Pen sub-mode switches (explicit only): L/B/A always land
+                // in the Pen tool with that sub-mode — they never untoggle
+                // Pen, and drag never changes mode.
+                if !e.keystroke.modifiers.modified() {
+                    let pen_switch = match key.as_str() {
+                        "l" | "b" | "a" => Some(key.as_str()),
+                        _ => None,
+                    };
+                    if let Some(k) = pen_switch {
+                        let mut consumed = false;
+                        let _ = shell_keys.update(cx, |shell, cx| {
+                            if shell.renaming.is_some() {
+                                return;
+                            }
+                            if let Some(ed) = shell.editor.as_ref() {
+                                if ed.read(cx).dim_input.is_none()
+                                {
+                                    let mode = match k {
+                                        "l" => crate::editor::PenMode::Line,
+                                        "b" => crate::editor::PenMode::Bezier,
+                                        _ => crate::editor::PenMode::Arc,
+                                    };
+                                    if ed.update(cx, |ed, cx| {
+                                        let tool_changed =
+                                            ed.set_tool(crate::editor::Tool::Pen);
+                                        let mode_changed = ed.set_pen_mode(mode);
+                                        if tool_changed || mode_changed {
+                                            cx.notify();
+                                        }
+                                        // Always consume: L/B/A belong to
+                                        // Pen now and must never fall
+                                        // through (or untoggle it).
+                                        true
+                                    }) {
+                                        consumed = true;
+                                    }
+                                }
+                            }
+                            if consumed {
+                                cx.notify();
+                            }
+                        });
+                        if consumed {
+                            cx.stop_propagation();
+                            return;
+                        }
+                    }
+                }
                 // Dimension tool idle: Esc walks the cancel stack — value
                 // input, picks, then the tool itself (back to Move).
+                // Pen: Esc cancels the live preview first, then the tool.
                 if key == "escape" {
                     let mut consumed = false;
                     let _ = shell_keys.update(cx, |shell, cx| {
@@ -1092,10 +1454,24 @@ impl Render for Shell {
                                 consumed = true;
                                 return;
                             }
+                            let is_pen = ed.read(cx).tool == crate::editor::Tool::Pen;
+                            if is_pen
+                                && ed.update(cx, |ed, cx| {
+                                    if ed.cancel_pen_path() {
+                                        cx.notify();
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                })
+                            {
+                                consumed = true;
+                                return;
+                            }
                             let is_dim = ed.read(cx).tool == crate::editor::Tool::Dimension;
                             if is_dim && ed.update(cx, |ed, _| ed.dim_escape()) {
                                 consumed = true;
-                            } else if is_dim
+                            } else if (is_dim || is_pen)
                                 && ed.update(cx, |ed, _| ed.set_tool(crate::editor::Tool::Move))
                             {
                                 consumed = true;
@@ -1225,6 +1601,10 @@ impl Render for Shell {
                             shell: cx.entity().downgrade(),
                         })
                         .child(crate::ui::inspector::Inspector {
+                            editor: editor.downgrade(),
+                            shell: cx.entity().downgrade(),
+                        })
+                        .child(crate::ui::floating_menu::FloatingMenu {
                             editor: editor.downgrade(),
                             shell: cx.entity().downgrade(),
                         })

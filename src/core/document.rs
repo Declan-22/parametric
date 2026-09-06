@@ -51,6 +51,12 @@ pub enum SegmentKind {
     // Circular arc through start, ctrl (a point ON the arc), end. Becomes
     // a full circle when start/end share a Coincident constraint.
     Arc,
+    // Cubic bezier through start -> end with two handle points.
+    // Storage reuses the existing slots: `ctrl` is handle 1, `center` is
+    // handle 2 (center is meaningless for beziers). No schema migration —
+    // the DB persists both slots already. All point lifecycle paths
+    // (remove/merge/sweep/element_points) already follow both slots.
+    Bezier,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -76,6 +82,18 @@ impl Segment {
 
     fn with_kind(start: PointId, end: PointId, kind: SegmentKind) -> Self {
         Self { start, end, kind, stroke_width: 0., ctrl: None, center: None }
+    }
+
+    /// Bezier handles: (handle1, handle2). None slots mean sharp/degenerate.
+    pub fn bezier_handles(&self) -> (Option<PointId>, Option<PointId>) {
+        if self.kind != SegmentKind::Bezier {
+            return (None, None);
+        }
+        (self.ctrl, self.center)
+    }
+
+    pub fn is_curve(&self) -> bool {
+        matches!(self.kind, SegmentKind::Arc | SegmentKind::Bezier)
     }
 }
 
@@ -274,6 +292,26 @@ impl Document {
         SegmentId { idx, generation }
     }
 
+    /// Adds a cubic bezier start -> end with two real handle points.
+    /// Handles are free (no solver equations); only endpoints constrain.
+    pub fn add_bezier_segment(
+        &mut self,
+        start: PointId,
+        handle1: PointId,
+        handle2: PointId,
+        end: PointId,
+    ) -> SegmentId {
+        let (idx, generation) = self.segments.insert(Segment {
+            start,
+            end,
+            kind: SegmentKind::Bezier,
+            stroke_width: 1.0,
+            ctrl: Some(handle1),
+            center: Some(handle2),
+        });
+        SegmentId { idx, generation }
+    }
+
     /// Adds a circular arc through start -> ctrl -> end, with a real
     /// center point (kept in sync by the editor).
     pub fn add_arc_segment(
@@ -296,6 +334,10 @@ impl Document {
 
     pub fn segment(&self, id: SegmentId) -> Option<Segment> {
         self.segments.get((id.idx, id.generation)).copied()
+    }
+
+    pub fn segment_mut(&mut self, id: SegmentId) -> Option<&mut Segment> {
+        self.segments.get_mut((id.idx, id.generation))
     }
 
     /// Resolved endpoint positions of a segment.
@@ -594,10 +636,14 @@ impl Document {
                 DimTarget::PointLine { p, line } => {
                     self.point(*p).is_some() && self.segment(*line).is_some()
                 }
-                DimTarget::Lines { a, b } | DimTarget::Angle { a, b } => {
+                DimTarget::Lines { a, b }
+                | DimTarget::Angle { a, b }
+                | DimTarget::EdgeMid { a, b, .. } => {
                     self.segment(*a).is_some() && self.segment(*b).is_some()
                 }
-                DimTarget::Radius { seg } => self.segment(*seg).is_some(),
+                DimTarget::Radius { seg } | DimTarget::CurveLength { seg } => {
+                    self.segment(*seg).is_some()
+                }
             })
             .collect();
         let dims = self.dimensions.clone();

@@ -1,6 +1,7 @@
 pub mod actions;
 pub mod canvas;
 pub mod components;
+pub mod floating_menu;
 pub mod home;
 pub mod inspector;
 pub mod menu;

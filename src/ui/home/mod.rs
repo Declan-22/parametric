@@ -156,12 +156,15 @@ impl RenderOnce for DesignCard {
                         None, // hover
                         &[],  // dims
                         &[],  // angle dims
+                        &[],  // curve dims
                         &[],  // snap guides
                         None, // marquee
                         None, // pending ruler
                         None, // pending line
                         &[],  // constraint markers
                         None, // pending circle
+                        None, // pending pen
+                        None, // pending bezier
                         false, // show_grid (thumbnails never show grid)
                         crate::editor::Tool::Move,
                         None, // cursor_doc (no midpoint reveal in thumbnails)
@@ -200,6 +203,7 @@ impl RenderOnce for DesignCard {
                     paint::Primitive::Line { .. } => {}
                     paint::Primitive::Outline { .. } => {}
                     paint::Primitive::Circle { .. } => {}
+                    paint::Primitive::Diamond { .. } => {}
                     paint::Primitive::RulerLabel { .. } => {}
                 }
             }

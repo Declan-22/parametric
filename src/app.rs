@@ -62,18 +62,23 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("-", ZoomOut, None),
         KeyBinding::new("shift-1", ZoomToFit, None),
         KeyBinding::new("shift-2", ZoomToSelection, None),
-        // Snap-bond choice menu quick keys.
-        KeyBinding::new("1", BondCoincident, None),
-        KeyBinding::new("2", BondCombinePoints, None),
         KeyBinding::new("escape", BondDismiss, None),
+        // Dimension-type locks. D stays on ToolDimension (its handler
+        // toggles Displacement when already in the tool); C doubles as
+        // Coincident outside the Dimension tool (handled there).
+        KeyBinding::new("x", DimWidth, None),
+        KeyBinding::new("y", DimHeight, None),
+        KeyBinding::new("c", DimDistance, None),
         // Tool selection (canvas focused; also works globally when not renaming)
+        // Line (L) + Arc (A) live inside the Pen tool — no separate
+        // bindings, so L/B/A never untoggle Pen (shell routes them to
+        // the pen sub-mode instead).
         KeyBinding::new("v", ToolMove, None),
         KeyBinding::new("space", ToolPan, None),
         KeyBinding::new("d", ToolDimension, None),
         KeyBinding::new("m", ToolRuler, None),
-        KeyBinding::new("l", ToolLine, None),
         KeyBinding::new("r", ToolRectangle, None),
-        KeyBinding::new("a", ToolCircle, None),
+        KeyBinding::new("p", ToolPen, None),
     ]);
 }
 

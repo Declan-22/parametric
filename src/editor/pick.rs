@@ -43,11 +43,15 @@ impl<'a> Picker<'a> {
         let mut best: Option<(f64, SegmentId)> = None;
         for (id, seg) in self.doc.all_segments() {
             if seg.kind != SegmentKind::Line && seg.kind != SegmentKind::Ruler {
-                // Arcs hit-test against their sampled polyline.
-                if seg.kind == SegmentKind::Arc
-                    && let Some(samples) =
-                        crate::editor::arc::segment_samples(self.doc, id, 32)
-                {
+                // Arcs + beziers hit-test against their sampled polyline.
+                let samples = if seg.kind == SegmentKind::Arc {
+                    crate::editor::arc::segment_samples(self.doc, id, 32)
+                } else if seg.kind == SegmentKind::Bezier {
+                    crate::editor::bezier::segment_samples(self.doc, id, 32)
+                } else {
+                    None
+                };
+                if let Some(samples) = samples {
                     let d = samples
                         .windows(2)
                         .map(|w| point_segment_distance(at, w[0], w[1]))

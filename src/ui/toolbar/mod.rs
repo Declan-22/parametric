@@ -5,9 +5,9 @@ use gpui::{
 use crate::editor::Tool;
 use crate::theme::Theme;
 
-const ICON_CONSTRAINT_HV: &[u8] = br#"<svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg"><g clip-path="url(#clip0_10_2)"><path d="M3.12729 0.858231V7.82697M1.75229 0.858231V8.92073M1.75229 2.92073L0.810216 1.97866M1.75229 5.37385L1.28125 4.90281L0.810211 4.43178M1.75229 7.82697L0.810216 6.8849M3.12729 10.1997H5.18979M10.096 10.1997H7.64291L5.18979 10.1997M5.18979 10.1997L4.24772 11.1418M7.64291 10.1997L7.17187 10.6707L6.70083 11.1418M10.096 10.1997H11.1898M10.096 10.1997L9.15396 11.1418M11.1898 8.9474H3.95312" stroke="black" stroke-width="0.75" stroke-linecap="round"/></g><defs><clipPath id="clip0_10_2"><rect width="12" height="12" fill="white"/></clipPath></defs></svg>"#;
-const ICON_CONSTRAINT_PARALLEL: &[u8] = br#"<svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M3.20312 6.72656L6.79688 3.13281M5.27344 8.79688L8.86719 5.20312" stroke="black" stroke-width="0.75" stroke-linecap="round"/><circle cx="2.29" cy="7.64" r="1.04" stroke="black" stroke-width="0.75"/><circle cx="7.64" cy="2.29" r="1.04" stroke="black" stroke-width="0.75"/><circle cx="4.36" cy="9.71" r="1.04" stroke="black" stroke-width="0.75"/><circle cx="9.71" cy="4.36" r="1.04" stroke="black" stroke-width="0.75"/></svg>"#;
-const ICON_CONSTRAINT_PERPENDICULAR: &[u8] = br#"<svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M.44 10.02h4.47M7.14 10.02h4.42M6.01 2.69v6.08" stroke="black" stroke-width=".75"/><circle cx="6.01" cy="1.7" r=".99" fill="black"/><circle cx="6.01" cy="9.96" r=".99" fill="black"/></svg>"#;
+pub(crate) const ICON_CONSTRAINT_HV: &[u8] = br#"<svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg"><g clip-path="url(#clip0_10_2)"><path d="M3.12729 0.858231V7.82697M1.75229 0.858231V8.92073M1.75229 2.92073L0.810216 1.97866M1.75229 5.37385L1.28125 4.90281L0.810211 4.43178M1.75229 7.82697L0.810216 6.8849M3.12729 10.1997H5.18979M10.096 10.1997H7.64291L5.18979 10.1997M5.18979 10.1997L4.24772 11.1418M7.64291 10.1997L7.17187 10.6707L6.70083 11.1418M10.096 10.1997H11.1898M10.096 10.1997L9.15396 11.1418M11.1898 8.9474H3.95312" stroke="black" stroke-width="0.75" stroke-linecap="round"/></g><defs><clipPath id="clip0_10_2"><rect width="12" height="12" fill="white"/></clipPath></defs></svg>"#;
+pub(crate) const ICON_CONSTRAINT_PARALLEL: &[u8] = br#"<svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M3.20312 6.72656L6.79688 3.13281M5.27344 8.79688L8.86719 5.20312" stroke="black" stroke-width="0.75" stroke-linecap="round"/><circle cx="2.29" cy="7.64" r="1.04" stroke="black" stroke-width="0.75"/><circle cx="7.64" cy="2.29" r="1.04" stroke="black" stroke-width="0.75"/><circle cx="4.36" cy="9.71" r="1.04" stroke="black" stroke-width="0.75"/><circle cx="9.71" cy="4.36" r="1.04" stroke="black" stroke-width="0.75"/></svg>"#;
+pub(crate) const ICON_CONSTRAINT_PERPENDICULAR: &[u8] = br#"<svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M.44 10.02h4.47M7.14 10.02h4.42M6.01 2.69v6.08" stroke="black" stroke-width=".75"/><circle cx="6.01" cy="1.7" r=".99" fill="black"/><circle cx="6.01" cy="9.96" r=".99" fill="black"/></svg>"#;
 
 // Bottom toolbar: one centered row â€” mode tools (Move / Pan), a divider,
 // then shape tools (Rectangle).
@@ -36,7 +36,7 @@ const ICON_PAN: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" 
 
 "#;
 
-const ICON_LINE: &[u8] =
+pub(crate) const ICON_LINE: &[u8] =
     br#"<svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
     <g clip-path="url(#clip0_3_14)">
     <path d="M3.5 8.5L8.5 3.5M8.805 3.981C8.9015 4 9.0175 4 9.25 4C9.4825 4 9.5985 4 9.695 3.981C9.88908 3.94245 10.0674 3.84719 10.2073 3.70727C10.3472 3.56736 10.4424 3.38908 10.481 3.195C10.5 3.0985 10.5 2.9825 10.5 2.75C10.5 2.5175 10.5 2.4015 10.481 2.305C10.4424 2.11092 10.3472 1.93264 10.2073 1.79273C10.0674 1.65281 9.88908 1.55755 9.695 1.519C9.5985 1.5 9.4825 1.5 9.25 1.5C9.0175 1.5 8.9015 1.5 8.805 1.519C8.61092 1.55755 8.43264 1.65281 8.29273 1.79273C8.15281 1.93264 8.05755 2.11092 8.019 2.305C8 2.4015 8 2.5175 8 2.75C8 2.9825 8 3.0985 8.019 3.195C8.05755 3.38908 8.15281 3.56736 8.29273 3.70727C8.43264 3.84719 8.61092 3.94245 8.805 3.981ZM2.305 10.481C2.4015 10.5 2.5175 10.5 2.75 10.5C2.9825 10.5 3.0985 10.5 3.195 10.481C3.38908 10.4424 3.56736 10.3472 3.70727 10.2073C3.84719 10.0674 3.94245 9.88908 3.981 9.695C4 9.5985 4 9.4825 4 9.25C4 9.0175 4 8.9015 3.981 8.805C3.94245 8.61092 3.84719 8.43264 3.70727 8.29273C3.56736 8.15281 3.38908 8.05755 3.195 8.019C3.0985 8 2.9825 8 2.75 8C2.5175 8 2.4015 8 2.305 8.019C2.11092 8.05755 1.93264 8.15281 1.79273 8.29273C1.65281 8.43264 1.55755 8.61092 1.519 8.805C1.5 8.9015 1.5 9.0175 1.5 9.25C1.5 9.4825 1.5 9.5985 1.519 9.695C1.55755 9.88908 1.65281 10.0674 1.79273 10.2073C1.93264 10.3472 2.11092 10.4424 2.305 10.481Z" stroke="black" stroke-width="0.75" stroke-linejoin="round"/>
@@ -69,7 +69,7 @@ const ICON_RECTANGLE: &[u8] =
 
 "#;
 
-const ICON_CIRCLE: &[u8] =
+pub(crate) const ICON_CIRCLE: &[u8] =
     br#"<svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
     <g clip-path="url(#clip0_3_74)">
     <path d="M1.66891 8.5C1.24349 7.76457 1 6.91072 1 6C1 3.23858 3.23858 1 6 1C6.88514 1 7.71657 1.23 8.43777 1.6335" stroke="black" stroke-width="0.4" stroke-dasharray="1 1"/>
@@ -85,7 +85,7 @@ const ICON_CIRCLE: &[u8] =
 
 "#;
 
-const ICON_DIMENSION: &[u8] =
+pub(crate) const ICON_DIMENSION: &[u8] =
     br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
 	<path d="M0 0h24v24H0z" fill="none" />
 	<g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5">
@@ -107,6 +107,8 @@ const ICON_RULER: &[u8] =
 
 
 "#;
+
+const ICON_PEN: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24"><path d="M0 0h24v24H0z" fill="none" /><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"><path d="m9.5 14.5l-7 7m8-7a1 1 0 1 1-2 0a1 1 0 0 1 2 0" /><path d="m18.5 12l-1.762 4.028c-.85 1.944-1.276 2.915-2.076 3.538c-.8.624-1.846.798-3.938 1.147L3 22a1 1 0 0 1-1-1l1.287-7.724c.349-2.092.523-3.138 1.147-3.938c.623-.8 1.594-1.225 3.538-2.076L12 5.5" /><path d="M18.379 11.879L12.12 5.62a2.121 2.121 0 0 1 3-3l6.26 6.26a2.121 2.121 0 0 1-3 3" /></g></svg>"#;
 
 #[derive(IntoElement)]
 pub struct Toolbar {
@@ -146,15 +148,8 @@ impl RenderOnce for Toolbar {
             .child(self.tool_button(Tool::Dimension, ICON_DIMENSION, active_tool, t, cx))
             .child(self.tool_button(Tool::Ruler, ICON_RULER, active_tool, t, cx))
             .child(divider(t))
-            .child(self.tool_button(Tool::Line, ICON_LINE, active_tool, t, cx))
+            .child(self.tool_button(Tool::Pen, ICON_PEN, active_tool, t, cx))
             .child(self.tool_button(Tool::Rectangle, ICON_RECTANGLE, active_tool, t, cx))
-            .child(self.tool_button(Tool::Circle, ICON_CIRCLE, active_tool, t, cx))
-            .child(divider(t))
-            .child(self.tool_button(Tool::ConstraintHorizontalVertical, ICON_CONSTRAINT_HV, active_tool, t, cx))
-            .child(self.tool_button(Tool::ConstraintTangent, crate::ui::canvas::ICON_CHIP_TANGENT, active_tool, t, cx))
-            .child(self.tool_button(Tool::ConstraintCoincident, crate::ui::canvas::ICON_CHIP_COINCIDENT, active_tool, t, cx))
-            .child(self.tool_button(Tool::ConstraintParallel, ICON_CONSTRAINT_PARALLEL, active_tool, t, cx))
-            .child(self.tool_button(Tool::ConstraintPerpendicular, ICON_CONSTRAINT_PERPENDICULAR, active_tool, t, cx))
     }
 }
 
@@ -289,6 +284,7 @@ fn tool_debug_name(tool: Tool) -> &'static str {
         Tool::Circle => "tool-circle",
         Tool::Ruler => "tool-ruler",
         Tool::Dimension => "tool-dimension",
+        Tool::Pen => "tool-pen",
         Tool::ConstraintHorizontalVertical => "tool-constraint-hv",
         Tool::ConstraintTangent => "tool-constraint-tangent",
         Tool::ConstraintCoincident => "tool-constraint-coincident",
@@ -306,6 +302,7 @@ fn tool_tooltip(tool: Tool) -> (&'static str, &'static str) {
         Tool::Rectangle => ("Rectangle", "R"),
         Tool::Circle => ("Arc", "A"),
         Tool::Dimension => ("Dimension", "D"),
+        Tool::Pen => ("Pen", "P"),
         Tool::ConstraintHorizontalVertical => ("Horizontal / Vertical constraint", ""),
         Tool::ConstraintTangent => ("Tangent constraint", ""),
         Tool::ConstraintCoincident => ("Coincident constraint", ""),

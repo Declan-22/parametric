@@ -57,6 +57,7 @@ pub struct PendingBezier {
     pub h1: Option<Point2>,
     pub h2: Option<Point2>,
     pub cursor: Point2,
+    pub active_handle: Option<u8>,
 }
 
 impl PendingBezier {
@@ -102,7 +103,7 @@ impl PendingPen {
             PenMode::Bezier => Self {
                 mode,
                 line: None,
-                bezier: Some(PendingBezier { p0: at, p1: None, h1: None, h2: None, cursor: at }),
+                bezier: Some(PendingBezier { p0: at, p1: None, h1: None, h2: None, cursor: at, active_handle: None }),
                 circle: None,
             },
             PenMode::Arc => Self {

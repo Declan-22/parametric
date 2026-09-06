@@ -442,14 +442,21 @@ impl Document {
             ElementRef::Point(p) => vec![p],
             ElementRef::Segment(s) => match self.segment(s) {
                 Some(seg) => {
-                    let mut v = vec![seg.start, seg.end];
-                    if let Some(c) = seg.ctrl {
-                        v.push(c);
+                    // A completed arc is edited as two endpoints plus its
+                    // radius. Its construction points remain internal so
+                    // they cannot appear as a third/fourth user handle.
+                    if seg.kind == SegmentKind::Arc {
+                        vec![seg.start, seg.end]
+                    } else {
+                        let mut v = vec![seg.start, seg.end];
+                        if let Some(c) = seg.ctrl {
+                            v.push(c);
+                        }
+                        if let Some(c) = seg.center {
+                            v.push(c);
+                        }
+                        v
                     }
-                    if let Some(c) = seg.center {
-                        v.push(c);
-                    }
-                    v
                 }
                 None => Vec::new(),
             },
@@ -482,7 +489,14 @@ impl Document {
 
     pub fn add_constraint(&mut self, kind: ConstraintKind, a: PointId, b: PointId) {
         let c = Constraint { kind, a, b, tangent_segments: None, point_on_segment: None };
-        if !self.constraints.contains(&c) {
+        let unordered = matches!(kind, ConstraintKind::Coincident)
+            && self.constraints.iter().any(|existing| {
+                existing.kind == kind
+                    && existing.point_on_segment.is_none()
+                    && ((existing.a == a && existing.b == b)
+                        || (existing.a == b && existing.b == a))
+            });
+        if !self.constraints.contains(&c) && !unordered {
             self.constraints.push(c);
         }
     }
@@ -493,6 +507,31 @@ impl Document {
         arc: SegmentId,
         point: PointId,
     ) {
+        // Tangency is a relation between the two owning segments, not between
+        // whichever duplicate point ids happened to be selected at the
+        // junction. Treat the pair as unordered and keep exactly one record.
+        // This also cleans up older documents that already contain duplicate
+        // tangent rows when another tangent is added.
+        let mut found = false;
+        self.constraints.retain(|existing| {
+            let same_pair = existing.kind == ConstraintKind::Tangent
+                && existing.tangent_segments.is_some_and(|(a, b)| {
+                    (a == line && b == arc) || (a == arc && b == line)
+                });
+            if same_pair {
+                if found {
+                    false
+                } else {
+                    found = true;
+                    true
+                }
+            } else {
+                true
+            }
+        });
+        if found {
+            return;
+        }
         let c = Constraint {
             kind: ConstraintKind::Tangent,
             a: point,

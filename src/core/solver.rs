@@ -89,6 +89,9 @@ enum Eq {
     Vertical { a: usize, b: usize },
     // Residual: |ab| - target
     Distance { a: usize, b: usize, target: f64 },
+    // Prevent a length-constrained segment from crossing through zero and
+    // satisfying the same unsigned distance on the reversed branch.
+    DistanceBranch { a: usize, b: usize, ux: f64, uy: f64, min_dot: f64 },
     // Residual: (b.x - a.x) - target (signed target captured at build)
     DistanceX { a: usize, b: usize, target: f64 },
     // Residual: (b.y - a.y) - target (signed target captured at build)
@@ -103,13 +106,11 @@ enum Eq {
     // Expresses an arc radius constraint through its three defining points.
     ArcRadius { s: usize, e: usize, c: usize, target: f64 },
     EqualRadius { o: usize, a: usize, b: usize },
-    // Minimum-bend barrier for live drags: keeps |bend height| above a small
-    // floor so micro-drags can't push the arc through flat (the instant it
-    // goes flat, the sweep representation flips sides and the whole arc
-    // strobes). Memory-free — it resists crossing from whichever side the
-    // iterate is on, so unlike a stored-side hinge it can never lock in a
-    // flip that already happened. Deliberate large drags can still invert.
-    ArcBend { s: usize, e: usize, c: usize },
+    // Minimum-bend barrier for live drags: keeps the bend on the side captured
+    // when the gesture started, so micro-drags cannot cross the flat state
+    // where the arc representation flips branches. Deliberate large drags
+    // can still invert through an explicit endpoint/arc reshape.
+    ArcBend { s: usize, e: usize, c: usize, side: f64 },
     Tangent { l1: usize, l2: usize, o: usize, p: usize },
     // Residual: cross(line_dir, contact-handle)/mean_len — a line tangent
     // to a BEZIER at the contact endpoint (handle = the contact's near
@@ -256,6 +257,31 @@ impl Solver {
                         continue;
                     };
                     // (line, curve) in either order.
+                    if matches!(first.kind, SK::Arc | SK::Bezier)
+                        && matches!(second.kind, SK::Arc | SK::Bezier)
+                    {
+                        let endpoints = |s: &crate::core::document::Segment| [s.start, s.end];
+                        let mut best = None;
+                        for a in endpoints(&first) {
+                            for b in endpoints(&second) {
+                                let (Some(pa), Some(pb)) = (doc.point(a), doc.point(b)) else { continue };
+                                let d = (pa.x - pb.x).powi(2) + (pa.y - pb.y).powi(2);
+                                if best.map_or(true, |(bd, _, _)| d < bd) { best = Some((d, a, b)); }
+                            }
+                        }
+                        let Some((_, a, b)) = best else { continue };
+                        let handle = |s: &crate::core::document::Segment, endpoint: PointId| {
+                            if s.kind != SK::Bezier { return None; }
+                            if s.start == endpoint { s.ctrl } else if s.end == endpoint { s.center } else { None }
+                        };
+                        let (Some(ha), Some(hb), Some(a), Some(b)) = (
+                            handle(&first, a).and_then(|id| slot_of(id)),
+                            handle(&second, b).and_then(|id| slot_of(id)),
+                            slot_of(a), slot_of(b),
+                        ) else { continue };
+                        eqs.push(Eq::Parallel { a1: ha, a2: a, b1: hb, b2: b });
+                        continue;
+                    }
                     let (line_id, curve_id, line, curve) = match (first.kind, second.kind) {
                         (SK::Line, SK::Arc) | (SK::Line, SK::Bezier) => {
                             (first_id, second_id, first, second)
@@ -277,6 +303,17 @@ impl Solver {
                             continue;
                         };
                         eqs.push(Eq::Tangent { l1, l2, o, p });
+                        let edge_drag = drag.iter().filter(|(id, _)| {
+                            *id == line.start || *id == line.end
+                        }).count() == 2;
+                        if edge_drag
+                            && let (Some(a), Some(b)) = (doc.point(line.start), doc.point(line.end))
+                        {
+                            let length = ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt();
+                            if length > 1e-9 {
+                                eqs.push(Eq::Distance { a: l1, b: l2, target: length });
+                            }
+                        }
                         if let (Some(center_id), Some(contact)) = (curve.center, doc.point(c.a))
                             && let Some(center) = doc.point(center_id)
                         {
@@ -351,7 +388,13 @@ impl Solver {
             eqs.push(Eq::EqualRadius { o, a, b });
             eqs.push(Eq::EqualRadius { o, a, b: c });
             if live_drag {
-                eqs.push(Eq::ArcBend { s: a, e: b, c });
+                let ps = doc.point(seg.start).unwrap();
+                let pe = doc.point(seg.end).unwrap();
+                let pc = doc.point(seg.ctrl.unwrap()).unwrap();
+                let cross = (pe.x - ps.x) * (pc.y - ps.y)
+                    - (pe.y - ps.y) * (pc.x - ps.x);
+                let side = if cross < 0.0 { -1.0 } else { 1.0 };
+                eqs.push(Eq::ArcBend { s: a, e: b, c, side });
             }
         }
 
@@ -367,6 +410,17 @@ impl Solver {
                     match mode {
                         crate::core::constraints::DimMode::Aligned => {
                             eqs.push(Eq::Distance { a, b, target: d.value });
+                            if let (Some(ap), Some(bp)) = endpoints {
+                                let dx = bp.x - ap.x;
+                                let dy = bp.y - ap.y;
+                                let len = (dx * dx + dy * dy).sqrt();
+                                if len > 1e-9 {
+                                    eqs.push(Eq::DistanceBranch {
+                                        a, b, ux: dx / len, uy: dy / len,
+                                        min_dot: (0.05 * len).max(1e-3),
+                                    });
+                                }
+                            }
                         }
                         axis => {
                             // Sign captured from current geometry so the
@@ -496,6 +550,29 @@ impl Solver {
                     eqs.push(Eq::Distance { a: o, b: s, target: d.value.abs() });
                     eqs.push(Eq::Distance { a: o, b: e, target: d.value.abs() });
                     eqs.push(Eq::Distance { a: o, b: cc, target: d.value.abs() });
+                    // The stored on-arc point is the legacy representation of
+                    // the sweep branch. With a radius dimension it is not an
+                    // independent handle: preserve both angular positions
+                    // around the center while the radius changes. This is
+                    // equivalent to endpoints + radius + persistent sweep,
+                    // and prevents the arc from crossing through the chord or
+                    // turning into the opposite/complete branch.
+                    if let (Some(op), Some(sp), Some(ep), Some(cp)) = (
+                        doc.point(seg_d.center.unwrap()),
+                        doc.point(seg_d.start),
+                        doc.point(seg_d.end),
+                        doc.point(seg_d.ctrl.unwrap()),
+                    ) {
+                        let angle = |a: Point2, b: Point2| {
+                            let ax = a.x - op.x;
+                            let ay = a.y - op.y;
+                            let bx = b.x - op.x;
+                            let by = b.y - op.y;
+                            (ax * by - ay * bx).atan2(ax * bx + ay * by)
+                        };
+                        eqs.push(Eq::Angle { a1: o, a2: s, b1: o, b2: cc, target: angle(sp, cp) });
+                        eqs.push(Eq::Angle { a1: o, a2: s, b1: o, b2: e, target: angle(sp, ep) });
+                    }
                 }
                 DimTarget::CurveLength { seg } => {
                     // Bezier-only arc-length: a real equation over the
@@ -809,6 +886,44 @@ impl Solver {
             }
         }
 
+        // Segment connectivity alone must not make an untouched arc
+        // deformable. A far-endpoint drag on a tangent line reaches the arc
+        // through the shared segment graph, but the arc is not part of the
+        // gesture. Keep every defining arc point fixed unless the gesture
+        // explicitly grabbed one of them; the line can still rotate/resize
+        // to satisfy the tangent equation.
+        let mut pinned_untouched_arc = false;
+        for (_, seg) in doc.all_segments() {
+            if seg.kind != crate::core::document::SegmentKind::Arc {
+                continue;
+            }
+            let mut ids = vec![seg.start, seg.end];
+            if let Some(id) = seg.ctrl { ids.push(id); }
+            if let Some(id) = seg.center { ids.push(id); }
+            if ids.iter().any(|pid| drag.iter().any(|(d, _)| d == pid)) {
+                continue;
+            }
+            for pid in ids {
+                if let Some(&i) = index.get(&pid) {
+                    if free_of[i].is_some() {
+                        free_of[i] = None;
+                        fixed[i] = true;
+                        pinned_untouched_arc = true;
+                    }
+                }
+            }
+        }
+        if pinned_untouched_arc {
+            let mut next = 0;
+            for slot in &mut free_of {
+                if slot.is_some() {
+                    *slot = Some(next);
+                    next += 1;
+                }
+            }
+            n_free = next;
+        }
+
         let active_eqs = eqs
             .iter()
             .copied()
@@ -817,6 +932,7 @@ impl Solver {
                     Eq::Horizontal { a, b }
                     | Eq::Vertical { a, b }
                     | Eq::Distance { a, b, .. }
+                    | Eq::DistanceBranch { a, b, .. }
                     | Eq::DistanceX { a, b, .. }
                     | Eq::DistanceY { a, b, .. } => [a, b, usize::MAX, usize::MAX],
                     Eq::PointLineDist { p, l1, l2, .. } => [p, l1, l2, usize::MAX],
@@ -826,7 +942,7 @@ impl Solver {
                     | Eq::Perpendicular { a1, a2, b1, b2 }
                     | Eq::MidSpan { a1, a2, b1, b2, .. } => [a1, a2, b1, b2],
                     Eq::ArcRadius { s, e, c, .. }
-                    | Eq::ArcBend { s, e, c } => [s, e, c, usize::MAX],
+                    | Eq::ArcBend { s, e, c, .. } => [s, e, c, usize::MAX],
                     Eq::EqualRadius { o, a, b } => [o, a, b, usize::MAX],
                     Eq::Tangent { l1, l2, o, p } => [l1, l2, o, p],
                     Eq::LineBezierTangent { l1, l2, h, p } => [l1, l2, h, p],
@@ -943,6 +1059,7 @@ impl Solver {
             Eq::Horizontal { a, b }
             | Eq::Vertical { a, b }
             | Eq::Distance { a, b, .. }
+            | Eq::DistanceBranch { a, b, .. }
             | Eq::DistanceX { a, b, .. }
             | Eq::DistanceY { a, b, .. } => [a, b, usize::MAX, usize::MAX],
             Eq::PointLineDist { p, l1, l2, .. } => [p, l1, l2, usize::MAX],
@@ -950,7 +1067,7 @@ impl Solver {
             Eq::Angle { a1, a2, b1, b2, .. } => [a1, a2, b1, b2],
             Eq::ArcRadius { s, e, c, .. } => [s, e, c, usize::MAX],
             Eq::EqualRadius { o, a, b } => [o, a, b, usize::MAX],
-            Eq::ArcBend { s, e, c } => [s, e, c, usize::MAX],
+            Eq::ArcBend { s, e, c, .. } => [s, e, c, usize::MAX],
             Eq::Tangent { l1, l2, o, p } => [l1, l2, o, p],
             Eq::LineBezierTangent { l1, l2, h, p } => [l1, l2, h, p],
             Eq::BezierLength { p0, c1, c2, p1, .. } => [p0, c1, c2, p1],
@@ -1011,6 +1128,26 @@ impl Solver {
                         grad.push((v * 2 + 1, uy));
                     }
                     out.push(Residual { value: len - target, grad, weight: DIM_WEIGHT });
+                }
+                Eq::DistanceBranch { a, b, ux, uy, min_dot } => {
+                    let (pa, pb) = (self.pos(a, x), self.pos(b, x));
+                    let dot = (pb.x - pa.x) * ux + (pb.y - pa.y) * uy;
+                    let mut grad = Vec::new();
+                    if dot < min_dot {
+                        if let Some(v) = self.free_of[a] {
+                            grad.push((v * 2, ux));
+                            grad.push((v * 2 + 1, uy));
+                        }
+                        if let Some(v) = self.free_of[b] {
+                            grad.push((v * 2, -ux));
+                            grad.push((v * 2 + 1, -uy));
+                        }
+                    }
+                    out.push(Residual {
+                        value: (min_dot - dot).max(0.),
+                        grad,
+                        weight: EQ_WEIGHT,
+                    });
                 }
                 Eq::DistanceX { a, b, target } => {
                     let (pa, pb) = (self.pos(a, x), self.pos(b, x));
@@ -1207,7 +1344,7 @@ impl Solver {
                     }
                     out.push(Residual { value: da - db, grad, weight: EQ_WEIGHT });
                 }
-                Eq::ArcBend { s, e, c } => {
+                Eq::ArcBend { s, e, c, side } => {
                     // Minimum-bend barrier in doc units: keeps the bend
                     // height off the chord above a small floor. Zero when
                     // satisfied; pushing back toward the current side when
@@ -1221,11 +1358,13 @@ impl Solver {
                     let chord = (ux * ux + uy * uy).sqrt().max(1e-9);
                     let h = (ux * vy - uy * vx) / chord;
                     let min_h = (0.025 * chord).clamp(1.0, 8.0);
-                    let h_abs = h.abs();
+                    let oriented_h = side * h;
                     let mut grad = Vec::new();
-                    if h_abs < min_h {
-                        // d(h_abs) = sign(h) * dh; residual = min_h - h_abs.
-                        let sgn = if h >= 0. { 1.0 } else { -1.0 };
+                    if oriented_h < min_h {
+                        // Preserve the side captured at drag start. An
+                        // absolute-height barrier is satisfied on both sides
+                        // and lets the solver cross through a flat arc.
+                        let sgn = side;
                         if let Some(v) = self.free_of[s] {
                             grad.push((v * 2, -sgn * (-vy + uy) / chord));
                             grad.push((v * 2 + 1, -sgn * (-ux + vx) / chord));
@@ -1240,7 +1379,7 @@ impl Solver {
                         }
                     }
                     out.push(Residual {
-                        value: (min_h - h_abs).max(0.),
+                        value: (min_h - oriented_h).max(0.),
                         grad,
                         weight: EQ_WEIGHT,
                     });
@@ -1702,6 +1841,11 @@ impl Solver {
                     let dy = pb.y - pa.y;
                     ((dx * dx + dy * dy).sqrt() - target).abs()
                 }
+                Eq::DistanceBranch { a, b, ux, uy, min_dot } => {
+                    let (pa, pb) = (self.pos(a, x), self.pos(b, x));
+                    let dot = (pb.x - pa.x) * ux + (pb.y - pa.y) * uy;
+                    (min_dot - dot).max(0.)
+                }
                 Eq::DistanceX { a, b, target } => (self.pos(b, x).x - self.pos(a, x).x - target).abs(),
                 Eq::DistanceY { a, b, target } => (self.pos(b, x).y - self.pos(a, x).y - target).abs(),
                 Eq::PointLineDist { p, l1, l2, target } => {
@@ -1743,14 +1887,14 @@ impl Solver {
                     lin = lin.max((da - db).abs());
                     continue;
                 }
-                Eq::ArcBend { s, e, c } => {
+                Eq::ArcBend { s, e, c, side } => {
                     let (ps, pe, pc) = (self.pos(s, x), self.pos(e, x), self.pos(c, x));
                     let ux = pe.x - ps.x;
                     let uy = pe.y - ps.y;
                     let chord = (ux * ux + uy * uy).sqrt().max(1e-9);
                     let h = (ux * (pc.y - ps.y) - uy * (pc.x - ps.x)) / chord;
                     let min_h = (0.025 * chord).clamp(1.0, 8.0);
-                    lin = lin.max((min_h - h.abs()).max(0.));
+                    lin = lin.max((min_h - side * h).max(0.));
                     continue;
                 }
                 Eq::Tangent { l1, l2, o, p } => {

@@ -216,9 +216,11 @@ pub fn update(ed: &mut Editor) {
                 continue;
             };
             if let Some((center, r)) = crate::editor::arc::circumcircle(a, b, c) {
-                // Radius dim from true center to the on-arc point.
+                // Radius dim from the true center to an arc endpoint. The
+                // legacy on-arc control point is only an internal sweep
+                // branch marker; it is not part of the user-facing radius.
                 ed.dim_renders.push(linear_dim(
-                    &ed.doc, &ed.camera, center, c, 0., r,
+                    &ed.doc, &ed.camera, center, a, 0., r,
                 ));
             }
         }
@@ -694,11 +696,11 @@ fn push_dim_target(
             if r < 1e-9 {
                 return;
             }
-            // Dashed line from the center to the on-arc bend point; the
-            // value container rides it at the placed fraction.
+            // Dashed line from the center to an endpoint on the arc; the
+            // legacy control point only determines the sweep branch.
             let frac = slide.clamp(0.25, 1.0);
             let sc = ed.camera.unit_to_screen(center);
-            let ec = ed.camera.unit_to_screen(c);
+            let ec = ed.camera.unit_to_screen(a);
             let lp = Point2::new(
                 sc.x + (ec.x - sc.x) * frac as f64,
                 sc.y + (ec.y - sc.y) * frac as f64,
@@ -1047,7 +1049,18 @@ fn update_constraint_markers(ed: &mut Editor) {
         .unwrap_or((Vec::new(), Vec::new()));
 
     let constraints = ed.doc.constraints.clone();
+    let mut tangent_pairs = std::collections::HashSet::new();
     for c in constraints {
+        if c.kind == crate::core::constraints::ConstraintKind::Tangent
+            && let Some((first, second)) = c.tangent_segments
+        {
+            let left = (first.idx, first.generation);
+            let right = (second.idx, second.generation);
+            let key = if left <= right { (left, right) } else { (right, left) };
+            if !tangent_pairs.insert(key) {
+                continue;
+            }
+        }
         let (Some(a), Some(b)) = (ed.doc.point(c.a), ed.doc.point(c.b)) else {
             continue;
         };
@@ -1122,10 +1135,26 @@ fn update_constraint_markers(ed: &mut Editor) {
         let in_prim = |p: PointId| prim.contains(&p);
         let in_foll = |p: PointId| foll.contains(&p);
         let (pa, pb) = (in_prim(c.a), in_prim(c.b));
-        let active = match ((pa as u8) + (pb as u8)) {
-            1 => true,
-            0 => in_foll(c.a) != in_foll(c.b),
-            _ => false,
+        let active = if c.kind == crate::core::constraints::ConstraintKind::Tangent {
+            // Tangency is stored at the contact point, but a connected arc
+            // drag may grab the arc's own endpoint id instead of the line's
+            // duplicate/contact id. Treat every defining point of either
+            // tangent segment as part of the active relation.
+            c.tangent_segments.is_some_and(|(first, second)| {
+                [first, second].into_iter().any(|sid| {
+                    let Some(s) = ed.doc.segment(sid) else { return false };
+                    [Some(s.start), Some(s.end), s.ctrl, s.center]
+                        .into_iter()
+                        .flatten()
+                        .any(|pid| in_prim(pid) || in_foll(pid))
+                })
+            })
+        } else {
+            match ((pa as u8) + (pb as u8)) {
+                1 => true,
+                0 => in_foll(c.a) != in_foll(c.b),
+                _ => false,
+            }
         };
         let clicked = ed.selected_constraints.contains(&c);
 

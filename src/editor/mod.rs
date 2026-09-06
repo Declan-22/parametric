@@ -48,8 +48,8 @@ pub(crate) struct DragState {
     pub points: Vec<(PointId, Point2)>,
     pub aux: Vec<(PointId, Point2)>,
     pub start_cursor: Point2,
-    // Arc body grab: the whole arc scales about its fixed center (see
-    // plan_arc_drag). None for every other gesture (solver path).
+    // Arc body grab: the whole arc translates rigidly (see plan_arc_drag).
+    // None for every other gesture (solver path).
     pub arc_body_scale: Option<SegmentId>,
 }
 
@@ -891,7 +891,7 @@ impl Editor {
                     lines.push(sid);
                 }
             } else if s.is_curve() {
-                if !curves.contains(&sid) && curves.is_empty() {
+                if !curves.contains(&sid) && curves.len() < 2 {
                     curves.push(sid);
                 }
             }
@@ -906,14 +906,16 @@ impl Editor {
                 push_seg(oid);
             }
         }
-        let line = *lines.first()?;
-        let (other, collinear) = if let Some(&c) = curves.first() {
-            if c == line {
+        let (line, other, collinear) = if let Some(&line) = lines.first() {
+            if let Some(&c) = curves.first() {
+                (line, c, false)
+            } else if lines.len() >= 2 && lines[1] != line {
+                (line, lines[1], true)
+            } else {
                 return None;
             }
-            (c, false)
-        } else if lines.len() >= 2 && lines[1] != line {
-            (lines[1], true)
+        } else if curves.len() >= 2 {
+            (curves[0], curves[1], false)
         } else {
             return None;
         };
@@ -956,6 +958,8 @@ impl Editor {
                 (Some(a), Some(b)) => parallel_dirs(a, b),
                 _ => true,
             }
+        } else if oseg.kind == SK::Bezier || doc.segment(line).is_some_and(|s| s.kind == SK::Bezier) {
+            true
         } else {
             let Some(d) = Self::locked_dir(doc, line) else {
                 return true;
@@ -1649,8 +1653,8 @@ impl Editor {
         }
         if shift {
             self.maybe_add_tangent(seg, b);
+            self.auto_tangent_for_pen(seg);
         }
-        self.auto_tangent_for_pen(seg);
         self.selection = vec![ElementRef::Segment(seg)];
         let chained = self.pen_anchor.unwrap_or(b);
         self.pending_pen = Some(PendingPen {
@@ -1669,7 +1673,9 @@ impl Editor {
             if let Some(line) = pending.line {
                 let (_, mut b) = line.snapped(shift);
                 if shift {
-                    if let Some(q) = self.tangent_snap_for_line(line.start, line.cursor) {
+                    if let Some(q) = self.tangent_snap_for_line(line.start, line.cursor)
+                        .or_else(|| self.bezier_tangent_snap(line.start, line.cursor))
+                    {
                         b = q;
                     }
                 }
@@ -1824,6 +1830,7 @@ impl Editor {
                 h1,
                 h2: None,
                 cursor: at,
+                active_handle: None,
             }),
             circle: None,
         });
@@ -1863,6 +1870,7 @@ impl Editor {
                     h1: None,
                     h2: None,
                     cursor: pb.cursor,
+                    active_handle: None,
                 }),
                 circle: None,
             });
@@ -1904,6 +1912,7 @@ impl Editor {
                 h1: next_h1,
                 h2: None,
                 cursor: chained,
+                active_handle: None,
             }),
             circle: None,
         });
@@ -1929,7 +1938,9 @@ impl Editor {
                 };
                 let (_, mut b) = line.snapped(shift);
                 if shift {
-                    if let Some(q) = self.tangent_snap_for_line(line.start, line.cursor) {
+                    if let Some(q) = self.tangent_snap_for_line(line.start, line.cursor)
+                        .or_else(|| self.bezier_tangent_snap(line.start, line.cursor))
+                    {
                         b = q;
                     }
                 }
@@ -2009,12 +2020,20 @@ impl Editor {
             }
             // Coincident joint (distinct ids from chaining).
             let pj = self.doc.segment(prev).map(|s| s.end);
-            if let Some(pj) = pj
+            let contact = if let Some(pj) = pj
                 && pj != cur.start
+                && self.doc.point(pj).zip(self.doc.point(cur.start))
+                    .is_some_and(|(a, b)| pick::distance(a, b) <= tol)
             {
-                self.doc.add_constraint(ConstraintKind::Coincident, pj, cur.start);
-            }
-            self.doc.add_tangent_constraint(prev, fresh, cur.start);
+                // Chained geometry shares a topological vertex. Merge the
+                // ids instead of layering a solver Coincident constraint on
+                // top of an already-connected joint.
+                self.doc.merge_point(pj, cur.start);
+                pj
+            } else {
+                cur.start
+            };
+            self.doc.add_tangent_constraint(prev, fresh, contact);
             let _ = self.solve_constraint_now(&[ElementRef::Segment(prev), ElementRef::Segment(fresh)]);
             let _ = cp1;
         }
@@ -2100,12 +2119,13 @@ impl Editor {
                 // constraint layer — 45° lock, arc-tangent lock and the
                 // perpendicular snap. Never yank the preview otherwise.
                 let (tangent_at, perpendicular) = if shift {
-                    let tan = self.tangent_snap_for_line(line.start, at);
+                    let tan = self.tangent_snap_for_line(line.start, at)
+                        .or_else(|| self.bezier_tangent_snap(line.start, at));
                     let perp =
                         self.perpendicular_snap_for_line(line.start, tan.unwrap_or(at));
                     (tan, perp)
                 } else {
-                    (self.bezier_tangent_snap(line.start, at), None)
+                    (None, None)
                 };
                 let final_at =
                     perpendicular.map(|(p, _)| p).unwrap_or(tangent_at.unwrap_or(at));
@@ -2133,15 +2153,18 @@ impl Editor {
                 let Some(mut pb) = pending.bezier else {
                     return true;
                 };
-                // After the endpoint press, the drag shapes the handle
-                // NEAREST the cursor (h1 at the p0 side, h2 at the p1
-                // side) — the handle under the cursor follows it.
+                // Once grabbed, stay on the chosen handle throughout the drag gesture.
+                // Do not switch handles mid-drag even if cursor moves closer to the other point.
                 if pb.p1.is_some() {
-                    let (d0, d1) = (
-                        pick::distance(at, pb.p0),
-                        pb.p1.map(|p| pick::distance(at, p)).unwrap_or(f64::MAX),
-                    );
-                    if d1 <= d0 {
+                    let handle = pb.active_handle.unwrap_or_else(|| {
+                        let (d0, d1) = (
+                            pick::distance(at, pb.p0),
+                            pb.p1.map(|p| pick::distance(at, p)).unwrap_or(f64::MAX),
+                        );
+                        if d1 <= d0 { 2 } else { 1 }
+                    });
+                    pb.active_handle = Some(handle);
+                    if handle == 2 {
                         pb.h2 = Some(at);
                     } else {
                         pb.h1 = Some(at);
@@ -2337,8 +2360,13 @@ impl Editor {
                 //    edge of a selected rectangle reshapes it instead of
                 //    translating. (Translate via the fill's interior.)
                 //  - FILL -> selection-wide translation.
+                // A literal point hit is always a point-resize gesture. In
+                // particular, a tangent relation often leaves both spans
+                // selected; treating the far line endpoint as a group drag
+                // accidentally drags the arc contact and makes the arc spin.
+                // Move a selected group through its body/edge instead.
                 let solo_point = match el {
-                    ElementRef::Point(pid) if self.selection.len() == 1 => Some(pid),
+                    ElementRef::Point(pid) => Some(pid),
                     _ => None,
                 };
                 let ring_of = |pids: &[PointId]| -> Vec<(PointId, Point2)> {
@@ -2471,38 +2499,50 @@ impl Editor {
                         (drag, aux)
                     } else {
                     let cluster = coincident_cluster(pid);
-                    if cluster.len() > 1 {
-                        // Explicit coincident points are separate entities in
-                        // the model, but a coincident stack is one temporary
-                        // drag handle. Drag every member as a primary target
-                        // so the stack cannot stretch apart while moving.
-                        let drag = cluster
-                            .iter()
-                            .filter_map(|&p| self.doc.point(p).map(|pos| (p, pos)))
-                            .collect();
-                        let aux = ring_of(&cluster);
-                        (drag, aux)
-                    } else {
-                        let start = self.doc.point(pid).unwrap();
-                        let aux = ring_of(&[pid]);
-                        (vec![(pid, start)], aux)
+                    let mut ids = cluster.clone();
+                    // If pid is a bezier endpoint, its attached near control handle moves with it
+                    // so the handle vector does not invert or collapse.
+                    for (_, s) in self.doc.all_segments() {
+                        if s.kind == crate::core::document::SegmentKind::Bezier {
+                            if cluster.contains(&s.start) {
+                                if let Some(h) = s.ctrl && !ids.contains(&h) {
+                                    ids.push(h);
+                                }
+                            }
+                            if cluster.contains(&s.end) {
+                                if let Some(h) = s.center && !ids.contains(&h) {
+                                    ids.push(h);
+                                }
+                            }
+                        }
                     }
+                    let drag = ids
+                        .iter()
+                        .filter_map(|&p| self.doc.point(p).map(|pos| (p, pos)))
+                        .collect();
+                    let aux = ring_of(&ids);
+                    (drag, aux)
                     }
                 } else if let (ElementRef::Segment(sid), false) =
                     (&el, self.selection.len() > 1 && self.element_selected(el))
                 {
-                    // SOLO segment -> edge-stretch. With a MULTI-selection,
-                    // dragging any selected member moves the whole group
-                    // instead (see the fallback arm below).
-                    // No aux followers here: the H/V constraints alone
-                    // collapse an edge drag to a PERPENDICULAR stretch
-                    // (tangential pulls are projected out), so grabbing an
-                    // edge never translates the shape.
-                    // ARCS are the exception: dragging the arc body scales
-                    // the arc about its fixed center (see plan_arc_drag);
-                    // its endpoints are the sweep handles.
+                    // SOLO segment -> edge-stretch / translation.
                     let seg = self.doc.segment(*sid);
                     if seg.is_some_and(|s| s.kind == crate::core::document::SegmentKind::Arc) {
+                        let s = seg.unwrap();
+                        let mut ids = vec![s.start, s.end];
+                        if let Some(c) = s.ctrl {
+                            ids.push(c);
+                        }
+                        if let Some(c) = s.center {
+                            ids.push(c);
+                        }
+                        let drag = ids
+                            .iter()
+                            .filter_map(|&p| self.doc.point(p).map(|pos| (p, pos)))
+                            .collect();
+                        (drag, Vec::new())
+                    } else if seg.is_some_and(|s| s.kind == crate::core::document::SegmentKind::Bezier) {
                         let s = seg.unwrap();
                         let mut ids = vec![s.start, s.end];
                         if let Some(c) = s.ctrl {
@@ -2686,7 +2726,7 @@ impl Editor {
         }
 
         changed |= self.solve_drag(shift);
-        changed |= self.post_handle_drag();
+        changed |= self.post_handle_drag(shift);
         changed
     }
 
@@ -2696,8 +2736,11 @@ impl Editor {
     /// dragged direction onto a neighboring span's tangent rail when
     /// close (~10°). Alt-held drags stay fully free. Multi-drags never
     /// touch handles symmetrically (they translate).
-    fn post_handle_drag(&mut self) -> bool {
-        if self.alt_down {
+    fn post_handle_drag(&mut self, shift: bool) -> bool {
+        // Tangent-rail snapping is an explicit modifier action.  Applying it
+        // unconditionally made a free handle silently acquire a neighboring
+        // span's direction as the cursor passed nearby.
+        if self.alt_down || !shift {
             return false;
         }
         let Some(drag) = self.dragging.as_ref() else {
@@ -3037,24 +3080,94 @@ impl Editor {
             }
         }
 
+        // A line-edge drag can include the shared tangent point in its drag
+        // set. That point belongs to the arc too, but the gesture intent is
+        // still “move the line”, not “reshape the arc”. Pin the complete arc
+        // in this case; the tangent solver then rotates only the line around
+        // the fixed contact and preserves its length.
+        let mut tangent_arc_pins: Vec<(PointId, Point2)> = Vec::new();
+        if drag.arc_body_scale.is_none() {
+            for constraint in &self.doc.constraints {
+                if constraint.kind != ConstraintKind::Tangent {
+                    continue;
+                }
+                let Some((first_id, second_id)) = constraint.tangent_segments else { continue };
+                let (Some(first), Some(second)) = (self.doc.segment(first_id), self.doc.segment(second_id)) else { continue };
+                let (line, curve) = match (first.kind, second.kind) {
+                    (crate::core::document::SegmentKind::Line, crate::core::document::SegmentKind::Arc) => (first, second),
+                    (crate::core::document::SegmentKind::Arc, crate::core::document::SegmentKind::Line) => (second, first),
+                    _ => continue,
+                };
+                let Some(ctrl) = curve.ctrl else { continue };
+                let arc_ids = [curve.start, curve.end, ctrl, curve.center.unwrap_or(curve.start)];
+                let line_ids = [line.start, line.end];
+                let arc_dragged = arc_ids[..3].iter().any(|id| dragged.contains(id));
+                let line_dragged = line_ids.iter().any(|id| dragged.contains(id));
+                let far_line_dragged = line_ids.iter().any(|id| dragged.contains(id) && *id != constraint.a);
+                if !arc_dragged || !line_dragged || !far_line_dragged {
+                    continue;
+                }
+                for pid in arc_ids {
+                    if let Some(pos) = self.doc.point(pid)
+                        && !tangent_arc_pins.iter().any(|(id, _)| *id == pid)
+                    {
+                        tangent_arc_pins.push((pid, pos));
+                    }
+                }
+            }
+        }
+
         // Kinematic arc drags bypass the least-squares hunt entirely:
         // endpoints slide on the circle, the bend refits it, the body
         // scales about the center. Everything else takes the solver path.
-        let solver = match self.plan_arc_drag(drag, &targets) {
+        let arc_plan = if tangent_arc_pins.is_empty() {
+            self.plan_arc_drag(drag, &targets)
+        } else {
+            // The line owns this gesture; do not let arc endpoint kinematics
+            // reinterpret it as an arc reshape.
+            None
+        };
+        let solver = match arc_plan {
             Some(kin) => {
                 if let Some((pid, pos)) = kin.premove {
                     self.doc.move_point(pid, pos);
                 }
+                // Kinematic arc positions are authoritative. Feed only the
+                // non-arc drag targets into the solver; otherwise LM gets a
+                // second chance to reinterpret a rigid arc move as a branch
+                // change. Tangent followers remain free through aux_all and
+                // are solved against the now-fixed arc.
+                let kin_ids: std::collections::HashSet<PointId> =
+                    kin.targets.iter().map(|&(id, _)| id).collect();
+                for &(pid, pos) in &kin.targets {
+                    self.doc.move_point(pid, pos);
+                }
+                let external: Vec<(PointId, Point2)> = targets
+                    .iter()
+                    .copied()
+                    .filter(|(id, _)| !kin_ids.contains(id))
+                    .collect();
+                let mut pins = kin.pins;
+                pins.extend(kin.targets.iter().copied());
                 // 1.0 = the default live-drag anchor weight.
                 crate::core::solver::Solver::build_pinned(
                     &self.doc,
-                    &kin.targets,
+                    &external,
                     &aux_all,
-                    &kin.pins,
+                    &pins,
                     1.0,
                 )
             }
-            None => crate::core::solver::Solver::build(&self.doc, &targets, &aux_all),
+            None if tangent_arc_pins.is_empty() => {
+                crate::core::solver::Solver::build(&self.doc, &targets, &aux_all)
+            }
+            None => crate::core::solver::Solver::build_pinned(
+                &self.doc,
+                &targets,
+                &aux_all,
+                &tangent_arc_pins,
+                1.0,
+            ),
         };
         let solution = solver.solve();
         // A live drag may request an impossible step, but applying a partial
@@ -3069,6 +3182,8 @@ impl Editor {
             moved.insert(id);
             self.doc.move_point(id, pos);
         }
+        self.enforce_arc_coincident_joints(&dragged);
+        self.enforce_tangencies();
         // Arc consistency is enforced by solver equations; no post-solve
         // mutation is allowed to overwrite other constraints.
         // Re-anchor the connection guides at the locked point's FINAL
@@ -3097,6 +3212,44 @@ impl Editor {
                 .collect();
         }
         true
+    }
+
+    /// Coincident arc joints are topological attachments, not merely a
+    /// numerical preference. Kinematic arc drags pin the arc points, so a
+    /// separate line endpoint must be copied onto the moved arc point after
+    /// the follower solve or it can visibly detach for a frame.
+    fn enforce_arc_coincident_joints(&mut self, dragged: &[PointId]) {
+        let dragged: std::collections::HashSet<PointId> = dragged.iter().copied().collect();
+        let touched_arcs: Vec<[PointId; 3]> = self
+            .doc
+            .all_segments()
+            .filter(|(_, s)| s.kind == crate::core::document::SegmentKind::Arc)
+            .filter_map(|(_, s)| {
+                let ctrl = s.ctrl?;
+                let defs = [s.start, s.end, ctrl];
+                defs.iter().any(|id| dragged.contains(id)).then_some(defs)
+            })
+            .collect();
+        if touched_arcs.is_empty() {
+            return;
+        }
+        for c in self.doc.constraints.clone() {
+            if c.kind != ConstraintKind::Coincident || c.point_on_segment.is_some() {
+                continue;
+            }
+            let arc_point = if touched_arcs.iter().any(|defs| defs.contains(&c.a)) {
+                c.a
+            } else if touched_arcs.iter().any(|defs| defs.contains(&c.b)) {
+                c.b
+            } else {
+                continue;
+            };
+            let other = if arc_point == c.a { c.b } else { c.a };
+            let Some(pos) = self.doc.point(arc_point) else { continue };
+            if self.doc.point(other).is_some() {
+                self.doc.move_point(other, pos);
+            }
+        }
     }
 
     /// True when a document segment directly connects `pid` to a point at
@@ -3128,8 +3281,7 @@ impl Editor {
     ///    endpoint and the bend so the sweep can never invert;
     ///  - ctrl (on-curve point): moves freely with a bend-height floor and
     ///    the center refit exactly through the pinned endpoints;
-    ///  - body (DragState::arc_body_scale): uniform scale about the frozen
-    ///    center;
+    ///  - body (DragState::arc_body_scale): rigid translation of the arc;
     ///  - center: rigid translate, already exact — legacy solver path.
     /// Pins are hard-fixed for the follow-up solve so tangent lines rotate
     /// around the frozen arc instead of throwing it around. None = legacy
@@ -3142,17 +3294,8 @@ impl Editor {
             d = (d + PI).rem_euclid(TAU);
             d - PI
         };
-        let circ_dist = |x: f64, y: f64| wrap(x - y).abs();
 
         let drag_ids: Vec<PointId> = drag.points.iter().map(|&(id, _)| id).collect();
-        // Any center dragged -> rigid translate, already exact. Legacy path.
-        for (_, s) in self.doc.all_segments() {
-            if s.kind == SegmentKind::Arc
-                && s.center.is_some_and(|c| drag_ids.contains(&c))
-            {
-                return None;
-            }
-        }
         // Exactly one arc touched, else legacy (e.g. shared vertices).
         let mut arc_sid = None;
         for (sid, s) in self.doc.all_segments() {
@@ -3231,9 +3374,6 @@ impl Editor {
             }
         }
 
-        let start_of = |pid: PointId| -> Option<Point2> {
-            drag.points.iter().find(|(id, _)| *id == pid).map(|&(_, s)| s)
-        };
         let target_of = |pid: PointId| -> Option<Point2> {
             targets.iter().find(|(id, _)| *id == pid).map(|&(_, t)| t)
         };
@@ -3247,31 +3387,22 @@ impl Editor {
         // Body: uniform scale about the frozen (healed) center. A locked
         // radius can't scale — legacy translate preserves it exactly.
         if drag.arc_body_scale == Some(sid) {
-            if radius_locked || !partners.is_empty() {
-                return None;
-            }
             let Some(ct) = target_of(ctrl) else {
                 return None;
             };
-            let f = (pick::distance(ct, cc) / r).clamp(0.2, 5.0);
-            let mut out = Vec::with_capacity(targets.len());
-            for &(pid, _) in targets {
-                let Some(s) = start_of(pid) else {
-                    return None;
-                };
-                out.push(if pid == center_id {
-                    (pid, cc)
-                } else {
-                    (
-                        pid,
-                        Point2::new(cc.x + (s.x - cc.x) * f, cc.y + (s.y - cc.y) * f),
-                    )
-                });
+            // An edge grab is a move gesture, not a radius-edit gesture.
+            // The old implementation scaled around the center, which made a
+            // tangent-connected arc resize/spin while the cursor was merely
+            // translating across its edge.
+            let delta = Point2::new(ct.x - c.x, ct.y - c.y);
+            let mut out = Vec::with_capacity(4);
+            for (pid, s) in [(seg.start, a), (seg.end, b), (ctrl, c), (center_id, cc)] {
+                out.push((pid, Point2::new(s.x + delta.x, s.y + delta.y)));
             }
             return Some(ArcKin {
                 targets: out,
                 pins: Vec::new(),
-                premove: Some((center_id, cc)),
+                premove: None,
             });
         }
 
@@ -3279,14 +3410,32 @@ impl Editor {
         let start_d = in_drag(seg.start);
         let end_d = in_drag(seg.end);
 
-        // Endpoint: slide along the existing circle, clamped away from the
-        // other endpoint and the bend so the sweep can never invert.
+        // Dragging the center is a rigid translation. It must never enter the
+        // general arc solve: the solver can satisfy tangent/radius equations
+        // by changing the sweep branch even though every arc point is being
+        // asked to move by the same delta.
+        if in_drag(center_id) {
+            let Some(t0) = target_of(center_id) else { return None };
+            let delta = Point2::new(t0.x - cc.x, t0.y - cc.y);
+            return Some(ArcKin {
+                targets: vec![
+                    (seg.start, Point2::new(a.x + delta.x, a.y + delta.y)),
+                    (seg.end, Point2::new(b.x + delta.x, b.y + delta.y)),
+                    (ctrl, Point2::new(c.x + delta.x, c.y + delta.y)),
+                    (center_id, t0),
+                ],
+                pins: Vec::new(),
+                premove: None,
+            });
+        }
+
+        // Endpoint: slide along the existing circle. Do not reserve a hidden
+        // exclusion zone around the other endpoint or construction marker:
+        // arcs are allowed to become very small, nearly closed spans.
+        // If external segment endpoints (like a line or bezier) are being dragged,
+        // bypass kinematic arc drag so the solver solves the multi-point drag.
         if (start_d ^ end_d) && !ctrl_d {
-            let (e_pid, f_cur) = if start_d {
-                (seg.start, b)
-            } else {
-                (seg.end, a)
-            };
+            let e_pid = if start_d { seg.start } else { seg.end };
             let Some(t0) = target_of(e_pid) else {
                 return None;
             };
@@ -3294,19 +3443,59 @@ impl Editor {
             let e_cur = if start_d { a } else { b };
             let th_prev = ang(e_cur);
             let dth = wrap(ang(t0) - th_prev).clamp(-0.2, 0.2);
-            let mut th = th_prev + dth;
-            const MARGIN: f64 = 0.14;
-            if circ_dist(th, ang(f_cur)) < MARGIN || circ_dist(th, ang(c)) < MARGIN {
-                // Forbidden zone straddling the other endpoint or the bend:
-                // hold last frame instead of crossing (crossing inverts).
-                th = th_prev;
-            }
+            let th = th_prev + dth;
+
+            // Preserve the current signed sweep. Recomputing the sweep from
+            // the hidden construction point each frame lets an endpoint
+            // crossing the atan2 seam turn a small arc into its 360-degree
+            // complement. Move that internal marker to the midpoint of the
+            // same directed sweep instead.
+            let a0 = ang(a);
+            let b0 = ang(b);
+            let c0 = ang(c);
+            let forward = (b0 - a0).rem_euclid(std::f64::consts::TAU);
+            let c_forward = (c0 - a0).rem_euclid(std::f64::consts::TAU);
+            let current_sweep = if c_forward <= forward {
+                forward
+            } else {
+                forward - std::f64::consts::TAU
+            };
+            let positive_sweep = current_sweep >= 0.0;
+            let (new_start, new_end) = if start_d {
+                (th, b0)
+            } else {
+                (a0, th)
+            };
+            let sweep = if positive_sweep {
+                wrap(new_end - new_start).rem_euclid(std::f64::consts::TAU)
+            } else {
+                -wrap(new_start - new_end).rem_euclid(std::f64::consts::TAU)
+            };
+            let sweep = if sweep.abs() < 1e-6 {
+                if positive_sweep { 1e-6 } else { -1e-6 }
+            } else {
+                sweep
+            };
+            let ctrl_angle = new_start + sweep * 0.5;
+            let ctrl_target = Point2::new(
+                cc.x + r * ctrl_angle.cos(),
+                cc.y + r * ctrl_angle.sin(),
+            );
             let t = Point2::new(cc.x + r * th.cos(), cc.y + r * th.sin());
-            let pins = vec![(seg.start, a), (seg.end, b), (ctrl, c), (center_id, cc)];
+            let pins = vec![(seg.start, a), (seg.end, b), (center_id, cc)];
             let pins = pins.into_iter().filter(|(id, _)| *id != e_pid).collect();
             let mut out = Vec::with_capacity(targets.len());
             for &(pid, _) in targets {
-                out.push((pid, t));
+                if [seg.start, seg.end, ctrl, center_id].contains(&pid) {
+                    let original = if pid == seg.start { a }
+                        else if pid == seg.end { b }
+                        else if pid == ctrl { ctrl_target }
+                        else { cc };
+                    out.push((pid, if pid == e_pid { t } else { original }));
+                }
+            }
+            if !out.iter().any(|(pid, _)| *pid == ctrl) {
+                out.push((ctrl, ctrl_target));
             }
             return Some(ArcKin {
                 targets: out,
@@ -3319,7 +3508,7 @@ impl Editor {
         // refit exactly through the pinned endpoints. A locked radius can't
         // refit — legacy path (which preserves it).
         if ctrl_d && !start_d && !end_d {
-            if radius_locked {
+            if radius_locked || !partners.is_empty() {
                 return None;
             }
             let Some(t0) = target_of(ctrl) else {
@@ -3660,7 +3849,7 @@ impl Editor {
                 matches!(element, ElementRef::Segment(sid) if self.doc.segment(sid).is_some_and(|s| s.kind == crate::core::document::SegmentKind::Line))
             }
             Tool::ConstraintTangent => {
-                matches!(element, ElementRef::Segment(sid) if self.doc.segment(sid).is_some_and(|s| matches!(s.kind, crate::core::document::SegmentKind::Line | crate::core::document::SegmentKind::Arc)))
+                matches!(element, ElementRef::Segment(sid) if self.doc.segment(sid).is_some_and(|s| matches!(s.kind, crate::core::document::SegmentKind::Line | crate::core::document::SegmentKind::Arc | crate::core::document::SegmentKind::Bezier)))
             }
             Tool::ConstraintCoincident => matches!(element, ElementRef::Point(_) | ElementRef::Segment(_)),
             Tool::ConstraintParallel => matches!(element, ElementRef::Segment(sid) if self.doc.segment(sid).is_some_and(|s| s.kind == crate::core::document::SegmentKind::Line)),
@@ -3681,7 +3870,7 @@ impl Editor {
                 .filter(|(_, s)| {
                     let allowed = match self.tool {
                         Tool::ConstraintHorizontalVertical => s.kind == crate::core::document::SegmentKind::Line,
-                        Tool::ConstraintTangent => matches!(s.kind, crate::core::document::SegmentKind::Line | crate::core::document::SegmentKind::Arc),
+                        Tool::ConstraintTangent => matches!(s.kind, crate::core::document::SegmentKind::Line | crate::core::document::SegmentKind::Arc | crate::core::document::SegmentKind::Bezier),
                         Tool::ConstraintPerpendicular => s.kind == crate::core::document::SegmentKind::Line,
                         _ => false,
                     };
@@ -3808,8 +3997,9 @@ impl Editor {
         if let Some(start) = anchor {
             let tan = if self.shift {
                 self.tangent_snap_for_line(start, pos)
+                    .or_else(|| self.bezier_tangent_snap(start, pos))
             } else {
-                self.bezier_tangent_snap(start, pos)
+                None
             };
             if let Some(at) = tan {
                 self.snap_guides.clear();
@@ -4213,8 +4403,9 @@ impl Editor {
                 let Some((center, r)) = crate::editor::arc::circumcircle(a, b, c) else {
                     return None;
                 };
-                // Container rides the center->bend line at the cursor's
-                // radial fraction.
+                // Container rides a center->arc ray at the cursor's radial
+                // fraction. The legacy bend point is only needed to recover
+                // the arc's sweep branch.
                 let frac = if r > 1e-9 {
                     (pick::distance(cursor, center) / r).clamp(0.25, 1.0)
                 } else {
@@ -4530,6 +4721,10 @@ impl Editor {
         // the center back to the exact circumcenter.
         if let crate::core::constraints::DimTarget::Radius { seg } = target {
             self.enforce_arc_radius_exact(seg);
+            // The exact radius pass intentionally runs after the numerical
+            // solve. Re-project tangent followers after it so changing an
+            // arc radius cannot leave its connected line off the tangent.
+            self.enforce_tangencies();
         }
         if let crate::core::constraints::DimTarget::CurveLength { seg } = target {
             self.enforce_curve_length_exact(seg);
@@ -4639,11 +4834,24 @@ impl Editor {
                 let line = self.constraint_picks.iter().find_map(|e| e.as_segment()).and_then(|sid| {
                     self.doc.segment(sid).filter(|s| s.kind == crate::core::document::SegmentKind::Line).map(|_| sid)
                 });
-                let arc = self.constraint_picks.iter().find_map(|e| e.as_segment()).and_then(|sid| {
-                    self.doc.segment(sid).filter(|s| s.kind == crate::core::document::SegmentKind::Arc).map(|_| sid)
+                let curve = self.constraint_picks.iter().find_map(|e| e.as_segment()).and_then(|sid| {
+                    self.doc.segment(sid).filter(|s| matches!(s.kind, crate::core::document::SegmentKind::Arc | crate::core::document::SegmentKind::Bezier)).map(|_| sid)
                 });
-                if let (Some(line), Some(arc)) = (line, arc) {
-                    let point = self.tangent_contact_point(line, arc, p);
+                // Curve-to-curve G1 is also a valid tangent relation. The
+                // menu path and solver use the same candidate, so selecting
+                // two Bezier spans no longer silently produces no action.
+                if line.is_none() && self.constraint_picks.len() == 2 {
+                    if let Some((first, second, contact, _)) = Self::tangent_candidate(&self.doc, &self.constraint_picks) {
+                        self.doc.add_tangent_constraint(first, second, contact);
+                        self.solve_constraint_now(&[ElementRef::Segment(first), ElementRef::Segment(second)]);
+                        self.selection = self.constraint_picks.clone();
+                        self.constraint_picks.clear();
+                        self.update_dim_geom();
+                        return true;
+                    }
+                }
+                if let (Some(line), Some(curve)) = (line, curve) {
+                    let point = self.tangent_contact_point(line, curve, p);
                     if let Some((point, contact)) = point {
                         // Put the selected line endpoint exactly on the
                         // selected arc contact, then place the other endpoint
@@ -4656,7 +4864,7 @@ impl Editor {
                             self.doc.segment(line).map(|s| s.end),
                         ) {
                             if let (Some(center), Some(lp), Some(rp)) = (
-                                self.doc.segment(arc).and_then(|s| s.center).and_then(|id| self.doc.point(id)),
+                                self.doc.segment(curve).and_then(|s| s.center).and_then(|id| self.doc.point(id)),
                                 self.doc.point(point), self.doc.point(if point == ls { le } else { ls }),
                             ) {
                                 let radius = Point2::new(contact.x - center.x, contact.y - center.y);
@@ -4678,8 +4886,8 @@ impl Editor {
                         } else {
                             self.doc.move_point(point, contact);
                         }
-                        self.doc.add_tangent_constraint(line, arc, point);
-                        self.solve_constraint_now(&[ElementRef::Segment(line), ElementRef::Segment(arc)]);
+                        self.doc.add_tangent_constraint(line, curve, point);
+                        self.solve_constraint_now(&[ElementRef::Segment(line), ElementRef::Segment(curve)]);
                     }
                     self.selection = self.constraint_picks.clone();
                     self.constraint_picks.clear();
@@ -4778,6 +4986,7 @@ impl Editor {
             for (id, pos) in solution.positions {
                 self.doc.move_point(id, pos);
             }
+            self.enforce_tangencies();
             self.doc_gen += 1;
             true
         } else {
@@ -4817,6 +5026,19 @@ impl Editor {
     fn tangent_contact_point(&self, line: crate::core::ids::SegmentId, arc: crate::core::ids::SegmentId, cursor: Point2) -> Option<(PointId, Point2)> {
         let l = self.doc.segment(line)?;
         let a = self.doc.segment(arc)?;
+        if a.kind == crate::core::document::SegmentKind::Bezier {
+            let curve_ends = [a.start, a.end];
+            let line_point = [l.start, l.end].into_iter().min_by(|x, y| {
+                let dx = |id: PointId| self.doc.point(id).map(|p| pick::distance(p, cursor)).unwrap_or(f64::MAX);
+                dx(*x).partial_cmp(&dx(*y)).unwrap_or(std::cmp::Ordering::Equal)
+            })?;
+            let lp = self.doc.point(line_point)?;
+            let curve_point = curve_ends.into_iter().min_by(|x, y| {
+                let dx = |id: PointId| self.doc.point(id).map(|p| pick::distance(p, lp)).unwrap_or(f64::MAX);
+                dx(*x).partial_cmp(&dx(*y)).unwrap_or(std::cmp::Ordering::Equal)
+            })?;
+            return Some((line_point, self.doc.point(curve_point)?));
+        }
         let (Some(sa), Some(sb), Some(ctrl)) = (
             self.doc.point(a.start), self.doc.point(a.end), a.ctrl.and_then(|id| self.doc.point(id))
         ) else { return None };
@@ -5084,7 +5306,8 @@ impl Editor {
                 }
             }
             DimTarget::Radius { seg } => {
-                // Container slides along the center->bend line.
+                // Container slides along a center->arc ray. The legacy bend
+                // point only recovers the arc's sweep branch.
                 let Some(seg_d) = self.doc.segment(seg) else {
                     return;
                 };
@@ -5333,10 +5556,9 @@ impl Editor {
                 Some(line_seg.end)
             } else { None };
             if let Some(point) = point {
-                self.doc.add_tangent_constraint(line, arc_id, point);
                 // At an arc endpoint the new line has a separate point id;
-                // bond it to the arc endpoint so later radius edits carry
-                // the tangent contact along with the arc.
+                // merge it into the arc endpoint so later radius edits carry
+                // the tangent contact with no duplicate Coincident row.
                 let endpoint = [arc.start, arc.end].into_iter()
                     .min_by(|x, y| {
                         let anchor = self.doc.point(point).unwrap_or(contact);
@@ -5344,12 +5566,14 @@ impl Editor {
                         let py = self.doc.point(*y).unwrap_or(anchor);
                         pick::distance(px, anchor).partial_cmp(&pick::distance(py, anchor)).unwrap_or(std::cmp::Ordering::Equal)
                     });
-                if let Some(endpoint) = endpoint
+                let contact_id = if let Some(endpoint) = endpoint
                     && self.doc.point(point).zip(self.doc.point(endpoint)).is_some_and(|(p, e)| pick::distance(p, e) <= self.snap_tol_doc() * 1.5)
                     && endpoint != point
                 {
-                    self.doc.add_constraint(ConstraintKind::Coincident, point, endpoint);
-                }
+                    self.doc.merge_point(endpoint, point);
+                    endpoint
+                } else { point };
+                self.doc.add_tangent_constraint(line, arc_id, contact_id);
                 return;
             }
         }

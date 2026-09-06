@@ -31,6 +31,14 @@ impl<'a> Picker<'a> {
     pub fn point(&self, at: Point2) -> Option<PointId> {
         let mut best: Option<(f64, PointId)> = None;
         for (id, p) in self.doc.all_points() {
+            // Arc control/center points are construction data, not editable
+            // handles. Completed arcs expose only their two endpoints.
+            let arc_internal = self.doc.all_segments().any(|(_, seg)| {
+                seg.kind == SegmentKind::Arc && (seg.ctrl == Some(id) || seg.center == Some(id))
+            });
+            if arc_internal {
+                continue;
+            }
             let d = distance(p, at);
             if d <= self.tol && best.map_or(true, |(bd, _)| d < bd) {
                 best = Some((d, id));

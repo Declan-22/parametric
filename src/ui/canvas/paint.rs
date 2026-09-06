@@ -408,46 +408,6 @@ pub fn build_draw_list(
         }
     }
 
-    // 1b) Arc CENTER reveal: when the cursor sits inside an arc's full
-    // circle (the disk, not just near the curve), draw its center — the
-    // middle of the whole sweep's circle — so it is discoverable without
-    // pixel-hunting hover. (Not the on-curve third point; the centerpoint.)
-    if let Some(cur) = cursor_doc {
-        for (_sid, seg) in doc.all_segments() {
-            if seg.kind != SegmentKind::Arc {
-                continue;
-            }
-            let Some(sc) = seg.ctrl else { continue };
-            let (Some(sa), Some(sb), Some(scp)) =
-                (doc.point(seg.start), doc.point(seg.end), doc.point(sc))
-            else {
-                continue;
-            };
-            let Some((center, r)) = crate::editor::arc::circumcircle(sa, sb, scp) else {
-                continue;
-            };
-            if r < 1e-9 {
-                continue;
-            }
-            let dx = cur.x - center.x;
-            let dy = cur.y - center.y;
-            if (dx * dx + dy * dy).sqrt() > r {
-                continue;
-            }
-            // Prefer the stored center point; fall back to the computed one.
-            let c = seg.center.and_then(|id| doc.point(id)).unwrap_or(center);
-            if !visible.contains(c) {
-                continue;
-            }
-            let (mx, my) = scr(c);
-            list.push(Primitive::Circle {
-                cx: mx,
-                cy: my,
-                radius: 4.,
-            });
-        }
-    }
-
     // 2) Dimension lines: extension stubs + parallel dashed dim line,
     // any angle. Drawn UNDER points/selection so corner dots always sit
     // on top. Tool-created dimension constraints render in the muted
@@ -621,47 +581,6 @@ pub fn build_draw_list(
             }
         }
     }
-    // Arc center handles — show whenever the arc is selected in any way
-    // (segment itself, or any of its defining points including the center).
-    {
-        let selected_pids: std::collections::HashSet<_> = selection
-            .iter()
-            .flat_map(|el| doc.element_points(*el))
-            .collect();
-        for (sid, seg) in doc.all_segments() {
-            if seg.kind != SegmentKind::Arc {
-                continue;
-            }
-            let is_touched = selection.contains(&ElementRef::Segment(sid))
-                || seg.ctrl.is_some_and(|c| selected_pids.contains(&c))
-                || selected_pids.contains(&seg.start)
-                || selected_pids.contains(&seg.end)
-                || seg.center.is_some_and(|c| selected_pids.contains(&c));
-            if !is_touched {
-                continue;
-            }
-            // Prefer the stored center point (real document point) if present.
-            let center_pos = seg.center.and_then(|id| doc.point(id)).or_else(|| {
-                let (Some(a), Some(b), Some(c)) = (
-                    doc.point(seg.start),
-                    doc.point(seg.end),
-                    seg.ctrl.and_then(|id| doc.point(id)),
-                ) else {
-                    return None;
-                };
-                crate::editor::arc::circumcircle(a, b, c).map(|(o, _)| o)
-            });
-            if let Some(center) = center_pos {
-                let (cx0, cy0) = scr(center);
-                list.push(Primitive::Circle {
-                    cx: cx0,
-                    cy: cy0,
-                    radius: 3.,
-                });
-            }
-        }
-    }
-
     // 6) Marquee band: low-opacity accent fill + 1px accent border.
     if let Some((a, b)) = marquee {
         let band = Rect::from_points(a, b);

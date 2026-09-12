@@ -120,6 +120,13 @@ impl Database {
                 value REAL,
                 offset REAL NOT NULL,
                 slide REAL NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS fillets (
+                id INTEGER PRIMARY KEY,
+                first_idx INTEGER NOT NULL, first_gen INTEGER NOT NULL,
+                second_idx INTEGER NOT NULL, second_gen INTEGER NOT NULL,
+                corner_idx INTEGER NOT NULL, corner_gen INTEGER NOT NULL,
+                radius REAL NOT NULL
             );",
         )?;
         // Appearance columns are additive for the prototype database.
@@ -136,6 +143,20 @@ impl Database {
             "ALTER TABLE dimensions ADD COLUMN sa_gen INTEGER",
             "ALTER TABLE dimensions ADD COLUMN sb_idx INTEGER",
             "ALTER TABLE dimensions ADD COLUMN sb_gen INTEGER",
+            // Fillet source definition (pre-derived-id documents) gains
+            // the wedge side plus the generated feature ids, so loaded
+            // fillets relink instead of regenerating lazily.
+            "ALTER TABLE fillets ADD COLUMN side INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE fillets ADD COLUMN arc_idx INTEGER",
+            "ALTER TABLE fillets ADD COLUMN arc_gen INTEGER",
+            "ALTER TABLE fillets ADD COLUMN t1_idx INTEGER",
+            "ALTER TABLE fillets ADD COLUMN t1_gen INTEGER",
+            "ALTER TABLE fillets ADD COLUMN t2_idx INTEGER",
+            "ALTER TABLE fillets ADD COLUMN t2_gen INTEGER",
+            "ALTER TABLE fillets ADD COLUMN ctr_idx INTEGER",
+            "ALTER TABLE fillets ADD COLUMN ctr_gen INTEGER",
+            "ALTER TABLE fillets ADD COLUMN ctl_idx INTEGER",
+            "ALTER TABLE fillets ADD COLUMN ctl_gen INTEGER",
         ] {
             let _ = self.conn.execute(sql, []);
         }
@@ -191,6 +212,7 @@ impl Database {
             }
             self.conn.execute_batch(
                 "DELETE FROM dimensions;
+                 DELETE FROM fillets;
                  DELETE FROM constraints;
                  DELETE FROM fill_segments;
                  DELETE FROM fills;
@@ -338,6 +360,50 @@ impl Database {
                     ],
                 )?;
             }
+            for f in &doc.modifiers {
+                use crate::core::fillet::FilletSide;
+                let pid = |id: Option<crate::core::ids::PointId>| {
+                    id.map(|id| (id.idx as i64, id.generation as i64))
+                };
+                let (arc, t1, t2, ctr, ctl) = (
+                    f.arc.map(|id| (id.idx as i64, id.generation as i64)),
+                    pid(f.first_tangent),
+                    pid(f.second_tangent),
+                    pid(f.center),
+                    pid(f.control),
+                );
+                self.conn.execute(
+                    "INSERT INTO fillets(first_idx, first_gen, second_idx, second_gen,
+                        corner_idx, corner_gen, radius, side,
+                        arc_idx, arc_gen, t1_idx, t1_gen, t2_idx, t2_gen,
+                        ctr_idx, ctr_gen, ctl_idx, ctl_gen)
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                        ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                    rusqlite::params![
+                        f.first.idx as i64,
+                        f.first.generation as i64,
+                        f.second.idx as i64,
+                        f.second.generation as i64,
+                        f.corner.idx as i64,
+                        f.corner.generation as i64,
+                        f.radius,
+                        match f.side {
+                            FilletSide::Inner => 0,
+                            FilletSide::Outer => 1,
+                        },
+                        arc.map(|a| a.0),
+                        arc.map(|a| a.1),
+                        t1.map(|p| p.0),
+                        t1.map(|p| p.1),
+                        t2.map(|p| p.0),
+                        t2.map(|p| p.1),
+                        ctr.map(|p| p.0),
+                        ctr.map(|p| p.1),
+                        ctl.map(|p| p.0),
+                        ctl.map(|p| p.1),
+                    ],
+                )?;
+            }
             for (index, layer) in doc.layers.iter().enumerate() {
                 self.conn.execute(
                     "INSERT INTO layers(id, name, order_index) VALUES(?1, ?2, ?3)",
@@ -470,6 +536,48 @@ impl Database {
                 s.stroke_color = row.get::<_, i64>(12).unwrap_or(2105636) as u32;
                 s.opacity = row.get::<_, f64>(13).unwrap_or(1.) as f32;
             }
+        }
+        drop(rows);
+        drop(stmt);
+
+        let mut stmt = self.conn.prepare(
+            "SELECT first_idx, first_gen, second_idx, second_gen, corner_idx, corner_gen,
+                radius, side, arc_idx, arc_gen, t1_idx, t1_gen, t2_idx, t2_gen,
+                ctr_idx, ctr_gen, ctl_idx, ctl_gen FROM fillets",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            // Generated ids resolve against the just-loaded arenas (slots
+            // persist verbatim); anything stale degrades to None and the
+            // lazy-regeneration path carries on as before.
+            let point = |icol: usize, gcol: usize| -> Option<PointId> {
+                let (i, g): (Option<i64>, Option<i64>) =
+                    (row.get(icol).ok().flatten(), row.get(gcol).ok().flatten());
+                let id = PointId { idx: i? as u32, generation: g? as u32 };
+                doc.point(id).map(|_| id)
+            };
+            let segment = |icol: usize, gcol: usize| -> Option<SegmentId> {
+                let (i, g): (Option<i64>, Option<i64>) =
+                    (row.get(icol).ok().flatten(), row.get(gcol).ok().flatten());
+                let id = SegmentId { idx: i? as u32, generation: g? as u32 };
+                doc.segment(id).map(|_| id)
+            };
+            let side = match row.get::<_, i64>(7).unwrap_or(0) {
+                1 => crate::core::fillet::FilletSide::Outer,
+                _ => crate::core::fillet::FilletSide::Inner,
+            };
+            doc.modifiers.push(crate::core::fillet::Fillet {
+                first: SegmentId { idx: row.get::<_, i64>(0)? as u32, generation: row.get::<_, i64>(1)? as u32 },
+                second: SegmentId { idx: row.get::<_, i64>(2)? as u32, generation: row.get::<_, i64>(3)? as u32 },
+                corner: PointId { idx: row.get::<_, i64>(4)? as u32, generation: row.get::<_, i64>(5)? as u32 },
+                radius: row.get(6)?,
+                side,
+                arc: segment(8, 9),
+                first_tangent: point(10, 11),
+                second_tangent: point(12, 13),
+                center: point(14, 15),
+                control: point(16, 17),
+            });
         }
         drop(rows);
         drop(stmt);

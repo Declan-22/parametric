@@ -40,31 +40,7 @@ pub struct Document {
     pub dimensions: Vec<Dimension>,
     /// Parametric edge treatments. The source segments remain identifiable so
     /// the treatment can be removed without losing the user's geometry.
-    pub modifiers: Vec<Modifier>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Modifier {
-    Fillet(FilletModifier),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct FilletModifier {
-    pub first: SegmentId,
-    pub second: SegmentId,
-    pub corner: PointId,
-    pub radius: f64,
-    /// The generated tangent arc. Its construction points are owned by the
-    /// modifier and are removed with it.
-    pub arc: SegmentId,
-    pub first_trim: PointId,
-    pub second_trim: PointId,
-    pub center: PointId,
-    pub control: PointId,
-    pub first_original_start: PointId,
-    pub first_original_end: PointId,
-    pub second_original_start: PointId,
-    pub second_original_end: PointId,
+    pub modifiers: Vec<crate::core::fillet::Fillet>,
 }
 
 // -- entities --
@@ -285,6 +261,15 @@ impl Document {
                 *p = Point2::new(p.x + delta.x, p.y + delta.y).clamped();
             }
         }
+    }
+
+    /// Removes a point WITHOUT cascading: no segments, constraints,
+    /// dimensions, or fills are touched. Only call this after migrating
+    /// every reference off the point (fillet subdivision consumes corners
+    /// this way) — otherwise the document keeps dangling ids.
+    pub fn remove_point_raw(&mut self, id: PointId) -> bool {
+        self.detach_from_layers(ElementRef::Point(id));
+        self.points.remove(id.idx).is_some()
     }
 
     /// Removes a point plus everything that depends on it: touching
@@ -719,9 +704,9 @@ impl Document {
         self.dimensions.push(dim);
     }
 
-    pub fn add_modifier(&mut self, modifier: Modifier) { self.modifiers.push(modifier); }
+    pub fn add_modifier(&mut self, modifier: crate::core::fillet::Fillet) { self.modifiers.push(modifier); }
 
-    pub fn remove_modifier(&mut self, index: usize) -> Option<Modifier> {
+    pub fn remove_modifier(&mut self, index: usize) -> Option<crate::core::fillet::Fillet> {
         (index < self.modifiers.len()).then(|| self.modifiers.remove(index))
     }
 

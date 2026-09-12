@@ -6,4 +6,5 @@ pub mod home;
 pub mod inspector;
 pub mod menu;
 pub mod shell;
+pub mod toasts;
 pub mod toolbar;

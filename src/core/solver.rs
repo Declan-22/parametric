@@ -2,6 +2,7 @@ use super::constraints::{ConstraintKind, DimTarget};
 use super::document::Document;
 use super::geometry::Point2;
 use super::ids::PointId;
+use smallvec::SmallVec;
 use std::collections::HashMap;
 
 // Real constraint solver: damped least-squares (Levenberg-Marquardt) over
@@ -145,11 +146,15 @@ fn ctrl_point(ctrl: &[Point2; 4], t: f64) -> Point2 {
 const BEZ_SAMPLES: usize = 12;
 
 // A residual evaluated at one iterate: value plus sparse gradient over
-// FREE variable indices.
+// FREE variable indices. Gradients are stack-allocated: no equation
+// touches more than 8 scalars (4 points × 2), so the hot LM loop
+// performs zero heap allocation for gradients.
+type GradBuf = SmallVec<[(usize, f64); 8]>;
+
 struct Residual {
     value: f64,
     // (free variable index, d value / d variable)
-    grad: Vec<(usize, f64)>,
+    grad: GradBuf,
     weight: f64,
 }
 
@@ -378,16 +383,21 @@ impl Solver {
         // the stored center equidistant from all three arc-defining points.
         // The bend barrier is drag-only (live drags pass non-empty `drag`;
         // dimension/constraint applies pass empty): a shallow-but-valid
-        // radius dimension must never fight it.
+        // radius dimension must never fight it. Fillet arcs are the
+        // exception — their radius equations are branch-agnostic distances,
+        // so without the barrier an apply can settle the control on the
+        // mirrored branch, flipping the arc inside-out and obliterating
+        // its fill. The barrier only guards the side, never the radius.
         let live_drag = !drag.is_empty();
-        for (_, seg) in doc.all_segments() {
+        for (sid, seg) in doc.all_segments() {
             if seg.kind != crate::core::document::SegmentKind::Arc { continue; }
             let (Some(o), Some(a), Some(b), Some(c)) = (
                 seg.center.and_then(|id| slot_of(id)), slot_of(seg.start),
                 slot_of(seg.end), seg.ctrl.and_then(|id| slot_of(id))) else { continue };
             eqs.push(Eq::EqualRadius { o, a, b });
             eqs.push(Eq::EqualRadius { o, a, b: c });
-            if live_drag {
+            let is_fillet = doc.modifiers.iter().any(|m| m.arc == Some(sid));
+            if live_drag || is_fillet {
                 let ps = doc.point(seg.start).unwrap();
                 let pe = doc.point(seg.end).unwrap();
                 let pc = doc.point(seg.ctrl.unwrap()).unwrap();
@@ -1032,6 +1042,67 @@ impl Solver {
         solver
     }
 
+    /// Removes fillet-derived equations for interactive drag solves.
+    ///
+    /// Tangent contacts, arc centers, and tangent points are re-seated
+    /// exactly by refresh_fillets() after every drag commit, so keeping
+    /// their stiff nonlinear equations (tangent, circle-point,
+    /// equal-radius, on-line) in the live system only risks fights: a
+    /// pinned contact freezes the drag, a stale circle radius contradicts
+    /// the dimension, and rejected frames read as stuck geometry. Radius
+    /// Distance equations stay (they hold, benignly), as does everything
+    /// unrelated to fillets — drags without fillets behave bit-identically.
+    /// Discrete applies and validations never call this: they need the
+    /// full system to judge feasibility.
+    pub fn strip_fillet_equations(&mut self, doc: &Document) {
+        if doc.modifiers.is_empty() {
+            return;
+        }
+        let at = |slot: usize| self.slots.get(slot).copied();
+        self.eqs.retain(|eq| {
+            match *eq {
+                // Creation-derived tangency: contact is a tangent point
+                // and the center is its modifier's center.
+                Eq::Tangent { o, p, .. } => !doc.modifiers.iter().any(|m| {
+                    at(o) == m.center
+                        && (at(p) == m.first_tangent || at(p) == m.second_tangent)
+                }),
+                // Creation-derived point glue: a tangent point constrained
+                // to its own source edge.
+                Eq::PointLineDist { p, l1, l2, .. } => !doc.modifiers.iter().any(|m| {
+                    let tangent = at(p) == m.first_tangent || at(p) == m.second_tangent;
+                    tangent
+                        && [m.first, m.second].into_iter().any(|sid| {
+                            doc.segment(sid).is_some_and(|s| {
+                                let (a, b) = (Some(s.start), Some(s.end));
+                                (at(l1), at(l2)) == (a, b) || (at(l1), at(l2)) == (b, a)
+                            })
+                        })
+                }),
+                // Arc rigidity around a fillet center.
+                Eq::CirclePoint { p, o, .. } => !doc.modifiers.iter().any(|m| {
+                    at(o) == m.center
+                        && (at(p) == m.first_tangent || at(p) == m.second_tangent)
+                }),
+                Eq::EqualRadius { o, a, b } => !doc.modifiers.iter().any(|m| {
+                    at(o) == m.center
+                        && [at(a), at(b)].iter().all(|id| {
+                            *id == m.first_tangent
+                                || *id == m.second_tangent
+                                || *id == m.control
+                        })
+                }),
+                _ => true,
+            }
+        });
+        self.active_eqs = self
+            .eqs
+            .iter()
+            .copied()
+            .filter(|&eq| self.eq_touches_free(eq))
+            .collect();
+    }
+
     pub fn is_empty(&self) -> bool {
         self.n_free == 0 && self.eqs.is_empty()
     }
@@ -1090,7 +1161,7 @@ impl Solver {
             match *eq {
                 Eq::Horizontal { a, b } => {
                     let (pa, pb) = (self.pos(a, x), self.pos(b, x));
-                    let mut grad = Vec::new();
+                    let mut grad = GradBuf::new();
                     if let Some(v) = self.free_of[a] {
                         grad.push((v * 2 + 1, 1.0));
                     }
@@ -1101,7 +1172,7 @@ impl Solver {
                 }
                 Eq::Vertical { a, b } => {
                     let (pa, pb) = (self.pos(a, x), self.pos(b, x));
-                    let mut grad = Vec::new();
+                    let mut grad = GradBuf::new();
                     if let Some(v) = self.free_of[a] {
                         grad.push((v * 2, 1.0));
                     }
@@ -1117,7 +1188,7 @@ impl Solver {
                     let len = (dx * dx + dy * dy).sqrt().max(1e-9);
                     let ux = dx / len;
                     let uy = dy / len;
-                    let mut grad = Vec::new();
+                    let mut grad = GradBuf::new();
                     if let Some(v) = self.free_of[a] {
                         // d|ab|/da = -(unit ab)
                         grad.push((v * 2, -ux));
@@ -1132,7 +1203,7 @@ impl Solver {
                 Eq::DistanceBranch { a, b, ux, uy, min_dot } => {
                     let (pa, pb) = (self.pos(a, x), self.pos(b, x));
                     let dot = (pb.x - pa.x) * ux + (pb.y - pa.y) * uy;
-                    let mut grad = Vec::new();
+                    let mut grad = GradBuf::new();
                     if dot < min_dot {
                         if let Some(v) = self.free_of[a] {
                             grad.push((v * 2, ux));
@@ -1151,7 +1222,7 @@ impl Solver {
                 }
                 Eq::DistanceX { a, b, target } => {
                     let (pa, pb) = (self.pos(a, x), self.pos(b, x));
-                    let mut grad = Vec::new();
+                    let mut grad = GradBuf::new();
                     if let Some(v) = self.free_of[a] {
                         grad.push((v * 2, -1.0));
                     }
@@ -1162,7 +1233,7 @@ impl Solver {
                 }
                 Eq::DistanceY { a, b, target } => {
                     let (pa, pb) = (self.pos(a, x), self.pos(b, x));
-                    let mut grad = Vec::new();
+                    let mut grad = GradBuf::new();
                     if let Some(v) = self.free_of[a] {
                         grad.push((v * 2 + 1, -1.0));
                     }
@@ -1176,9 +1247,9 @@ impl Solver {
                         (self.pos(a1, x), self.pos(a2, x), self.pos(b1, x), self.pos(b2, x));
                     let (mxa, mya) = ((pa1.x + pa2.x) / 2., (pa1.y + pa2.y) / 2.);
                     let (mxb, myb) = ((pb1.x + pb2.x) / 2., (pb1.y + pb2.y) / 2.);
-                    let mut grad = Vec::new();
+                    let mut grad = GradBuf::new();
                     // d(midB-midA)/d(each endpoint) = ±0.5 per axis.
-                    let push = |grad: &mut Vec<(usize, f64)>, slot: usize, gx: f64, gy: f64| {
+                    let push = |grad: &mut GradBuf, slot: usize, gx: f64, gy: f64| {
                         if let Some(v) = self.free_of[slot] {
                             grad.push((v * 2, gx));
                             grad.push((v * 2 + 1, gy));
@@ -1195,7 +1266,7 @@ impl Solver {
                             out.push(Residual { value: mxb - mxa - target, grad, weight: DIM_WEIGHT });
                         }
                         1 => {
-                            let mut g = Vec::new();
+                            let mut g = GradBuf::new();
                             push(&mut g, a1, 0.0, -0.5);
                             push(&mut g, a2, 0.0, -0.5);
                             push(&mut g, b1, 0.0, 0.5);
@@ -1207,7 +1278,7 @@ impl Solver {
                             let dy = myb - mya;
                             let len = (dx * dx + dy * dy).sqrt().max(1e-9);
                             let (ux, uy) = (dx / len, dy / len);
-                            let mut g = Vec::new();
+                            let mut g = GradBuf::new();
                             push(&mut g, a1, -0.5 * ux, -0.5 * uy);
                             push(&mut g, a2, -0.5 * ux, -0.5 * uy);
                             push(&mut g, b1, 0.5 * ux, 0.5 * uy);
@@ -1223,7 +1294,7 @@ impl Solver {
                     let l = (dx * dx + dy * dy).sqrt().max(1e-9);
                     let nx = -dy / l;
                     let ny = dx / l;
-                    let mut grad = Vec::new();
+                    let mut grad = GradBuf::new();
                     if let Some(v) = self.free_of[p] {
                         grad.push((v * 2, nx));
                         grad.push((v * 2 + 1, ny));
@@ -1247,7 +1318,7 @@ impl Solver {
                     let l = (dx * dx + dy * dy).sqrt().max(1e-9);
                     let nx = -dy / l;
                     let ny = dx / l;
-                    let mut grad = Vec::new();
+                    let mut grad = GradBuf::new();
                     if let Some(v) = self.free_of[a1] {
                         grad.push((v * 2, -nx));
                         grad.push((v * 2 + 1, -ny));
@@ -1281,7 +1352,7 @@ impl Solver {
                     let gay = (-bx * d - c * by) / denom;
                     let gbx = (-ay * d - c * ax) / denom;
                     let gby = (ax * d - c * ay) / denom;
-                    let mut grad = Vec::new();
+                    let mut grad = GradBuf::new();
                     if let Some(v) = self.free_of[a1] {
                         grad.push((v * 2, -gax));
                         grad.push((v * 2 + 1, -gay));
@@ -1329,7 +1400,7 @@ impl Solver {
                     let db = (dbx * dbx + dby * dby).sqrt().max(1e-9);
                     let (uax, uay) = (dax / da, day / da);
                     let (ubx, uby) = (dbx / db, dby / db);
-                    let mut grad = Vec::new();
+                    let mut grad = GradBuf::new();
                     if let Some(v) = self.free_of[o] {
                         grad.push((v * 2, ubx - uax));
                         grad.push((v * 2 + 1, uby - uay));
@@ -1359,7 +1430,7 @@ impl Solver {
                     let h = (ux * vy - uy * vx) / chord;
                     let min_h = (0.025 * chord).clamp(1.0, 8.0);
                     let oriented_h = side * h;
-                    let mut grad = Vec::new();
+                    let mut grad = GradBuf::new();
                     if oriented_h < min_h {
                         // Preserve the side captured at drag start. An
                         // absolute-height barrier is satisfied on both sides
@@ -1402,7 +1473,7 @@ impl Solver {
                     let dvy = ry / m - dot * vy / (2. * lv * m * m);
                     let drx = vx / m - dot * rx / (2. * lr * m * m);
                     let dry = vy / m - dot * ry / (2. * lr * m * m);
-                    let mut grad = Vec::new();
+                    let mut grad = GradBuf::new();
                     if let Some(v) = self.free_of[l1] { grad.push((v * 2, -dvx)); grad.push((v * 2 + 1, -dvy)); }
                     if let Some(v) = self.free_of[l2] { grad.push((v * 2, dvx)); grad.push((v * 2 + 1, dvy)); }
                     if let Some(v) = self.free_of[o] { grad.push((v * 2, -drx)); grad.push((v * 2 + 1, -dry)); }
@@ -1414,7 +1485,7 @@ impl Solver {
                     let dx = point.x - center.x;
                     let dy = point.y - center.y;
                     let length = (dx * dx + dy * dy).sqrt().max(1e-9);
-                    let mut grad = Vec::new();
+                    let mut grad = GradBuf::new();
                     if let Some(v) = self.free_of[p] {
                         grad.push((v * 2, dx / length));
                         grad.push((v * 2 + 1, dy / length));
@@ -1439,7 +1510,7 @@ impl Solver {
                     let duy = -vx / m - cross * uy / (2. * lu * m * m);
                     let dvx = -uy / m - cross * vx / (2. * lv * m * m);
                     let dvy = ux / m - cross * vy / (2. * lv * m * m);
-                    let mut grad = Vec::new();
+                    let mut grad = GradBuf::new();
                     if let Some(i) = self.free_of[a1] { grad.push((i * 2, -dux)); grad.push((i * 2 + 1, -duy)); }
                     if let Some(i) = self.free_of[a2] { grad.push((i * 2, dux)); grad.push((i * 2 + 1, duy)); }
                     if let Some(i) = self.free_of[b1] { grad.push((i * 2, -dvx)); grad.push((i * 2 + 1, -dvy)); }
@@ -1463,7 +1534,7 @@ impl Solver {
                     let duy = -vx / m - cross * uy / (2. * lu * m * m);
                     let dvx = -uy / m - cross * vx / (2. * lv * m * m);
                     let dvy = ux / m - cross * vy / (2. * lv * m * m);
-                    let mut grad = Vec::new();
+                    let mut grad = GradBuf::new();
                     if let Some(i) = self.free_of[l1] { grad.push((i * 2, -dux)); grad.push((i * 2 + 1, -duy)); }
                     if let Some(i) = self.free_of[l2] { grad.push((i * 2, dux)); grad.push((i * 2 + 1, duy)); }
                     if let Some(i) = self.free_of[h] { grad.push((i * 2, -dvx)); grad.push((i * 2 + 1, -dvy)); }
@@ -1502,7 +1573,7 @@ impl Solver {
                         dlen[k + 1].1 += uy;
                     }
                     let slots = [p0, c1, c2, p1];
-                    let mut grad = Vec::new();
+                    let mut grad = GradBuf::new();
                     for (i, &slot) in slots.iter().enumerate() {
                         if let Some(v) = self.free_of[slot] {
                             let (mut gx, mut gy) = (0.0, 0.0);
@@ -1530,7 +1601,7 @@ impl Solver {
                     let duy = vy / m - dot * uy / (2. * lu * m * m);
                     let dvx = ux / m - dot * vx / (2. * lv * m * m);
                     let dvy = uy / m - dot * vy / (2. * lv * m * m);
-                    let mut grad = Vec::new();
+                    let mut grad = GradBuf::new();
                     if let Some(i) = self.free_of[a1] { grad.push((i * 2, -dux)); grad.push((i * 2 + 1, -duy)); }
                     if let Some(i) = self.free_of[a2] { grad.push((i * 2, dux)); grad.push((i * 2 + 1, duy)); }
                     if let Some(i) = self.free_of[b1] { grad.push((i * 2, -dvx)); grad.push((i * 2 + 1, -dvy)); }
@@ -1560,7 +1631,7 @@ impl Solver {
                     // way so radius dims never reached their target.
                     let dr_dh = h.signum() * (h_abs * h_abs - m * m) / (2. * h_abs * h_abs);
                     let dr_dm = m / h_abs;
-                    let mut grad = Vec::new();
+                    let mut grad = GradBuf::new();
                     if let Some(v) = self.free_of[c] {
                         // dh/dc = perp(u)
                         grad.push((v * 2, -uy * dr_dh));
@@ -1584,14 +1655,18 @@ impl Solver {
         // their gesture-start positions.
         for &(i, t) in &self.drag {
             if let Some(v) = self.free_of[i] {
+                let mut gx = GradBuf::new();
+                gx.push((v * 2, 1.0));
                 out.push(Residual {
                     value: x[v].x - t.x,
-                    grad: vec![(v * 2, 1.0)],
+                    grad: gx,
                     weight: DRAG_WEIGHT,
                 });
+                let mut gy = GradBuf::new();
+                gy.push((v * 2 + 1, 1.0));
                 out.push(Residual {
                     value: x[v].y - t.y,
-                    grad: vec![(v * 2 + 1, 1.0)],
+                    grad: gy,
                     weight: DRAG_WEIGHT,
                 });
             }
@@ -1599,14 +1674,18 @@ impl Solver {
         for &(i, anchor, factor) in &self.aux {
             if let Some(v) = self.free_of[i] {
                 let w = self.anchor_weight * factor;
+                let mut gx = GradBuf::new();
+                gx.push((v * 2, 1.0));
                 out.push(Residual {
                     value: x[v].x - anchor.x,
-                    grad: vec![(v * 2, 1.0)],
+                    grad: gx,
                     weight: w,
                 });
+                let mut gy = GradBuf::new();
+                gy.push((v * 2 + 1, 1.0));
                 out.push(Residual {
                     value: x[v].y - anchor.y,
-                    grad: vec![(v * 2 + 1, 1.0)],
+                    grad: gy,
                     weight: w,
                 });
             }

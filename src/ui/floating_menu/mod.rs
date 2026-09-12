@@ -106,13 +106,11 @@ impl RenderOnce for FloatingMenu {
                 ElementRef::Segment(sid) => ed
                     .doc
                     .segment(*sid)
-                    .is_some_and(|s| {
-                        s.kind == crate::core::document::SegmentKind::Bezier
-                    }),
+                    .is_some_and(|s| s.kind == crate::core::document::SegmentKind::Bezier),
                 _ => false,
             }) && dim_edge.is_none();
-            let dist_active = show_distance
-                && matches!(ed.dim_target, Some(DT::CurveLength { .. }));
+            let dist_active =
+                show_distance && matches!(ed.dim_target, Some(DT::CurveLength { .. }));
             // Radius and point-line targets imply their own type.
             let dim_auto = match ed.dim_target {
                 Some(DT::Radius { .. }) => Some("Auto · Radius"),
@@ -430,7 +428,11 @@ fn apply_key(action: MenuAction) -> &'static str {
 }
 
 // Merge mark: two points joining into one.
-const ICON_MERGE: &[u8] = br#"<svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="2.5" cy="3.5" r="1.1" fill="black"/><circle cx="2.5" cy="8.5" r="1.1" fill="black"/><path d="M3.5 4L7.5 6L3.5 8" stroke="black" stroke-width="0.9" stroke-linecap="round" stroke-linejoin="round"/><circle cx="9" cy="6" r="1.2" fill="black"/></svg>"#;
+const ICON_MERGE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<path fill="currentColor" d="M16.72 7.33v-.04h-.05A7.54 7.54 0 0 0 9.5 2.01C5.36 2.01 2 5.37 2 9.51c0 3.29 2.19 6.21 5.28 7.17v.04h.05c.96 3.1 3.88 5.28 7.17 5.28c4.14 0 7.5-3.36 7.5-7.5c0-3.29-2.19-6.21-5.28-7.17M4 9.5C4 6.47 6.47 4 9.5 4c2.09 0 3.97 1.2 4.9 3c-.13 0-.25.02-.37.02c-.11 0-.22 0-.34.02c-.14.01-.28.04-.41.06c-.11.02-.22.03-.33.05c-.13.03-.26.07-.4.1c-.11.03-.21.05-.32.08c-.13.04-.25.09-.38.14c-.1.04-.2.07-.3.11c-.13.05-.25.12-.37.18c-.09.05-.19.09-.28.14c-.12.07-.24.14-.36.22c-.08.05-.17.1-.25.16c-.12.08-.24.18-.36.27l-.22.16c-.14.12-.28.25-.41.37c-.08.08-.16.16-.23.24c-.12.13-.25.26-.36.4l-.18.24c-.08.11-.17.22-.25.33c-.06.09-.11.19-.17.28c-.07.11-.14.22-.2.33c-.06.1-.1.21-.15.31c-.05.11-.11.22-.16.34c-.05.11-.08.22-.12.33c-.04.12-.09.23-.13.35c-.04.11-.06.23-.09.35s-.07.24-.09.36c-.03.12-.04.24-.06.36l-.06.37c-.01.12-.02.25-.02.38c0 .11-.02.22-.02.33c-1.8-.93-3-2.81-3-4.9ZM14.5 20c-2.09 0-3.97-1.2-4.9-3c.11 0 .22-.01.33-.02c.13 0 .25-.01.38-.02s.25-.04.37-.06s.24-.03.36-.06l.36-.09l.35-.09c.12-.04.24-.09.35-.13l.33-.12c.12-.05.23-.11.35-.17c.1-.05.2-.09.3-.15c.12-.06.23-.14.34-.21c.09-.06.18-.11.27-.17c.12-.08.23-.17.34-.25c.08-.06.16-.11.23-.18c.14-.12.27-.24.4-.36l.24-.24c.12-.13.25-.26.36-.4c.06-.07.12-.16.17-.23c.09-.11.18-.22.25-.34c.06-.09.11-.18.16-.26c.07-.12.15-.23.21-.35c.05-.09.1-.2.14-.29c.06-.12.12-.23.17-.36c.04-.1.08-.21.12-.32c.05-.12.09-.24.13-.37c.03-.11.06-.22.09-.34s.07-.25.1-.37l.06-.36l.06-.38c.01-.12.02-.25.02-.38c0-.11.02-.22.02-.34c1.8.93 3 2.81 3 4.9c0 3.03-2.47 5.5-5.5 5.5Z" />
+</svg>
+"#;
 
 fn row_icon(icon: Option<&'static [u8]>, t: Theme) -> impl IntoElement {
     match icon {
@@ -479,7 +481,11 @@ fn mode_row(
     };
     let shell_hover = shell.clone();
     let key_h = key.clone();
-    let active_shadow = if is_active { vec![t.shadow_sm()] } else { Vec::new() };
+    let active_shadow = if is_active {
+        vec![t.shadow_sm()]
+    } else {
+        Vec::new()
+    };
     div()
         .id(gpui::SharedString::from(key.clone()))
         .flex()
@@ -569,7 +575,11 @@ fn action_row(
         lerp_rgb(t.bg_tertiary, t.bg_primary, k)
     };
     let shell_hover = shell.clone();
-    let active_shadow = if active { vec![t.shadow_sm()] } else { Vec::new() };
+    let active_shadow = if active {
+        vec![t.shadow_sm()]
+    } else {
+        Vec::new()
+    };
     let key_owned = key.to_string();
     let key_hover = key_owned.clone();
     div()

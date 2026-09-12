@@ -88,6 +88,12 @@ pub struct Shell {
     pub(crate) save_in_flight: bool,
     // Dimension value-input caret blink loop guard.
     pub(crate) dim_blink_active: bool,
+    // Toast notification stack (bottom-right, left of the inspector).
+    // Reusable for any non-blocking notice; over-constraint rejections
+    // are just the first producer. Capped so bursts never cover the
+    // canvas; identical pushes re-arm instead of stacking.
+    pub(crate) toasts: Vec<crate::ui::toasts::ToastEntry>,
+    pub(crate) toast_seq: u64,
 }
 
 fn now_secs() -> i64 {
@@ -131,6 +137,8 @@ impl Shell {
             saved_gens: HashMap::new(),
             save_in_flight: false,
             dim_blink_active: false,
+            toasts: Vec::new(),
+            toast_seq: 0,
         }
     }
 
@@ -838,6 +846,175 @@ impl Shell {
         })
         .detach();
     }
+
+    // -- toast notifications --
+
+    /// Maximum live toasts: bursts drop the oldest instead of covering the
+    /// canvas.
+    const MAX_TOASTS: usize = 4;
+
+    /// Pushes a reusable toast. An identical live toast (same title,
+    /// body, hint and blockers) re-arms its timer instead of stacking a
+    /// duplicate on repeated failures.
+    pub(crate) fn push_toast(
+        &mut self,
+        kind: crate::ui::toasts::ToastKind,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        hint: impl Into<String>,
+        blocks: Vec<crate::editor::BlockChip>,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::ui::toasts::ToastEntry;
+        let (title, body, hint) = (title.into(), body.into(), hint.into());
+        let same_blocks = |t: &ToastEntry| {
+            t.blocks.len() == blocks.len()
+                && t.blocks.iter().zip(&blocks).all(|(a, b)| {
+                    a.kind == b.kind && a.label == b.label
+                })
+        };
+        if let Some(existing) = self.toasts.iter_mut().find(|t| {
+            t.title == title && t.body == body && t.hint == hint && !t.dismissing && same_blocks(t)
+        }) {
+            existing.epoch = existing.epoch.wrapping_add(1);
+            let (id, epoch, duration) =
+                (existing.id, existing.epoch, existing.kind.duration());
+            Self::arm_toast_expiry(cx, id, epoch, duration);
+            cx.notify();
+            return;
+        }
+        self.toast_seq = self.toast_seq.wrapping_add(1);
+        let id = self.toast_seq;
+        self.toasts.push(ToastEntry {
+            id,
+            kind,
+            title,
+            body,
+            hint,
+            blocks,
+            anim: 0.0,
+            tween: 0,
+            epoch: 0,
+            dismissing: false,
+        });
+        while self.toasts.len() > Self::MAX_TOASTS {
+            if let Some(oldest) = self.toasts.first().map(|t| t.id) {
+                self.dismiss_toast(oldest, cx);
+            } else {
+                break;
+            }
+        }
+        self.start_toast_anim(id, 1.0, cx);
+        Self::arm_toast_expiry(cx, id, 0, kind.duration());
+        cx.notify();
+    }
+
+    /// Drains `Editor::toast_requests` into the live stack. Called once per
+    /// render so producers stay UI-independent.
+    pub(crate) fn drain_editor_toasts(&mut self, cx: &mut Context<Self>) {
+        let requests = self
+            .editor
+            .as_ref()
+            .map(|ed| ed.update(cx, |ed, _| std::mem::take(&mut ed.toast_requests)))
+            .unwrap_or_default();
+        for req in requests {
+            let kind = if req.error {
+                crate::ui::toasts::ToastKind::Error
+            } else {
+                crate::ui::toasts::ToastKind::Info
+            };
+            self.push_toast(kind, req.title, req.body, req.hint, req.blocks, cx);
+        }
+    }
+
+    /// Starts (or re-arms) the auto-dismiss timer for a toast generation.
+    /// A stale sleeper (re-armed or manually dismissed since) is a no-op.
+    fn arm_toast_expiry(
+        cx: &mut Context<Self>,
+        id: u64,
+        epoch: u64,
+        duration: std::time::Duration,
+    ) {
+        let this = cx.entity().downgrade();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(duration).await;
+            let _ = this.update(cx, |shell, cx| {
+                let live = shell
+                    .toasts
+                    .iter()
+                    .any(|t| t.id == id && t.epoch == epoch && !t.dismissing);
+                if live {
+                    shell.dismiss_toast(id, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Begins dismissing a toast: tweens its entry animation back to 0,
+    /// then removes it so the stack below rises smoothly.
+    pub(crate) fn dismiss_toast(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(entry) = self.toasts.iter_mut().find(|t| t.id == id) else {
+            return;
+        };
+        if entry.dismissing {
+            return;
+        }
+        entry.dismissing = true;
+        entry.epoch = entry.epoch.wrapping_add(1);
+        self.start_toast_anim(id, 0.0, cx);
+        cx.notify();
+    }
+
+    /// Per-toast rise+fade tween (~150ms ease-out-cubic, 10 ticks).
+    /// Generation-guarded like the floating menu so re-arms never stack
+    /// competing tickers. Reaching 0 via a dismiss removes the entry.
+    fn start_toast_anim(&mut self, id: u64, target: f32, cx: &mut Context<Self>) {
+        let Some(entry) = self.toasts.iter_mut().find(|t| t.id == id) else {
+            return;
+        };
+        entry.tween = entry.tween.wrapping_add(1);
+        let (tween, from) = (entry.tween, entry.anim);
+        if (from - target).abs() < f32::EPSILON {
+            if target == 0.0 {
+                self.toasts.retain(|t| t.id != id);
+            }
+            return;
+        }
+        let this = cx.entity().downgrade();
+        cx.spawn(async move |this, cx| {
+            let steps = 10;
+            for i in 1..=steps {
+                cx.background_executor()
+                    .timer(Duration::from_millis(15))
+                    .await;
+                let done = this
+                    .update(cx, |shell, cx| {
+                        let Some(entry) =
+                            shell.toasts.iter_mut().find(|t| t.id == id)
+                        else {
+                            return true;
+                        };
+                        if entry.tween != tween {
+                            return true;
+                        }
+                        let t = i as f32 / steps as f32;
+                        let eased = 1.0 - (1.0 - t).powi(3);
+                        entry.anim = from + (target - from) * eased;
+                        if i == steps && target == 0.0 {
+                            shell.toasts.retain(|t| t.id != id);
+                        }
+                        cx.notify();
+                        i == steps
+                    })
+                    .unwrap_or(true);
+                if done {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
 }
 
 // Camera that fits the document's content into a viewport with padding.
@@ -873,6 +1050,9 @@ fn fit_camera(doc: &Document, viewport: (f32, f32)) -> Camera {
 impl Render for Shell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.autosave(cx);
+        // Editor-produced notices (over-constraint rejections, …) become
+        // reusable toasts. Drained here so producers stay UI-independent.
+        self.drain_editor_toasts(cx);
         // Dimension value-input caret blink.
         let dim_input_active = self
             .editor
@@ -899,15 +1079,13 @@ impl Render for Shell {
                 shell.delete_selection(cx);
             }))
             .on_action(cx.listener(|shell, _: &crate::ui::actions::BondDismiss, _, cx| {
-                // Global escape, highest priority first: over-constrained
-                // modal > dimension editing/picking > any toggled tool
-                // (back to Move) > context menu.
+                // Global escape, highest priority first: dimension
+                // editing/picking > any toggled tool (back to Move) >
+                // selection (clear it) > context menu. Toasts are
+                // non-modal and auto-expire, so Esc intentionally leaves
+                // them up.
                 if let Some(ed) = shell.editor.as_ref() {
                     let handled = ed.update(cx, |ed, cx| {
-                        if ed.overconstrained {
-                            ed.overconstrained = false;
-                            return true;
-                        }
                         if ed.dim_input.take().is_some() {
                             ed.dim_picks.clear();
                             ed.dim_target = None;
@@ -924,6 +1102,15 @@ impl Render for Shell {
                         }
                         if ed.tool != crate::editor::Tool::Move {
                             ed.set_tool(crate::editor::Tool::Move);
+                            return true;
+                        }
+                        if !ed.selection.is_empty()
+                            || !ed.selected_constraints.is_empty()
+                            || ed.selected_dim.is_some()
+                        {
+                            ed.selection.clear();
+                            ed.selected_constraints.clear();
+                            ed.selected_dim = None;
                             return true;
                         }
                         false
@@ -1404,6 +1591,15 @@ impl Render for Shell {
                 // Pen sub-mode switches (explicit only): L/B/A always land
                 // in the Pen tool with that sub-mode — they never untoggle
                 // Pen, and drag never changes mode.
+                if !e.keystroke.modifiers.modified() && key.as_str() == "f" {
+                    let _ = shell_keys.update(cx, |shell, cx| {
+                        if shell.renaming.is_none() && let Some(ed) = shell.editor.as_ref() {
+                            ed.update(cx, |ed, cx| { if ed.set_tool(crate::editor::Tool::Fillet) { cx.notify(); } });
+                        }
+                    });
+                    cx.stop_propagation();
+                    return;
+                }
                 if !e.keystroke.modifiers.modified() {
                     let pen_switch = match key.as_str() {
                         "l" | "b" | "a" => Some(key.as_str()),
@@ -1456,11 +1652,6 @@ impl Render for Shell {
                     let mut consumed = false;
                     let _ = shell_keys.update(cx, |shell, cx| {
                         if let Some(ed) = shell.editor.as_ref() {
-                            if ed.read(cx).overconstrained {
-                                ed.update(cx, |ed, _| ed.overconstrained = false);
-                                consumed = true;
-                                return;
-                            }
                             let is_pen = ed.read(cx).tool == crate::editor::Tool::Pen;
                             if is_pen
                                 && ed.update(cx, |ed, cx| {
@@ -1615,6 +1806,9 @@ impl Render for Shell {
                             editor: editor.downgrade(),
                             shell: cx.entity().downgrade(),
                         })
+                        .child(crate::ui::toasts::Toasts {
+                            shell: cx.entity().downgrade(),
+                        })
                         .into_any_element()
                 }
             })
@@ -1760,81 +1954,6 @@ impl Render for Shell {
                                                 })
                                                 .child("Delete")
                                         }),
-                                ),
-                        ),
-                )
-            })
-            .when(self.editor.as_ref().is_some_and(|ed| ed.read(cx).overconstrained), |root| {
-                let shell_ok = cx.entity().downgrade();
-                let shell_ok_bg = shell_ok.clone();
-                root.child(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .bg(rgba(0x00000073))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                            let _ = shell_ok_bg.update(cx, |shell, cx| {
-                                if let Some(ed) = shell.editor.as_ref() {
-                                    ed.update(cx, |ed, _| ed.overconstrained = false);
-                                }
-                                cx.notify();
-                            });
-                        })
-                        .child(
-                            div()
-                                .w(px(340.))
-                                .flex()
-                                .flex_col()
-                                .gap(px(10.))
-                                .p(px(20.))
-                                .bg(rgb(t.bg_darker))
-                                .border_1()
-                                .border_color(rgb(t.component_border_color))
-                                .rounded(px(12.))
-                                .shadow(vec![t.shadow_md()])
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                                        .text_color(rgb(t.text_primary))
-                                        .child("Over-constrained"),
-                                )
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(rgb(t.text_secondary))
-                                        .child("This dimension conflicts with existing constraints — the geometry cannot satisfy it, so it was not applied."),
-                                )
-                                .child(
-                                    div()
-                                        .id("overconstrained-ok")
-                                        .flex()
-                                        .justify_end()
-                                        .child(
-                                            div()
-                                                .px(px(12.))
-                                                .py(px(6.))
-                                                .rounded(px(6.))
-                                                .bg(rgb(t.bg_tertiary))
-                                                .border_1()
-                                                .border_color(rgb(t.component_border_color))
-                                                .text_sm()
-                                                .text_color(rgb(t.text_primary))
-                                                .cursor_pointer()
-                                                .child("OK")
-                                                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                                                    let _ = shell_ok.update(cx, |shell, cx| {
-                                                        if let Some(ed) = shell.editor.as_ref() {
-                                                            ed.update(cx, |ed, _| ed.overconstrained = false);
-                                                        }
-                                                        cx.notify();
-                                                    });
-                                                }),
-                                        ),
                                 ),
                         ),
                 )

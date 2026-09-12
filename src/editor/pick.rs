@@ -339,7 +339,103 @@ pub fn loop_points(doc: &Document, id: FillId) -> Option<Vec<Point2>> {
     if cursor? != doc.segment(f.segments[0])?.start {
         return None;
     }
-    Some(out)
+    // Effective outline, edge by edge: straight corners pass through,
+    // fillet arcs spliced into the loop sample their curve inline, and
+    // legacy unsubdivided corners substitute the evaluated arc. Every
+    // vertex is emitted exactly once (implicitly closed); order is
+    // load-bearing (marquee maps indices back to segments), so this only
+    // ever inserts samples between existing corners.
+    let n = out.len();
+    let mut effective = Vec::with_capacity(n + doc.modifiers.len() * 48);
+    for i in 0..n {
+        let p = out[i];
+        let q = out[(i + 1) % n];
+        // Case 1: a fillet arc spliced across this edge (either direction).
+        let span = doc.modifiers.iter().find_map(|m| {
+            let arc = m.arc?;
+            if !f.segments.contains(&arc) {
+                return None;
+            }
+            let (ta, tb, tc) = (
+                doc.point(m.first_tangent?)?,
+                doc.point(m.second_tangent?)?,
+                doc.point(m.control?)?,
+            );
+            if distance(p, ta) <= 1e-6 && distance(q, tb) <= 1e-6 {
+                Some((ta, tb, tc))
+            } else if distance(p, tb) <= 1e-6 && distance(q, ta) <= 1e-6 {
+                Some((tb, ta, tc))
+            } else {
+                None
+            }
+        });
+        if let Some((a, b, c)) = span {
+            effective.push(a);
+            let arc = crate::editor::arc::samples_through(a, b, c, 48);
+            effective.extend(arc.into_iter().skip(1));
+            continue;
+        }
+        // Case 2: legacy unsubdivided corner AT p (arc not in the loop).
+        let legacy = doc.modifiers.iter().find(|m| {
+            f.segments.contains(&m.first)
+                && f.segments.contains(&m.second)
+                && doc.point(m.corner) == Some(p)
+                && m.evaluate(doc).is_some()
+        });
+        if let Some(m) = legacy {
+            let Some(g) = m.evaluate(doc) else { effective.push(p); continue; };
+            if distance(p, g.corner) > 1e-6 { effective.push(p); continue; }
+            let prev = out[(i + n - 1) % n];
+            let next = q;
+            let d1 = distance(prev, g.first_tangent) + distance(next, g.second_tangent);
+            let d2 = distance(prev, g.second_tangent) + distance(next, g.first_tangent);
+            let (a, b) = if d1 <= d2 {
+                (g.first_tangent, g.second_tangent)
+            } else {
+                (g.second_tangent, g.first_tangent)
+            };
+            effective.push(a);
+            let arc = crate::editor::arc::samples_through(a, b, g.control, 48);
+            effective.extend(arc.into_iter().skip(1).take(47));
+            continue;
+        }
+        effective.push(p);
+    }
+    // Degenerate arcs (hairline radii, collapsed corners) emit runs of
+    // near-identical samples; collapse them so downstream edges have
+    // length. Point order is load-bearing (marquee maps indices back to
+    // segments), so this only removes, never reorders.
+    let mut clean: Vec<Point2> = Vec::with_capacity(effective.len());
+    for p in effective {
+        if clean.last().is_none_or(|&q| distance(p, q) > 1e-9) {
+            clean.push(p);
+        }
+    }
+    if clean.len() >= 3 && distance(clean[0], clean[clean.len() - 1]) <= 1e-9 {
+        clean.pop();
+    }
+    if clean.len() < 3 {
+        return None;
+    }
+    // Zero signed area means degenerate (collapsed) or self-cancelling
+    // (bowtie) winding — nothing sane to fill or hit-test. Every consumer
+    // already treats None as "broken loop" and skips.
+    if signed_area(&clean).abs() <= 1e-9 {
+        return None;
+    }
+    Some(clean)
+}
+
+/// Shoelace signed area (doc-unit², sign = winding). Used only as a
+/// degeneracy check — callers depend on loop order, so this never
+/// reorders.
+fn signed_area(pts: &[Point2]) -> f64 {
+    let mut s = 0.;
+    for i in 0..pts.len() {
+        let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
+        s += a.x * b.y - b.x * a.y;
+    }
+    s / 2.
 }
 
 /// Distance from p to the ab segment (clamped to the endpoints).

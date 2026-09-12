@@ -135,6 +135,15 @@ pub enum Primitive {
         w: f32,
         h: f32,
     },
+    // Solid color disk: round joins/caps for stroked polylines. Strokes
+    // paint as butt-jointed quads, which crack open at every tessellation
+    // joint once the weight gets thick — a disk per vertex fuses them.
+    Disk {
+        cx: f32,
+        cy: f32,
+        radius: f32,
+        color: gpui::Background,
+    },
     // White circle marking an editable/snapped point.
     Circle {
         cx: f32,
@@ -182,6 +191,7 @@ pub fn build_draw_list(
     tool: crate::editor::Tool,
     cursor_doc: Option<Point2>,
     cache: Option<&mut RenderCache>,
+    fillet_preview: Option<crate::editor::fillet::FilletPreview>,
 ) -> Vec<Primitive> {
     let min = camera.screen_to_unit(Point2::new(0., 0.));
     let max = camera.screen_to_unit(Point2::new(
@@ -265,7 +275,8 @@ pub fn build_draw_list(
                     // Standalone stroked lines (line tool output).
                     if seg.kind == SegmentKind::Line
                         && seg.stroke_width > 0.
-                        && let Some((a, b)) = doc.segment_geom(sid)
+                        && let Some((a, b)) = fillet_trimmed_line(doc, sid)
+                            .or_else(|| doc.segment_geom(sid))
                         && (visible.contains(a) || visible.contains(b))
                     {
                         let (ax, ay) = scr(a);
@@ -284,6 +295,17 @@ pub fn build_draw_list(
                     // smooth at any zoom). Incomplete arcs also show their
                     // dashed complementary portion.
                     if seg.kind == SegmentKind::Arc {
+                        // Fillet arcs resolve their stroke live from the
+                        // source edges (or paint nothing when unstroked)
+                        // instead of the unconditional arc stroke below.
+                        let fillet_style = doc
+                            .modifiers
+                            .iter()
+                            .find(|m| m.arc == Some(sid))
+                            .map(|m| source_stroke(doc, m.first, m.second));
+                        if matches!(fillet_style, Some(None)) {
+                            continue;
+                        }
                         let Some(sc) = seg.ctrl else { continue };
                         let (Some(sa), Some(sb), Some(scp)) =
                             (doc.point(seg.start), doc.point(seg.end), doc.point(sc))
@@ -308,11 +330,16 @@ pub fn build_draw_list(
                             continue;
                         };
                         if samples.iter().any(|p| visible.contains(*p)) {
-                            push_polyline(
-                                &mut list,
-                                &samples.iter().map(|p| scr(*p)).collect::<Vec<_>>(),
+                            let live = trimmed_samples(doc, sid, samples);
+                            let (w, col) = fillet_style.flatten().unwrap_or((
                                 1.5,
                                 rgba((seg.stroke_color << 8) | ((seg.opacity.clamp(0., 1.) * 255.) as u32)).into(),
+                            ));
+                            push_polyline(
+                                &mut list,
+                                &live.iter().map(|p| scr(*p)).collect::<Vec<_>>(),
+                                w,
+                                col,
                             );
                         }
                         // Dashed complement while incomplete — show whenever the
@@ -360,9 +387,10 @@ pub fn build_draw_list(
                             continue;
                         };
                         if samples.iter().any(|p| visible.contains(*p)) {
+                            let live = trimmed_samples(doc, sid, samples);
                             push_polyline(
                                 &mut list,
-                                &samples.iter().map(|p| scr(*p)).collect::<Vec<_>>(),
+                                &live.iter().map(|p| scr(*p)).collect::<Vec<_>>(),
                                 seg.stroke_width.max(1.) as f32,
                                 color,
                             );
@@ -407,6 +435,54 @@ pub fn build_draw_list(
                 _ => {}
             }
         }
+    }
+
+    // Fillets are derived geometry: linked arcs paint through the arc
+    // pass above (source-resolved style); this fallback only covers
+    // unlinkable modifiers, styled the same — never a default stroke.
+    for modifier in &doc.modifiers {
+        if modifier.arc.is_some() {
+            continue;
+        }
+        if let Some(g) = modifier.evaluate(doc)
+            && let Some((w, col)) = source_stroke(doc, modifier.first, modifier.second)
+        {
+            let n = crate::editor::arc::adaptive_samples(
+                g.first_tangent,
+                g.second_tangent,
+                g.control,
+                camera.zoom,
+            );
+            let pts = crate::editor::arc::samples_through(g.first_tangent, g.second_tangent, g.control, n);
+            push_polyline(&mut list, &pts.iter().map(|p| scr(*p)).collect::<Vec<_>>(), w, col);
+        }
+    }
+    // Fillet drag affordances: committed fillet centers always show while
+    // the Fillet tool is active, plus for any selected fillet arc (the
+    // radius-drag grab targets). Otherwise they stay hidden, as before.
+    let show_centers = tool == crate::editor::Tool::Fillet;
+    for m in &doc.modifiers {
+        let selected = m.arc.is_some_and(|a| selection.contains(&ElementRef::Segment(a)));
+        if !(show_centers || selected) {
+            continue;
+        }
+        if let Some(c) = m.center.and_then(|id| doc.point(id)) {
+            let (x, y) = scr(c);
+            list.push(Primitive::Circle { cx: x, cy: y, radius: 4. });
+        }
+    }
+    if let Some(preview) = fillet_preview {
+        let g = preview.geometry;
+        let n = crate::editor::arc::adaptive_samples(
+            g.first_tangent,
+            g.second_tangent,
+            g.control,
+            camera.zoom,
+        );
+        let pts = crate::editor::arc::samples_through(g.first_tangent, g.second_tangent, g.control, n);
+        push_polyline(&mut list, &pts.iter().map(|p| scr(*p)).collect::<Vec<_>>(), 2.2, accent);
+        let (x,y)=scr(g.center);
+        list.push(Primitive::Circle { cx:x, cy:y, radius:4. });
     }
 
     // 2) Dimension lines: extension stubs + parallel dashed dim line,
@@ -829,13 +905,19 @@ fn is_bezier_handle(doc: &Document, pid: crate::core::ids::PointId) -> bool {
     })
 }
 
-// Solid polyline (arc rendering).
+// Solid polyline (arc rendering) with round joins AND round caps: a
+// disk per vertex fuses the butt-jointed quads below, so thick strokes
+// never crack at tessellation joints and curves read round instead of
+// faceted. Zero-length runs collapse to a single disk, never NaNs.
 fn push_polyline(
     list: &mut Vec<Primitive>,
     pts: &[(f32, f32)],
     width: f32,
     color: gpui::Background,
 ) {
+    if pts.is_empty() {
+        return;
+    }
     for w in pts.windows(2) {
         list.push(Primitive::Line {
             ax: w[0].0,
@@ -845,6 +927,17 @@ fn push_polyline(
             width,
             color,
         });
+    }
+    let r = (width / 2.).max(0.5);
+    let mut prev: Option<(f32, f32)> = None;
+    for &p in pts {
+        // Skip degenerate repeats (a zero-length run still needs exactly
+        // one disk, emitted on its first occurrence).
+        if prev.is_some_and(|q| (p.0 - q.0).powi(2) + (p.1 - q.1).powi(2) < 1e-12) {
+            continue;
+        }
+        prev = Some(p);
+        list.push(Primitive::Disk { cx: p.0, cy: p.1, radius: r, color });
     }
 }
 
@@ -893,6 +986,130 @@ fn dashed_polyline(list: &mut Vec<Primitive>, pts: &[(f32, f32)], color: gpui::B
     }
 }
 
+/// Stroke style for a fillet, resolved live from its source edges: the
+/// first source with a real stroke wins (weight + color). None when no
+/// source is stroked — the fillet then paints nothing at all.
+fn source_stroke(
+    doc: &Document,
+    first: crate::core::ids::SegmentId,
+    second: crate::core::ids::SegmentId,
+) -> Option<(f32, gpui::Background)> {
+    for src in [first, second] {
+        if let Some(s) = doc.segment(src)
+            && s.stroke_width > 0.
+        {
+            return Some((
+                s.stroke_width as f32,
+                rgba((s.stroke_color << 8) | ((s.opacity.clamp(0., 1.) * 255.) as u32)).into(),
+            ));
+        }
+    }
+    None
+}
+
+/// Render span for a line feeding a fillet: far end to tangent point, so
+/// the sharp corner stub never sticks out past the arc. None when the
+/// segment isn't a filleted line or its ids don't resolve (draw full).
+fn fillet_trimmed_line(
+    doc: &Document,
+    sid: crate::core::ids::SegmentId,
+) -> Option<(Point2, Point2)> {
+    let seg = doc.segment(sid)?;
+    if seg.kind != SegmentKind::Line {
+        return None;
+    }
+    let m = doc
+        .modifiers
+        .iter()
+        .find(|m| m.first == sid || m.second == sid)?;
+    let tangent = doc.point(if m.first == sid {
+        m.first_tangent?
+    } else {
+        m.second_tangent?
+    })?;
+    let far_id = if seg.start == m.corner {
+        seg.end
+    } else if seg.end == m.corner {
+        seg.start
+    } else {
+        return None;
+    };
+    Some((doc.point(far_id)?, tangent))
+}
+
+/// Corner + tangent positions for a fillet source curve (arc/bezier),
+/// used to truncate the corner stub out of cached samples. Never matches
+/// the fillet arcs themselves.
+fn fillet_source_cut(
+    doc: &Document,
+    sid: crate::core::ids::SegmentId,
+) -> Option<(Point2, Point2)> {
+    let seg = doc.segment(sid)?;
+    if !matches!(seg.kind, SegmentKind::Arc | SegmentKind::Bezier) {
+        return None;
+    }
+    if doc.modifiers.iter().any(|m| m.arc == Some(sid)) {
+        return None;
+    }
+    let m = doc
+        .modifiers
+        .iter()
+        .find(|m| m.first == sid || m.second == sid)?;
+    let tangent = doc.point(if m.first == sid {
+        m.first_tangent?
+    } else {
+        m.second_tangent?
+    })?;
+    Some((doc.point(m.corner)?, tangent))
+}
+
+/// Sample range keeping a source curve's far-end side, dropping the
+/// corner stub past the tangent point. Falls back to full-span on any
+/// doubt (range < 2 kept, tangent coinciding with the corner end).
+fn trim_sample_range(pts: &[Point2], corner: Point2, tangent: Point2) -> Option<(usize, usize)> {
+    if pts.len() < 3 {
+        return None;
+    }
+    let near = |p: Point2| {
+        pts.iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                let da = (a.x - p.x).powi(2) + (a.y - p.y).powi(2);
+                let db = (b.x - p.x).powi(2) + (b.y - p.y).powi(2);
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    };
+    let (i_c, i_t) = (near(corner), near(tangent));
+    if i_c == i_t {
+        return None;
+    }
+    let (lo, hi) = if i_c < i_t {
+        (i_t, pts.len())
+    } else {
+        (0, i_t + 1)
+    };
+    if hi - lo < 2 {
+        return None;
+    }
+    Some((lo, hi))
+}
+
+/// Cached samples truncated to a fillet source's live span (far end to
+/// tangent), or the full sample set when the segment isn't a filleted
+/// source curve.
+fn trimmed_samples<'a>(
+    doc: &Document,
+    sid: crate::core::ids::SegmentId,
+    samples: &'a [Point2],
+) -> &'a [Point2] {
+    match fillet_source_cut(doc, sid).and_then(|(c, t)| trim_sample_range(samples, c, t)) {
+        Some((lo, hi)) => &samples[lo..hi.min(samples.len())],
+        None => samples,
+    }
+}
+
 // Accent outline overlay for one element.
 fn element_outline(
     doc: &Document,
@@ -929,15 +1146,17 @@ fn element_outline(
                 && seg.kind == SegmentKind::Arc
                 && let Some(samples) = cache.arc_samples(doc, sid, zoom)
             {
-                let pts: Vec<(f32, f32)> = samples.iter().map(|p| scr(*p)).collect();
+                let live = trimmed_samples(doc, sid, samples);
+                let pts: Vec<(f32, f32)> = live.iter().map(|p| scr(*p)).collect();
                 push_polyline(list, &pts, 2.5, accent);
             } else if let Some(seg) = doc.segment(sid)
                 && seg.kind == SegmentKind::Bezier
                 && let Some(samples) = cache.bezier_samples(doc, sid, zoom)
             {
-                let pts: Vec<(f32, f32)> = samples.iter().map(|p| scr(*p)).collect();
+                let live = trimmed_samples(doc, sid, samples);
+                let pts: Vec<(f32, f32)> = live.iter().map(|p| scr(*p)).collect();
                 push_polyline(list, &pts, 2.5, accent);
-            } else if let Some((a, b)) = doc.segment_geom(sid) {
+            } else if let Some((a, b)) = fillet_trimmed_line(doc, sid).or_else(|| doc.segment_geom(sid)) {
                 let (ax, ay) = scr(a);
                 let (bx, by) = scr(b);
                 list.push(Primitive::Line {

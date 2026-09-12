@@ -612,6 +612,7 @@ impl CanvasView {
                 ed.tool,
                 cursor_doc,
                 Some(&mut *ed.render_cache.borrow_mut()),
+                ed.fillet_preview,
             );
             (list, hitbox)
         };
@@ -697,6 +698,28 @@ impl CanvasView {
                             y: px(ay + ny) + oy,
                         });
                         window.paint_path(path, color);
+                    }
+                    paint::Primitive::Disk { cx: mcx, cy: mcy, radius, color } => {
+                        // Round join/cap dot in the stroke's own color,
+                        // painted as a fully-rounded quad (a disk).
+                        let r = px(radius);
+                        window.paint_quad(gpui::quad(
+                            Bounds {
+                                origin: Point {
+                                    x: px(mcx) - r + ox,
+                                    y: px(mcy) - r + oy,
+                                },
+                                size: Size {
+                                    width: r * 2.,
+                                    height: r * 2.,
+                                },
+                            },
+                            r,
+                            color,
+                            gpui::Edges::all(px(0.)),
+                            gpui::transparent_black(),
+                            gpui::BorderStyle::Solid,
+                        ));
                     }
                     paint::Primitive::Outline { x, y, w, h } => {
                         window.paint_quad(gpui::quad(

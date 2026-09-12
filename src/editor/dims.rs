@@ -381,6 +381,49 @@ pub fn update(ed: &mut Editor) {
         push_dim_target(ed, &d.target, d.offset, d.slide, d.value, text, Some(i), hovered, editing);
     }
 
+    // Transient radius readout while a dimension-less fillet is dragged:
+    // accent (blue) leader + container following the live radius. No dim
+    // index means no hitbox and no interactions — pure readout. Committed
+    // dims render through the stored loop above; provisional ones through
+    // the open input below.
+    if let Some(drag) = ed.fillet_radius_drag
+        && let Some(m) = ed.doc.modifiers.get(drag.modifier_index).copied()
+    {
+        let has_dim = m.arc.is_some_and(|arc| {
+            ed.doc.dimensions.iter().any(|d| {
+                matches!(
+                    d.target,
+                    crate::core::constraints::DimTarget::Radius { seg } if seg == arc
+                )
+            })
+        });
+        if !has_dim
+            && let Some(arc) = m.arc
+            && let Some((anchor, dest)) = fillet_leader(ed, arc, 0.5, 18.)
+        {
+            let sa = ed.camera.unit_to_screen(anchor);
+            let sd = ed.camera.unit_to_screen(dest);
+            ed.dim_renders.push(DimRender {
+                ax: sa.x as f32,
+                ay: sa.y as f32,
+                bx: sd.x as f32,
+                by: sd.y as f32,
+                lax: sa.x as f32,
+                lay: sa.y as f32,
+                lbx: sd.x as f32,
+                lby: sd.y as f32,
+                label_cx: sd.x as f32,
+                label_cy: sd.y as f32,
+                text: crate::ui::canvas::fmt_dim(m.radius),
+                extra_ext: Vec::new(),
+                constraint: false,
+                dim_index: None,
+                hovered: false,
+                editing: false,
+            });
+        }
+    }
+
     // Dimension tool: the frozen value-input state, then the live preview
     // following the cursor while a pick pair is assembled.
     if ed.tool == crate::editor::Tool::Dimension {
@@ -521,6 +564,44 @@ fn push_points_dim(
     r.hovered = hovered;
     r.editing = editing;
     ed.dim_renders.push(r);
+}
+
+/// Fillet-dim leader endpoints in doc units: anchor on the fillet edge
+/// (slide = angle fraction across the arc span, clamped to the edge) and
+/// container at the free radial offset. None when the arc isn't a linked
+/// fillet or its ids don't resolve.
+pub(crate) fn fillet_leader(
+    ed: &Editor,
+    seg: crate::core::ids::SegmentId,
+    slide: f64,
+    offset: f64,
+) -> Option<(Point2, Point2)> {
+    let m = ed.doc.modifiers.iter().find(|m| m.arc == Some(seg))?;
+    let (Some(t1), Some(t2), Some(o)) = (
+        m.first_tangent.and_then(|id| ed.doc.point(id)),
+        m.second_tangent.and_then(|id| ed.doc.point(id)),
+        m.center.and_then(|id| ed.doc.point(id)),
+    ) else {
+        return None;
+    };
+    let r = ((t1.x - o.x).powi(2) + (t1.y - o.y).powi(2)).sqrt();
+    if r < 1e-9 {
+        return None;
+    }
+    let a1 = (t1.y - o.y).atan2(t1.x - o.x);
+    let a2 = (t2.y - o.y).atan2(t2.x - o.x);
+    let a_ctrl = m.control.and_then(|id| ed.doc.point(id)).map(|c| {
+        (c.y - o.y).atan2(c.x - o.x)
+    })?;
+    let th = crate::editor::fillet::span_angle(a1, a2, a_ctrl, slide.clamp(0., 1.));
+    let (dx, dy) = (th.cos(), th.sin());
+    let anchor = Point2::new(o.x + dx * r, o.y + dy * r);
+    // Signed leader length: outside for positive, inside toward the
+    // center for negative (container reaches the center at -r). The
+    // container line's auto arrowheads ride both ends either way, so a
+    // dragged-through-zero container morphs outer↔inner continuously.
+    let lead = offset.max(-r);
+    Some((anchor, Point2::new(anchor.x + dx * lead, anchor.y + dy * lead)))
 }
 
 fn push_dim_target(
@@ -679,6 +760,37 @@ fn push_dim_target(
             });
         }
         DimTarget::Radius { seg } => {
+            // Fillet arcs get the dedicated leader layout: an arrow
+            // attached to the fillet edge itself (not the center), with
+            // the container riding a free radial offset. Slide picks the
+            // angle across the arc span (clamped to the edge); offset is
+            // the leader length in doc units.
+            if let Some((anchor, dest)) = fillet_leader(ed, *seg, slide, offset) {
+                let sa = ed.camera.unit_to_screen(anchor);
+                let sd = ed.camera.unit_to_screen(dest);
+                ed.dim_renders.push(DimRender {
+                    // Zero-length stubs: the container line IS the leader,
+                    // so its auto arrowheads land one on the fillet edge
+                    // (the attached arrow) and one at the container.
+                    ax: sa.x as f32,
+                    ay: sa.y as f32,
+                    bx: sd.x as f32,
+                    by: sd.y as f32,
+                    lax: sa.x as f32,
+                    lay: sa.y as f32,
+                    lbx: sd.x as f32,
+                    lby: sd.y as f32,
+                    label_cx: sd.x as f32,
+                    label_cy: sd.y as f32,
+                    text: text.unwrap_or_else(|| crate::ui::canvas::fmt_dim(value)),
+                    extra_ext: Vec::new(),
+                    constraint: true,
+                    dim_index,
+                    hovered,
+                    editing,
+                });
+                return;
+            }
             let Some(seg_d) = ed.doc.segment(*seg) else {
                 return;
             };
@@ -1279,7 +1391,9 @@ fn update_constraint_markers(ed: &mut Editor) {
             / indices.len() as f32;
         let base_y = indices.iter().map(|&i| ed.constraint_markers[i].cy_out).sum::<f32>()
             / indices.len() as f32;
-        let width = 22.0_f32;
+        // Chips render 22px wide (CHIP_SIZE + 4); pitch them at 30 so
+        // the row breathes instead of edge-touching.
+        let width = 30.0_f32;
         let start = base_x - width * (indices.len() as f32 - 1.0) / 2.0;
         for (row, &i) in indices.iter().enumerate() {
             ed.constraint_markers[i].cx_out = start + row as f32 * width;

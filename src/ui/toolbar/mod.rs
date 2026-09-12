@@ -150,6 +150,8 @@ impl RenderOnce for Toolbar {
             .child(divider(t))
             .child(self.tool_button(Tool::Pen, ICON_PEN, active_tool, t, cx))
             .child(self.tool_button(Tool::Rectangle, ICON_RECTANGLE, active_tool, t, cx))
+            .child(divider(t))
+            .child(self.tool_button(Tool::Fillet, ICON_CIRCLE, active_tool, t, cx))
     }
 }
 
@@ -284,6 +286,7 @@ fn tool_debug_name(tool: Tool) -> &'static str {
         Tool::Circle => "tool-circle",
         Tool::Ruler => "tool-ruler",
         Tool::Dimension => "tool-dimension",
+        Tool::Fillet => "tool-fillet",
         Tool::Pen => "tool-pen",
         Tool::ConstraintHorizontalVertical => "tool-constraint-hv",
         Tool::ConstraintTangent => "tool-constraint-tangent",
@@ -302,6 +305,7 @@ fn tool_tooltip(tool: Tool) -> (&'static str, &'static str) {
         Tool::Rectangle => ("Rectangle", "R"),
         Tool::Circle => ("Arc", "A"),
         Tool::Dimension => ("Dimension", "D"),
+        Tool::Fillet => ("Fillet", "F"),
         Tool::Pen => ("Pen", "P"),
         Tool::ConstraintHorizontalVertical => ("Horizontal / Vertical constraint", ""),
         Tool::ConstraintTangent => ("Tangent constraint", ""),

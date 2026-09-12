@@ -17,7 +17,7 @@ impl RenderOnce for Inspector {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let t = *crate::theme::active(cx);
         let Some(entity) = self.editor.upgrade() else { return div(); };
-        let (selected, bounds, segment, fill, constraints, color_picker_open, show_grid, snap_to_grid, snap_to_objects) = {
+        let (selected, bounds, segment, fill, constraints, modifiers, color_picker_open, show_grid, snap_to_grid, snap_to_objects) = {
             let ed = entity.read(cx);
             let selected = ed.selection.clone();
             let points = ed.doc.selection_points(&selected);
@@ -35,7 +35,8 @@ impl RenderOnce for Inspector {
                 DimTarget::PointLine { p, line } => points.contains(&p) || selected_segments.contains(&line),
                 DimTarget::Radius { seg } | DimTarget::CurveLength { seg } => selected_segments.contains(&seg),
             }).map(|(index, d)| (index, format!("Dimension · {:.2}", d.value))).collect::<Vec<_>>();
-            (selected, bounds, segment, fill, (constraints, dimensions), ed.color_picker_open, ed.show_grid, ed.snap_to_grid, ed.snap_to_objects)
+            let modifiers = ed.doc.modifiers.iter().enumerate().filter(|(_, m)| selected_segments.contains(&m.first) || selected_segments.contains(&m.second)).map(|(i,m)|(i,m.radius,m.side)).collect::<Vec<_>>();
+            (selected, bounds, segment, fill, (constraints, dimensions), modifiers, ed.color_picker_open, ed.show_grid, ed.snap_to_grid, ed.snap_to_objects)
         };
         if let Some(shell) = self.shell.upgrade() {
             let _ = shell.update(cx, |shell, _| {
@@ -55,6 +56,7 @@ impl RenderOnce for Inspector {
         } else {
             root = root.child(Self::section("Geometry", t, Self::geometry(&self.editor, t, bounds)))
                 .child(Self::section("Constraints", t, self.constraints(constraints, t)))
+                .child(Self::section("Modifiers", t, self.modifiers(modifiers, t)))
                 .child(Self::section("Appearance", t, Self::appearance(&self.editor, t, segment, fill, color_picker_open, cx)));
         }
         root
@@ -121,6 +123,48 @@ impl Inspector {
         if list.is_empty() && dimensions.is_empty() { body=body.child(div().text_xs().text_color(rgb(t.text_secondary)).child("No constraints attached")); }
         for c in list { let editor=self.editor.clone(); let x=c; body=body.child(Self::constraint_row(match x.kind {ConstraintKind::Coincident=>"Coincident",ConstraintKind::Horizontal=>"Horizontal",ConstraintKind::Vertical=>"Vertical",ConstraintKind::Tangent=>"Tangent",ConstraintKind::Parallel=>"Parallel",ConstraintKind::Perpendicular=>"Perpendicular"},format!("P{} · P{}",x.a.idx,x.b.idx),editor,move|ed,cx|ed.inspector_remove_constraint(x,cx),t)); }
         for (index, dimension) in dimensions { let editor=self.editor.clone(); body=body.child(Self::constraint_row("Dimension",dimension,editor,move|ed,cx|ed.inspector_remove_dimension(index,cx),t)); }
+        body
+    }
+
+    fn modifiers(&self, list: Vec<(usize, f64, crate::core::fillet::FilletSide)>, t: Theme) -> impl IntoElement {
+        let mut body = div().flex().flex_col().gap(px(3.)).px(px(10.));
+        if list.is_empty() { return body.child(div().text_xs().text_color(rgb(t.text_secondary)).child("No modifiers attached")); }
+        for (index, radius, side) in list {
+            let editor = self.editor.clone();
+            let editor_side = self.editor.clone();
+            let editor_del = self.editor.clone();
+            // The R value reopens the radius input (works on loaded
+            // fillets via the persisted arc id); the side chip flips the
+            // Inner/Outer wedge; × deletes.
+            body = body.child(
+                div().flex().items_center().justify_between().gap(px(8.)).h(px(28.)).px(px(7.))
+                    .rounded(px(8.)).bg(rgb(t.bg_tertiary)).border_1()
+                    .border_color(rgb(t.border_color)).shadow(vec![t.shadow_sm()])
+                    .child(
+                        div().flex().items_center().gap(px(6.))
+                            .child(div().text_xs().text_color(rgb(t.text_primary)).child("Fillet"))
+                            .child(
+                                div().text_xs().text_color(rgb(t.text_secondary)).cursor_pointer()
+                                    .child(format!("R {:.2}", radius))
+                                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                        cx.stop_propagation();
+                                        let _ = editor.update(cx, |ed, _| { ed.open_fillet_radius_input(index); });
+                                    }),
+                            )
+                            .child(
+                                div().text_xs().px(px(6.)).py(px(2.)).rounded(px(5.))
+                                    .bg(rgb(t.bg_primary)).border_1().border_color(rgb(t.component_border_color))
+                                    .text_color(rgb(t.text_secondary)).cursor_pointer()
+                                    .child(side.as_str())
+                                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                        cx.stop_propagation();
+                                        let _ = editor_side.update(cx, |ed, _| { ed.cycle_fillet_side(index); });
+                                    }),
+                            ),
+                    )
+                    .child(Self::delete_button(editor_del, move |ed, _| { ed.remove_modifier(index); }, t)),
+            );
+        }
         body
     }
 

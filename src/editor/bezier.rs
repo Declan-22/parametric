@@ -30,8 +30,8 @@ pub fn end_tangent(p0: Point2, c1: Point2, c2: Point2, p1: Point2, at_start: boo
 pub fn adaptive_samples(p0: Point2, c1: Point2, c2: Point2, p1: Point2, zoom: f64) -> usize {
     let poly = dist(p0, c1) + dist(c1, c2) + dist(c2, p1);
     let px = poly * zoom;
-    // ~1 sample per 4px, clamped for perf.
-    (px / 4.).ceil().clamp(8., 128.) as usize
+    // ~1 sample per 2px (round joins hide the rest); clamped for perf.
+    (px / 2.).ceil().clamp(8., 256.) as usize
 }
 
 pub fn samples(p0: Point2, c1: Point2, c2: Point2, p1: Point2, n: usize) -> Vec<Point2> {

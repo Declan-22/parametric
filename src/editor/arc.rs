@@ -222,7 +222,8 @@ pub fn snap_sweep(a: Point2, b: Point2, c: Point2) -> Option<Point2> {
 }
 
 /// Sample count so the polyline approximation's chord error stays under
-/// ~0.5 screen px regardless of zoom. `zoom` = camera zoom.
+/// ~0.25 screen px regardless of zoom (round joins cover the rest, but
+/// sparse chords still read as facets on big radii). `zoom` = camera zoom.
 pub fn adaptive_samples(a: Point2, b: Point2, c: Point2, zoom: f64) -> usize {
     let Some((o, r)) = circumcircle(a, b, c) else {
         return 8;
@@ -245,9 +246,9 @@ pub fn adaptive_samples(a: Point2, b: Point2, c: Point2, zoom: f64) -> usize {
     let s_neg = s_pos - TAU;
     let sweep = if norm(c0 - a0) <= s_pos + 1e-9 { s_pos } else { s_neg };
     let rs = r * zoom; // screen-space radius
-    // Sagitta per segment ≈ R·(θ/2)²/2; keeping it < 0.5px gives
-    // N > |sweep|·sqrt(R)/2.
-    let n = ((sweep.abs() * rs.sqrt()) / 2.0).ceil() as usize;
+    // Sagitta per segment ≈ R·(θ/2)²/2; keeping it < 0.25px gives
+    // N > |sweep|·sqrt(2R)/2.
+    let n = ((sweep.abs() * (2.0 * rs).sqrt()) / 2.0).ceil() as usize;
     // Keep tessellation bounded during extreme zoom or near-collinear arcs.
     // Beyond this point the curve is visually sub-pixel in practice, while
     // the allocation and paint cost continues to grow linearly.

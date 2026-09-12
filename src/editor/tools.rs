@@ -15,6 +15,7 @@ pub enum Tool {
     Circle,
     Ruler,
     Dimension,
+    Fillet,
     Pen,
     ConstraintHorizontalVertical,
     ConstraintTangent,

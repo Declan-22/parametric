@@ -169,6 +169,7 @@ impl RenderOnce for DesignCard {
                         crate::editor::Tool::Move,
                         None, // cursor_doc (no midpoint reveal in thumbnails)
                         None, // transient render cache
+                        None, // fillet preview
                     ),
                     None => Vec::new(),
                 }
@@ -230,6 +231,24 @@ impl RenderOnce for DesignCard {
                         path.line_to(Point { x: px(cx - radius) + ox, y: px(cy) + oy });
                         path.line_to(Point { x: px(cx) + ox, y: px(cy - radius) + oy });
                         window.paint_path(path, rgb(0x777777));
+                    }
+                    paint::Primitive::Disk { cx, cy, radius, color } => {
+                        // Round join/cap dot: octagon approximation reads
+                        // perfectly round at thumbnail scale.
+                        let r = radius;
+                        let mut path = gpui::Path::new(Point {
+                            x: px(cx + r) + ox,
+                            y: px(cy) + oy,
+                        });
+                        for k in 1..8 {
+                            let a = k as f32 * std::f32::consts::FRAC_PI_4;
+                            path.line_to(Point {
+                                x: px(cx + r * a.cos()) + ox,
+                                y: px(cy + r * a.sin()) + oy,
+                            });
+                        }
+                        path.line_to(Point { x: px(cx + r) + ox, y: px(cy) + oy });
+                        window.paint_path(path, color);
                     }
                     // Selection-only geometry is intentionally omitted from
                     // gallery previews.

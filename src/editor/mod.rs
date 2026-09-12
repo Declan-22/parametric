@@ -3,7 +3,9 @@ pub mod bezier;
 mod clipboard;
 mod camera;
 pub mod dims;
+pub mod fillet;
 pub mod grid;
+pub mod overconstraint;
 pub mod pick;
 pub mod ruler;
 mod snapping;
@@ -41,6 +43,77 @@ use crate::core::ids::{FillId, PointId, SegmentId};
 pub struct Size {
     pub w: f64,
     pub h: f64,
+}
+
+/// A non-blocking UI notice produced by the editor (over-constraint
+/// rejections today, anything tomorrow). Shell drains `toast_requests`
+/// into the reusable toast stack — same component, same animations.
+#[derive(Clone, Debug)]
+pub struct ToastRequest {
+    /// Short bold headline, e.g. "Can't add Horizontal".
+    pub title: String,
+    /// One short summary sentence (the "why").
+    pub body: String,
+    /// One short fix sentence (the "what to do"), rendered muted below
+    /// the blocker chips.
+    pub hint: String,
+    /// The exact existing locks blocking the attempt, rendered as icon
+    /// chips so they scan at a glance instead of hiding in a sentence.
+    pub blocks: Vec<BlockChip>,
+    /// True = error styling + longer dwell; false = plain info.
+    pub error: bool,
+}
+
+/// Which lock a blocker chip names (drives the chip icon in the toast
+/// card; the editor itself stays free of UI assets).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockKind {
+    Horizontal,
+    Vertical,
+    Coincident,
+    Tangent,
+    Parallel,
+    Perpendicular,
+    Dimension,
+}
+
+/// One blocking lock: its kind (icon) plus a compact label.
+#[derive(Clone, Debug)]
+pub struct BlockChip {
+    pub kind: LockKind,
+    pub label: String,
+}
+
+impl ToastRequest {
+    pub fn error(
+        title: impl Into<String>,
+        body: impl Into<String>,
+        hint: impl Into<String>,
+        blocks: Vec<BlockChip>,
+    ) -> Self {
+        Self {
+            title: title.into(),
+            body: body.into(),
+            hint: hint.into(),
+            blocks,
+            error: true,
+        }
+    }
+
+    pub fn info(
+        title: impl Into<String>,
+        body: impl Into<String>,
+        hint: impl Into<String>,
+        blocks: Vec<BlockChip>,
+    ) -> Self {
+        Self {
+            title: title.into(),
+            body: body.into(),
+            hint: hint.into(),
+            blocks,
+            error: false,
+        }
+    }
 }
 
 // An active drag: `points` are the dragged slots (gesture-start positions;
@@ -104,6 +177,16 @@ pub struct Editor {
     // committed.
     pub constraint_picks: Vec<ElementRef>,
     pub constraint_point_picks: Vec<PointId>,
+    pub fillet_picks: Vec<SegmentId>,
+    pub fillet_preview: Option<fillet::FilletPreview>,
+    // Live fillet radius-drag gesture (grabbed center, radius free).
+    pub fillet_radius_drag: Option<fillet::FilletRadiusDrag>,
+    // Live fillet corner-drag gesture (grabbed center with a committed
+    // radius dimension: resizes from the adjacent edges instead).
+    pub fillet_corner_drag: Option<fillet::FilletCornerDrag>,
+    // Staged fillet handle press, pre-click-threshold (converts to a
+    // gesture on real movement; clean release emulates the click).
+    pub fillet_press: Option<fillet::FilletPress>,
     // Selected constraint chips (identity = the Constraint value).
     pub selected_constraints: Vec<crate::core::constraints::Constraint>,
     pub hover: Option<ElementRef>,
@@ -180,8 +263,11 @@ pub struct Editor {
     pub dim_drag: Option<DimDrag>,
     // Caret blink for the dimension value input.
     pub dim_caret_visible: bool,
-    // Over-constrained modal: set when a dimension placement is infeasible.
-    pub overconstrained: bool,
+    // Non-blocking notices for the Shell toast stack (replaces the old
+    // over-constrained modal). The editor pushes structured requests;
+    // Shell drains them into `Shell::push_toast` each frame so the same
+    // component serves over-constraints and every future notice.
+    pub toast_requests: Vec<ToastRequest>,
     // Arc centers currently revealed (cursor inside the arc's disk).
     // Drives repaint detection: cursor moves that change nothing else must
     // still repaint when the reveal set changes, or the dot sticks around
@@ -240,6 +326,11 @@ impl Editor {
             color_picker_open: false,
             constraint_picks: Vec::new(),
             constraint_point_picks: Vec::new(),
+            fillet_picks: Vec::new(),
+            fillet_preview: None,
+            fillet_radius_drag: None,
+            fillet_corner_drag: None,
+            fillet_press: None,
             selected_constraints: Vec::new(),
             hover: None,
             marquee: None,
@@ -276,7 +367,7 @@ impl Editor {
             selected_dim: None,
             dim_drag: None,
             dim_caret_visible: true,
-            overconstrained: false,
+            toast_requests: Vec::new(),
             arc_center_reveal: Vec::new(),
         }
     }
@@ -302,15 +393,20 @@ impl Editor {
         self.selection.clear();
         self.constraint_picks.clear();
         self.constraint_point_picks.clear();
+        self.fillet_picks.clear();
+        self.fillet_preview = None;
+        self.fillet_radius_drag = None;
+        self.fillet_corner_drag = None;
+        self.fillet_press = None;
         self.selected_constraints.clear();
         self.marquee = None;
         self.group_drag_last = None;
         self.dragging = None;
         // Dimension tool picks + value input reset on every tool switch.
+        // Toasts intentionally persist across switches (non-modal).
         self.dim_picks.clear();
         self.dim_target = None;
         self.dim_input = None;
-        self.overconstrained = false;
         true
     }
 
@@ -1101,6 +1197,15 @@ impl Editor {
                     self.flush_pending_history();
                 } else {
                     self.gesture_snapshot = None;
+                    let (summary, hint) = overconstraint::hv_detail(
+                        &self.doc,
+                        pa,
+                        pb,
+                        k == ConstraintKind::Horizontal,
+                    );
+                    self.toast_requests.push(overconstraint::explain_constraint(
+                        &self.doc, k, pa, pb, summary, hint,
+                    ));
                 }
                 ok
             }
@@ -1118,6 +1223,15 @@ impl Editor {
                     self.flush_pending_history();
                 } else {
                     self.gesture_snapshot = None;
+                    let (summary, hint) = overconstraint::coincident_detail(&self.doc, a, b);
+                    self.toast_requests.push(overconstraint::explain_constraint(
+                        &self.doc,
+                        ConstraintKind::Coincident,
+                        a,
+                        b,
+                        summary,
+                        hint,
+                    ));
                 }
                 ok
             }
@@ -1178,6 +1292,18 @@ impl Editor {
                         self.flush_pending_history();
                     } else {
                         self.gesture_snapshot = None;
+                        let (summary, hint) =
+                            overconstraint::line_pair_detail(&self.doc, a, b, true);
+                        if let Some(sa) = self.doc.segment(a) {
+                            self.toast_requests.push(overconstraint::explain_constraint(
+                                &self.doc,
+                                ConstraintKind::Tangent,
+                                sa.start,
+                                sa.end,
+                                summary,
+                                hint,
+                            ));
+                        }
                     }
                     return ok;
                 }
@@ -1190,6 +1316,16 @@ impl Editor {
                     self.flush_pending_history();
                 } else {
                     self.gesture_snapshot = None;
+                    if let Some(lseg) = self.doc.segment(line) {
+                        self.toast_requests.push(overconstraint::explain_constraint(
+                            &self.doc,
+                            ConstraintKind::Tangent,
+                            lseg.start,
+                            contact,
+                            "The line can't swing tangent without breaking a lock.".to_string(),
+                            "Relax the H/V lock or dimension first.".to_string(),
+                        ));
+                    }
                 }
                 ok
             }
@@ -1219,6 +1355,22 @@ impl Editor {
                     self.flush_pending_history();
                 } else {
                     self.gesture_snapshot = None;
+                    let (summary, hint) = overconstraint::line_pair_detail(
+                        &self.doc,
+                        a,
+                        b,
+                        kind == ConstraintKind::Parallel,
+                    );
+                    if let Some(sa) = self.doc.segment(a) {
+                        self.toast_requests.push(overconstraint::explain_constraint(
+                            &self.doc,
+                            kind,
+                            sa.start,
+                            sa.end,
+                            summary,
+                            hint,
+                        ));
+                    }
                 }
                 ok
             }
@@ -1414,6 +1566,19 @@ impl Editor {
                         self.selected_constraints.push(c);
                     }
                     return true;
+                }
+                // Fillet center/tangent press: stage it (don't convert yet).
+                // A real drag converts past the click threshold; a clean
+                // release emulates the consumed click instead. Staging
+                // (rather than grabbing immediately) keeps fill selects,
+                // edge selects, and marquees working near handles.
+                if matches!(self.tool, Tool::Move | Tool::Fillet) {
+                    let at = self.cursor_doc(cursor);
+                    if let Some(index) = self.fillet_handle_at(at) {
+                        self.fillet_press =
+                            Some(fillet::FilletPress { modifier_index: index, down: at });
+                        return true;
+                    }
                 }
                 if self.is_constraint_tool() {
                     return self.constraint_tool_click(cursor);
@@ -1651,6 +1816,7 @@ impl Editor {
                     }
                     false
                 }
+                Tool::Fillet => self.fillet_click(cursor),
                 Tool::Pen => self.pen_tool_click(cursor, shift),
                 // Constraint tools are handled before this mode match so
                 // their clicks never enter shape/dimension creation. Keep an
@@ -2573,9 +2739,39 @@ impl Editor {
                 } else if let (ElementRef::Segment(sid), false) =
                     (&el, self.selection.len() > 1 && self.element_selected(el))
                 {
-                    // SOLO segment -> edge-stretch / translation.
+                    // SOLO segment -> edge-stretch / translation (filleted
+                    // edges included: the follower completion + refresh
+                    // keep the fillet riding along).
                     let seg = self.doc.segment(*sid);
                     if seg.is_some_and(|s| s.kind == crate::core::document::SegmentKind::Arc) {
+                        // Fillet arcs are derived geometry, never kinematic
+                        // bodies: with the value input still open the drag
+                        // drives its number (radius resize); otherwise the
+                        // whole corner moves like a corner-point drag
+                        // (dim or not — free fillets ride at stored radius).
+                        if let Some(index) = self
+                            .doc
+                            .modifiers
+                            .iter()
+                            .position(|m| m.arc == Some(*sid))
+                        {
+                            let provisional = self.doc.modifiers[index]
+                                .arc
+                                .and_then(|arc| {
+                                    self.doc.dimensions.iter().enumerate().find(|(_, d)| {
+                                        matches!(d.target, DimTarget::Radius { seg } if seg == arc)
+                                    })
+                                })
+                                .is_some_and(|(idx, _)| {
+                                    self.dim_input
+                                        .as_ref()
+                                        .is_some_and(|input| input.existing == Some(idx))
+                                });
+                            if provisional {
+                                return self.route_fillet_grab(index, p);
+                            }
+                            return self.begin_fillet_corner_drag(index, p);
+                        }
                         let s = seg.unwrap();
                         let mut ids = vec![s.start, s.end];
                         if let Some(c) = s.ctrl {
@@ -2604,9 +2800,29 @@ impl Editor {
                             .collect();
                         (drag, Vec::new())
                     } else {
-                        let ends: Vec<PointId> = seg
+                        let mut ends: Vec<PointId> = seg
                             .map(|s| vec![s.start, s.end])
                             .unwrap_or_default();
+                        // Fillet source edge: the tangent endpoint is
+                        // fillet-owned (refresh re-derives it from the
+                        // corner + radius every frame), so only the far
+                        // end drives. Dragging both rigidly fights the
+                        // refresh and jitters. Legacy (unsubdivided)
+                        // tangent points aren't endpoints — untouched.
+                        if let Some(m) = self.doc.modifiers.iter().find(|m| {
+                            m.first == *sid || m.second == *sid
+                        }) {
+                            let tangent_ends: Vec<PointId> = [
+                                m.first_tangent,
+                                m.second_tangent,
+                            ]
+                            .into_iter()
+                            .flatten()
+                            .collect();
+                            if ends.iter().any(|e| tangent_ends.contains(e)) {
+                                ends.retain(|e| !tangent_ends.contains(e));
+                            }
+                        }
                         let drag = ends
                             .iter()
                             .filter_map(|&pid| self.doc.point(pid).map(|pos| (pid, pos)))
@@ -2614,6 +2830,14 @@ impl Editor {
                         (drag, Vec::new())
                     }
                 } else {
+                    // Group/region drags chase every selected point rigidly,
+                    // fillet derived points included: excluding them strands
+                    // linking constraints (a dragged neighbor chases while
+                    // the tangent point is anchored → unsatisfiable →
+                    // frozen whole-object moves). Direct tangent grabs never
+                    // reach here anyway (press-time routing turns them into
+                    // fillet gestures); refresh confirms rigid translations
+                    // exactly, so nothing fights.
                     let pts = self.doc.selection_points(&self.selection);
                     let drag = pts
                         .iter()
@@ -2621,6 +2845,21 @@ impl Editor {
                         .collect();
                     (drag, Vec::new())
                 };
+                // A fillet radius input left open from placement would sit
+                // editing-highlighted over every subsequent drag — commit
+                // it implicitly (values are already stored) by closing it
+                // when a geometry drag starts. Fillet gestures manage
+                // their own input state and never reach here.
+                let stale_fillet_input = self.dim_input.as_ref().is_some_and(|input| {
+                    matches!(input.target, DimTarget::Radius { seg } if self
+                        .doc
+                        .modifiers
+                        .iter()
+                        .any(|m| m.arc == Some(seg)))
+                });
+                if stale_fillet_input {
+                    self.dim_input = None;
+                }
                 // Arc body grabs scale about the fixed center (kinematic);
                 // everything else takes the solver path.
                 let arc_body_scale = match el {
@@ -2689,6 +2928,32 @@ impl Editor {
                     self.dim_drag_update(idx, cursor);
                 }
             }
+            return true;
+        }
+        // Staged fillet-handle press: hold for a click, convert to the
+        // routed gesture past the click threshold (then fall through to
+        // the radius/corner blocks below in the same frame).
+        if let Some(press) = self.fillet_press {
+            let cur = self.cursor_doc(cursor);
+            if pick::distance(cur, press.down) * self.camera.zoom <= 3. {
+                return true;
+            }
+            self.fillet_press = None;
+            self.route_fillet_grab(press.modifier_index, press.down);
+        }
+        // Fillet radius drag: cursor displacement from the grab resizes
+        // the grabbed fillet. Consumed while active so no other gesture
+        // path acts on the stale press.
+        if self.fillet_radius_drag.is_some() {
+            let cur = self.cursor_doc(cursor);
+            self.update_fillet_radius_drag(cur);
+            return true;
+        }
+        // Fillet corner drag: both tangent points chase the cursor
+        // (locked-radius resize from the adjacent edges).
+        if self.fillet_corner_drag.is_some() {
+            let cur = self.cursor_doc(cursor);
+            self.update_fillet_corner_drag(cur);
             return true;
         }
 
@@ -2773,6 +3038,7 @@ impl Editor {
         }
 
         changed |= self.solve_drag(shift);
+        self.refresh_fillets();
         changed |= self.post_handle_drag(shift);
         changed
     }
@@ -3033,6 +3299,18 @@ impl Editor {
         let mut proposals: Vec<(PointId, f64, f64, Vec<SnapGuide>)> = Vec::new();
         if !self.alt_down && (self.snap_to_objects || self.snap_to_grid) {
             for &(pid, start) in &drag.points {
+                // Fillet derived points never vote: their positions are
+                // re-derived every frame, so their snap proposals would
+                // yank the whole rigid consensus in jumps.
+                let derived = self.doc.modifiers.iter().any(|m| {
+                    Some(pid) == m.first_tangent
+                        || Some(pid) == m.second_tangent
+                        || Some(pid) == m.center
+                        || Some(pid) == m.control
+                });
+                if derived {
+                    continue;
+                }
                 let target = Point2::new(start.x + delta.x, start.y + delta.y);
                 let (adj, guides) = snapping::best(
                     &self.doc,
@@ -3140,11 +3418,18 @@ impl Editor {
                 }
                 let Some((first_id, second_id)) = constraint.tangent_segments else { continue };
                 let (Some(first), Some(second)) = (self.doc.segment(first_id), self.doc.segment(second_id)) else { continue };
-                let (line, curve) = match (first.kind, second.kind) {
-                    (crate::core::document::SegmentKind::Line, crate::core::document::SegmentKind::Arc) => (first, second),
-                    (crate::core::document::SegmentKind::Arc, crate::core::document::SegmentKind::Line) => (second, first),
+                let (line, curve, curve_id) = match (first.kind, second.kind) {
+                    (crate::core::document::SegmentKind::Line, crate::core::document::SegmentKind::Arc) => (first, second, second_id),
+                    (crate::core::document::SegmentKind::Arc, crate::core::document::SegmentKind::Line) => (second, first, first_id),
                     _ => continue,
                 };
+                // Fillet contacts slide by definition (tangent points ride
+                // their edges as the radius changes) — pinning the arc
+                // here would freeze edge-stretch and group drags touching
+                // filleted geometry. The solver + refresh keep it exact.
+                if self.doc.modifiers.iter().any(|m| m.arc == Some(curve_id)) {
+                    continue;
+                }
                 let Some(ctrl) = curve.ctrl else { continue };
                 let arc_ids = [curve.start, curve.end, ctrl, curve.center.unwrap_or(curve.start)];
                 let line_ids = [line.start, line.end];
@@ -3160,6 +3445,126 @@ impl Editor {
                     {
                         tangent_arc_pins.push((pid, pos));
                     }
+                }
+            }
+        }
+
+        // Transitive follower closure: every point reachable from the
+        // drag set through constraints (pairs, tangent owners,
+        // point-on-segment edges) and arc construction slots follows
+        // softly. The single-hop ring above leaves two-hops-away points
+        // (opposite rectangle corners, fillet tangent contacts) hard-pinned
+        // at canvas positions, freezing corner drags and making edge
+        // drags fight. Soft anchors still regularize (minimal motion);
+        // constraints dominate. Dragged and hard-pinned ids are never
+        // double-entered as followers.
+        {
+            let mut seen: Vec<PointId> = dragged
+                .iter()
+                .copied()
+                .chain(aux_all.iter().map(|&(id, _)| id))
+                .collect();
+            let mut stack = seen.clone();
+            while let Some(pid) = stack.pop() {
+                // Constraint relations.
+                for c in &self.doc.constraints {
+                    if c.a == pid || c.b == pid {
+                        for q in [c.a, c.b] {
+                            if !seen.contains(&q) && self.doc.point(q).is_some() {
+                                seen.push(q);
+                                stack.push(q);
+                            }
+                        }
+                    }
+                    if let Some(segment_id) = c.point_on_segment
+                        && let Some(seg) = self.doc.segment(segment_id)
+                    {
+                        let touches = seg.start == pid
+                            || seg.end == pid
+                            || seg.ctrl == Some(pid)
+                            || seg.center == Some(pid);
+                        if touches {
+                            for q in [Some(seg.start), Some(seg.end), seg.ctrl, seg.center]
+                                .into_iter()
+                                .flatten()
+                                .chain([c.a, c.b])
+                            {
+                                if !seen.contains(&q) && self.doc.point(q).is_some() {
+                                    seen.push(q);
+                                    stack.push(q);
+                                }
+                            }
+                        }
+                    }
+                    if c.kind == ConstraintKind::Tangent
+                        || c.kind == ConstraintKind::Parallel
+                        || c.kind == ConstraintKind::Perpendicular
+                    {
+                        if let Some((first, second)) = c.tangent_segments
+                            && let (Some(a_seg), Some(b_seg)) =
+                                (self.doc.segment(first), self.doc.segment(second))
+                        {
+                            let ends = [
+                                a_seg.start,
+                                a_seg.end,
+                                b_seg.start,
+                                b_seg.end,
+                            ];
+                            if ends.contains(&pid)
+                                || c.a == pid
+                                || c.b == pid
+                                || a_seg.ctrl == Some(pid)
+                                || a_seg.center == Some(pid)
+                                || b_seg.ctrl == Some(pid)
+                                || b_seg.center == Some(pid)
+                            {
+                                for q in ends
+                                    .into_iter()
+                                    .chain([c.a, c.b])
+                                    .chain(
+                                        [a_seg.ctrl, a_seg.center, b_seg.ctrl, b_seg.center]
+                                            .into_iter()
+                                            .flatten(),
+                                    )
+                                {
+                                    if !seen.contains(&q) && self.doc.point(q).is_some() {
+                                        seen.push(q);
+                                        stack.push(q);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Arc construction slots: an arc's four defining points
+                // move as one follower set.
+                for (_, s) in self.doc.all_segments() {
+                    if s.start == pid
+                        || s.end == pid
+                        || s.ctrl == Some(pid)
+                        || s.center == Some(pid)
+                    {
+                        for q in [Some(s.start), Some(s.end), s.ctrl, s.center]
+                            .into_iter()
+                            .flatten()
+                        {
+                            if !seen.contains(&q) && self.doc.point(q).is_some() {
+                                seen.push(q);
+                                stack.push(q);
+                            }
+                        }
+                    }
+                }
+            }
+            for pid in seen {
+                if dragged.contains(&pid)
+                    || aux_all.iter().any(|&(id, _)| id == pid)
+                    || tangent_arc_pins.iter().any(|(id, _)| *id == pid)
+                {
+                    continue;
+                }
+                if let Some(pos) = self.doc.point(pid) {
+                    aux_all.push((pid, pos));
                 }
             }
         }
@@ -3216,6 +3621,11 @@ impl Editor {
                 1.0,
             ),
         };
+        // Live drags never solve fillet internals (refresh re-seats them
+        // exactly after every commit); the stiff derived equations would
+        // otherwise freeze drags touching filleted geometry.
+        let mut solver = solver;
+        solver.strip_fillet_equations(&self.doc);
         let solution = solver.solve();
         // A live drag may request an impossible step, but applying a partial
         // LM iterate would visibly break a locked constraint. Keep the last
@@ -3344,9 +3754,15 @@ impl Editor {
 
         let drag_ids: Vec<PointId> = drag.points.iter().map(|&(id, _)| id).collect();
         // Exactly one arc touched, else legacy (e.g. shared vertices).
+        // Fillet arcs never lead kinematically: they are derived
+        // geometry (refresh re-seats them every frame), so a kinematic
+        // plan would fight the refresh and warp.
         let mut arc_sid = None;
         for (sid, s) in self.doc.all_segments() {
             if s.kind != SegmentKind::Arc {
+                continue;
+            }
+            if self.doc.modifiers.iter().any(|m| m.arc == Some(sid)) {
                 continue;
             }
             let mut defs = vec![s.start, s.end];
@@ -3606,8 +4022,12 @@ impl Editor {
         drag_points: &[(PointId, Point2)],
         out: &mut Point2,
     ) -> bool {
-        for (_, s) in self.doc.all_segments() {
+        for (sid, s) in self.doc.all_segments() {
             if s.kind != crate::core::document::SegmentKind::Arc {
+                continue;
+            }
+            // Fillet arcs never spin kinematically (derived geometry).
+            if self.doc.modifiers.iter().any(|m| m.arc == Some(sid)) {
                 continue;
             }
             let Some(ctrl_id) = s.ctrl else { continue };
@@ -3865,6 +4285,18 @@ impl Editor {
                 .and_then(|element| self.normalize_constraint_hit(element));
             let changed = self.hover != picked;
             self.hover = picked;
+            return changed;
+        }
+        // Fillet tool: hovering highlights pickable edges/points exactly
+        // like the Dimension tool does, and additionally refreshes the
+        // fillet preview.
+        if self.tool == Tool::Fillet {
+            if self.dragging.is_some() || self.pan_start.is_some() { return false; }
+            let picked = pick::Picker::new(&self.doc, &self.camera, HANDLE_TOL_PX)
+                .element(self.cursor_doc(cursor));
+            let mut changed = self.hover != picked;
+            self.hover = picked;
+            changed |= self.update_fillet_preview(cursor);
             return changed;
         }
         if self.tool != Tool::Move || self.dragging.is_some() || self.pan_start.is_some() {
@@ -4683,6 +5115,20 @@ impl Editor {
                 self.dim_target = None;
                 let applied = match input.existing {
                     Some(idx) => {
+                        if let DimTarget::Radius { seg } = input.target
+                            && let Some((applied, dim_idx)) = self.update_fillet_radius(seg, value)
+                        {
+                            // Write only the update-resolved row: the input's
+                            // index may be stale if its dimension was deleted
+                            // mid-edit, and must never corrupt another row.
+                            if let Some(i) = dim_idx {
+                                if let Some(dim) = self.doc.dimensions.get_mut(i) {
+                                    dim.value = applied;
+                                }
+                            }
+                            self.doc_gen += 1;
+                            return true;
+                        }
                         if let Some(dim) = self.doc.dimensions.get_mut(idx) {
                             dim.value = value;
                             if is_angle {
@@ -4714,7 +5160,9 @@ impl Editor {
                 if let (Some(idx), Some(old)) = (input.existing, old_existing_value) {
                     if let Some(dim) = self.doc.dimensions.get_mut(idx) { dim.value = old; }
                 }
-                self.overconstrained = true;
+                // The rejection toast was already queued by
+                // `solve_and_apply`; keep the input alive so the user can
+                // correct the number or cancel with Esc.
                 self.dim_input = Some(input);
                 true
             }
@@ -4750,12 +5198,13 @@ impl Editor {
     /// Pushes a new dimension and immediately enforces it: the constraint
     /// component owning the referenced geometry is freed (soft-anchored at
     /// its current positions) and the solver stretches it minimally to
-    /// satisfy the new equation. Infeasible (over-constrained) placements
-    /// show the modal and leave the document untouched.
+    /// satisfy the new equation. Infeasible placements queue a toast
+    /// explaining the exact conflict and leave the document untouched.
     fn try_apply_dimension(&mut self, dim: crate::core::constraints::Dimension) -> bool {
+        let value = dim.value;
         let mut trial = self.doc.clone();
         trial.dimensions.push(dim);
-        self.solve_and_apply(trial, dim.target)
+        self.solve_and_apply(trial, dim.target, value)
     }
 
     /// Re-solves after an EDITED dimension value on the stored dimension
@@ -4763,16 +5212,18 @@ impl Editor {
     fn reapply_dimension(&mut self, idx: usize) -> bool {
         let trial = self.doc.clone();
         let target = trial.dimensions[idx].target;
-        self.solve_and_apply(trial, target)
+        let value = trial.dimensions[idx].value;
+        self.solve_and_apply(trial, target, value)
     }
 
     /// Runs the trial solve for `trial` (which already carries the dimension
     /// under test). On success the solved document replaces the live one;
-    /// on failure the over-constrained modal comes up and nothing changes.
+    /// on failure an explanatory toast is queued and nothing changes.
     fn solve_and_apply(
         &mut self,
         mut trial: crate::core::document::Document,
         target: crate::core::constraints::DimTarget,
+        attempted: f64,
     ) -> bool {
         // Free set: everything transitively connected to the dimension's
         // geometry through segments and constraints — soft-anchored at
@@ -4901,7 +5352,8 @@ impl Editor {
             || solution.max_angle_residual > 1e-5
             || (!direct_distance && solution.max_lin_residual > 1e-3)
         {
-            self.overconstrained = true;
+            self.toast_requests
+                .push(overconstraint::explain_dimension(&self.doc, target, attempted));
             return false;
         }
         self.history_begin();
@@ -5363,6 +5815,15 @@ impl Editor {
                  arc.unwrap_or(crate::core::ids::SegmentId { idx: u32::MAX, generation: 0 }))
             });
             let (Some(line), Some(arc)) = (self.doc.segment(line_id), self.doc.segment(arc_id)) else { continue; };
+            // Fillet-adjacent tangency is owned end-to-end by the solver
+            // equations plus refresh_fillets: rotating the line here would
+            // fight H/V locks and read as slant on constrained sketches.
+            // (Either side being fillet-linked is enough to skip.)
+            if self.doc.modifiers.iter().any(|m| {
+                m.arc == Some(arc_id) || m.first == line_id || m.second == line_id
+            }) {
+                continue;
+            }
             let (Some(a), Some(b), Some(ctrl)) = (
                 self.doc.point(arc.start), self.doc.point(arc.end),
                 arc.ctrl.and_then(|id| self.doc.point(id))) else { continue; };
@@ -5508,6 +5969,11 @@ impl Editor {
                 }
             }
             DimTarget::Radius { seg } => {
+                // Fillet arcs use the dedicated leader layout (slide rides
+                // the arc span, offset is the free leader length).
+                if self.update_fillet_dim_placement(seg, cur) {
+                    return;
+                }
                 // Container slides along a center->arc ray. The legacy bend
                 // point only recovers the arc's sweep branch.
                 let Some(seg_d) = self.doc.segment(seg) else {
@@ -5607,6 +6073,35 @@ impl Editor {
             self.flush_pending_history();
             if !drag.moved && drag.was_selected {
                 self.begin_dim_edit(drag.index);
+            }
+            return true;
+        }
+        // Fillet radius-drag release: promote the gesture snapshot (one
+        // undo step for the whole drag).
+        if self.fillet_radius_drag.take().is_some() {
+            self.flush_pending_history();
+            return true;
+        }
+        // Fillet corner-drag release: same single-undo-step promotion.
+        if self.fillet_corner_drag.take().is_some() {
+            self.flush_pending_history();
+            return true;
+        }
+        // Staged fillet-handle press released clean: emulate the click
+        // the staging consumed (single-click select semantics; no
+        // double-click escalation without a count at release).
+        if let Some(press) = self.fillet_press.take() {
+            let picker = pick::Picker::new(&self.doc, &self.camera, HANDLE_TOL_PX);
+            if let Some(el) = picker.element(press.down) {
+                if !self.element_selected(el) {
+                    if self.marquee_add {
+                        self.selection.push(el);
+                    } else {
+                        self.selection = vec![el];
+                    }
+                }
+            } else if !self.marquee_add {
+                self.selection.clear();
             }
             return true;
         }

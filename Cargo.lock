@@ -3631,6 +3631,7 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "rusqlite",
+ "smallvec",
 ]
 
 [[package]]

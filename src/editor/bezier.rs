@@ -30,12 +30,35 @@ pub fn end_tangent(p0: Point2, c1: Point2, c2: Point2, p1: Point2, at_start: boo
 pub fn adaptive_samples(p0: Point2, c1: Point2, c2: Point2, p1: Point2, zoom: f64) -> usize {
     let poly = dist(p0, c1) + dist(c1, c2) + dist(c2, p1);
     let px = poly * zoom;
-    // ~1 sample per 2px (round joins hide the rest); clamped for perf.
-    (px / 2.).ceil().clamp(8., 256.) as usize
+    // ~1 sample per 3px (was per 2px, max 256): chord error stays
+    // subpixel at UI widths while primitive count drops ~1.5x and the
+    // cache cap halves. Each sample becomes a GPU primitive downstream.
+    (px / 3.).ceil().clamp(8., 160.) as usize
 }
 
 pub fn samples(p0: Point2, c1: Point2, c2: Point2, p1: Point2, n: usize) -> Vec<Point2> {
-    (0..=n).map(|k| eval(p0, c1, c2, p1, k as f64 / n as f64)).collect()
+    let mut out = Vec::with_capacity(n + 1);
+    samples_into(p0, c1, c2, p1, n, &mut out);
+    out
+}
+
+/// Fill `out` with `n+1` samples, reusing its allocation. Hot paths
+/// (render cache refresh during drags) call this on the retained buffer
+/// instead of allocating a fresh Vec every frame.
+pub fn samples_into(
+    p0: Point2,
+    c1: Point2,
+    c2: Point2,
+    p1: Point2,
+    n: usize,
+    out: &mut Vec<Point2>,
+) {
+    out.clear();
+    out.reserve(n + 1);
+    let steps = n.max(1) as f64;
+    for k in 0..=n {
+        out.push(eval(p0, c1, c2, p1, k as f64 / steps));
+    }
 }
 
 pub fn segment_samples(doc: &Document, sid: SegmentId, n: usize) -> Option<Vec<Point2>> {
@@ -72,6 +95,8 @@ pub fn segment_length(doc: &Document, sid: SegmentId) -> Option<f64> {
 
 /// Nearest sample to `at` + its tangent. Used for tangent snapping and
 /// curve hit-testing without per-frame allocation pressure (caller caps n).
+/// Allocation-free: evaluates on the fly and re-evaluates the two tangent
+/// neighbors (2 extra evals) instead of retaining the whole polyline.
 pub fn nearest_on_curve(
     p0: Point2,
     c1: Point2,
@@ -80,23 +105,38 @@ pub fn nearest_on_curve(
     at: Point2,
     n: usize,
 ) -> (Point2, f64, (f64, f64)) {
-    let pts = samples(p0, c1, c2, p1, n);
-    let mut best = (pts[0], f64::MAX, 0usize);
-    for (i, p) in pts.iter().enumerate() {
-        let d = dist(*p, at);
-        if d < best.1 {
-            best = (*p, d, i);
+    let steps = n.max(1);
+    let inv = 1.0 / steps as f64;
+    let mut best_p = eval(p0, c1, c2, p1, 0.0);
+    let mut best_d = dist(best_p, at);
+    let mut best_i = 0usize;
+    for i in 1..=steps {
+        let p = eval(p0, c1, c2, p1, i as f64 * inv);
+        let d = dist(p, at);
+        if d < best_d {
+            best_p = p;
+            best_d = d;
+            best_i = i;
         }
     }
-    // Tangent from neighbors.
-    let a = pts[best.2.saturating_sub(1)];
-    let b = pts[(best.2 + 1).min(pts.len() - 1)];
+    // Tangent from neighbors (same points the old retained-polyline
+    // version indexed: saturating below, clamped above).
+    let a = if best_i == 0 {
+        eval(p0, c1, c2, p1, 0.0)
+    } else {
+        eval(p0, c1, c2, p1, (best_i - 1) as f64 * inv)
+    };
+    let b = if best_i >= steps {
+        eval(p0, c1, c2, p1, 1.0)
+    } else {
+        eval(p0, c1, c2, p1, (best_i + 1) as f64 * inv)
+    };
     let mut dx = b.x - a.x;
     let mut dy = b.y - a.y;
     let l = (dx * dx + dy * dy).sqrt().max(1e-9);
     dx /= l;
     dy /= l;
-    (best.0, best.1, (dx, dy))
+    (best_p, best_d, (dx, dy))
 }
 
 fn dist(a: Point2, b: Point2) -> f64 {

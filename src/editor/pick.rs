@@ -29,14 +29,23 @@ impl<'a> Picker<'a> {
     }
 
     pub fn point(&self, at: Point2) -> Option<PointId> {
+        // Arc control/center points are construction data, not editable
+        // handles. Build the internal set ONCE (was O(P·S): a full segment
+        // scan per point).
+        let mut internal = std::collections::HashSet::new();
+        for (_, seg) in self.doc.all_segments() {
+            if seg.kind == SegmentKind::Arc {
+                if let Some(c) = seg.ctrl {
+                    internal.insert(c);
+                }
+                if let Some(c) = seg.center {
+                    internal.insert(c);
+                }
+            }
+        }
         let mut best: Option<(f64, PointId)> = None;
         for (id, p) in self.doc.all_points() {
-            // Arc control/center points are construction data, not editable
-            // handles. Completed arcs expose only their two endpoints.
-            let arc_internal = self.doc.all_segments().any(|(_, seg)| {
-                seg.kind == SegmentKind::Arc && (seg.ctrl == Some(id) || seg.center == Some(id))
-            });
-            if arc_internal {
+            if internal.contains(&id) {
                 continue;
             }
             let d = distance(p, at);
@@ -52,6 +61,38 @@ impl<'a> Picker<'a> {
         for (id, seg) in self.doc.all_segments() {
             if seg.kind != SegmentKind::Line && seg.kind != SegmentKind::Ruler {
                 // Arcs + beziers hit-test against their sampled polyline.
+                // Cheap bbox reject first: most curves are far from the
+                // cursor, so skip the 32-sample allocation entirely.
+                let (Some(a), Some(b)) = (
+                    self.doc.point(seg.start),
+                    self.doc.point(seg.end),
+                ) else {
+                    continue;
+                };
+                let pad = self.tol + 1e-9;
+                let (mut lo_x, mut hi_x) = (a.x.min(b.x), a.x.max(b.x));
+                let (mut lo_y, mut hi_y) = (a.y.min(b.y), a.y.max(b.y));
+                if seg.kind == SegmentKind::Arc {
+                    if let Some(c) = seg.ctrl.and_then(|pid| self.doc.point(pid)) {
+                        lo_x = lo_x.min(c.x);
+                        hi_x = hi_x.max(c.x);
+                        lo_y = lo_y.min(c.y);
+                        hi_y = hi_y.max(c.y);
+                    }
+                } else if seg.kind == SegmentKind::Bezier {
+                    let (h1, h2) = seg.bezier_handles();
+                    for h in [h1, h2].into_iter().flatten() {
+                        if let Some(p) = self.doc.point(h) {
+                            lo_x = lo_x.min(p.x);
+                            hi_x = hi_x.max(p.x);
+                            lo_y = lo_y.min(p.y);
+                            hi_y = hi_y.max(p.y);
+                        }
+                    }
+                }
+                if at.x < lo_x - pad || at.x > hi_x + pad || at.y < lo_y - pad || at.y > hi_y + pad {
+                    continue;
+                }
                 let samples = if seg.kind == SegmentKind::Arc {
                     crate::editor::arc::segment_samples(self.doc, id, 32)
                 } else if seg.kind == SegmentKind::Bezier {
@@ -339,6 +380,12 @@ pub fn loop_points(doc: &Document, id: FillId) -> Option<Vec<Point2>> {
     if cursor? != doc.segment(f.segments[0])?.start {
         return None;
     }
+    // Fast path: no fillets means the loop IS the outline. Skips the
+    // per-edge modifier scans + 48-sample arc expansions below (the common
+    // case: every fill, every frame, every hit-test).
+    if doc.modifiers.is_empty() {
+        return validate_loop(out);
+    }
     // Effective outline, edge by edge: straight corners pass through,
     // fillet arcs spliced into the loop sample their curve inline, and
     // legacy unsubdivided corners substitute the evaluated arc. Every
@@ -405,6 +452,12 @@ pub fn loop_points(doc: &Document, id: FillId) -> Option<Vec<Point2>> {
     // near-identical samples; collapse them so downstream edges have
     // length. Point order is load-bearing (marquee maps indices back to
     // segments), so this only removes, never reorders.
+    Some(validate_loop(effective)?)
+}
+
+/// Shared corner-list validation (dedup + degeneracy + winding check).
+/// Used by both the fast path and the fillet-expanded outline.
+fn validate_loop(effective: Vec<Point2>) -> Option<Vec<Point2>> {
     let mut clean: Vec<Point2> = Vec::with_capacity(effective.len());
     for p in effective {
         if clean.last().is_none_or(|&q| distance(p, q) > 1e-9) {

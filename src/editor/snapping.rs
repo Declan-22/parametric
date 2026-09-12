@@ -64,9 +64,18 @@ pub fn targets(
     visible: Rect,
 ) -> Vec<SnapTarget> {
     let _ = exclude_segs;
+    // HashSet membership (was linear contains per point/segment) and
+    // upfront viewport culling (callers filtered after building) plus a
+    // single segment pass (was three full scans). Scoring and priority
+    // are unchanged.
+    let excluded: std::collections::HashSet<PointId> =
+        exclude_pts.iter().copied().collect();
     let mut out = Vec::new();
     for (pid, p) in doc.all_points() {
-        if exclude_pts.contains(&pid) {
+        if excluded.contains(&pid) {
+            continue;
+        }
+        if !visible.contains(p) {
             continue;
         }
         out.push(SnapTarget {
@@ -83,62 +92,76 @@ pub fn targets(
     if endpoints_only {
         return out;
     }
-    // Ruler graduations: every half-inch and inch mark along a ruler is a
-    // snap target (both axes), so objects align to the measuring system.
     for (sid, seg) in doc.all_segments() {
-        if seg.kind != SegmentKind::Ruler {
-            continue;
-        }
-        let Some((a, b)) = doc.segment_geom(sid) else { continue };
-        let dx = b.x - a.x;
-        let dy = b.y - a.y;
-        let len = (dx * dx + dy * dy).sqrt();
-        if len < 1e-6 {
-            continue;
-        }
-        let ux = dx / len;
-        let uy = dy / len;
-        let step = crate::editor::ruler::HALF_INCH;
-        let steps = (len / step).floor() as usize;
-        for k in 1..steps {
-            let d = step * k as f64;
-            out.push(SnapTarget {
-                x: a.x + ux * d,
-                y: a.y + uy * d,
-                kind: SnapKind::Endpoint,
-                snap_x: true,
-                snap_y: true,
-                span_lo: 0.,
-                span_hi: 0.,
-                span_is_x: false,
-            });
-        }
-    }
-    // Arc centers (circumcenters) — snappable midpoints for circles.
-    for (sid, seg) in doc.all_segments() {
-        if seg.kind != SegmentKind::Arc {
-            continue;
-        }
-        let Some(sc) = seg.ctrl else { continue };
-        let (Some(a), Some(b), Some(c)) =
-            (doc.point(seg.start), doc.point(seg.end), doc.point(sc))
-        else {
-            continue;
-        };
-        if exclude_pts.contains(&seg.start)
-            || exclude_pts.contains(&seg.end)
-            || exclude_pts.contains(&sc)
-            || seg.center.is_some_and(|id| exclude_pts.contains(&id))
-        {
-            continue;
-        }
-        if let Some((center, _)) = crate::editor::arc::circumcircle(a, b, c) {
-            if !visible.contains(center) {
+        if seg.kind == SegmentKind::Ruler {
+            // Ruler graduations: every half-inch and inch mark along a
+            // ruler is a snap target (both axes).
+            let Some((a, b)) = doc.segment_geom(sid) else { continue };
+            let dx = b.x - a.x;
+            let dy = b.y - a.y;
+            let len = (dx * dx + dy * dy).sqrt();
+            if len < 1e-6 {
                 continue;
             }
+            let ux = dx / len;
+            let uy = dy / len;
+            let step = crate::editor::ruler::HALF_INCH;
+            let steps = (len / step).floor() as usize;
+            for k in 1..steps {
+                let d = step * k as f64;
+                let q = Point2::new(a.x + ux * d, a.y + uy * d);
+                if !visible.contains(q) {
+                    continue;
+                }
+                out.push(SnapTarget {
+                    x: q.x,
+                    y: q.y,
+                    kind: SnapKind::Endpoint,
+                    snap_x: true,
+                    snap_y: true,
+                    span_lo: 0.,
+                    span_hi: 0.,
+                    span_is_x: false,
+                });
+            }
+            // Rulers are measurement aids, not snap scaffolding otherwise.
+            continue;
+        }
+        if seg.kind == SegmentKind::Arc {
+            // Arc centers (circumcenters) — snappable midpoints for circles.
+            if let Some(sc) = seg.ctrl
+                && let (Some(a), Some(b), Some(c)) =
+                    (doc.point(seg.start), doc.point(seg.end), doc.point(sc))
+                && !excluded.contains(&seg.start)
+                && !excluded.contains(&seg.end)
+                && !excluded.contains(&sc)
+                && !seg.center.is_some_and(|id| excluded.contains(&id))
+                && let Some((center, _)) = crate::editor::arc::circumcircle(a, b, c)
+                && visible.contains(center)
+            {
+                out.push(SnapTarget {
+                    x: center.x,
+                    y: center.y,
+                    kind: SnapKind::Midpoint,
+                    snap_x: true,
+                    snap_y: true,
+                    span_lo: 0.,
+                    span_hi: 0.,
+                    span_is_x: false,
+                });
+            }
+        }
+        let Some((a, b)) = doc.segment_geom(sid) else { continue };
+        let m = segment_mid_target(doc, seg, a, b);
+        // Midpoints are positional targets: own-component edges never
+        // offer them.
+        if excluded.contains(&seg.start) || excluded.contains(&seg.end) {
+            continue;
+        }
+        if visible.contains(m) {
             out.push(SnapTarget {
-                x: center.x,
-                y: center.y,
+                x: m.x,
+                y: m.y,
                 kind: SnapKind::Midpoint,
                 snap_x: true,
                 snap_y: true,
@@ -147,35 +170,12 @@ pub fn targets(
                 span_is_x: false,
             });
         }
-    }
-    for (sid, seg) in doc.all_segments() {
-        if seg.kind == SegmentKind::Ruler {
-            // Rulers are measurement aids, not snap scaffolding.
-            continue;
-        }
-        let Some((a, b)) = doc.segment_geom(sid) else { continue };
-        let m = segment_mid_target(doc, seg, a, b);
-        // Midpoints are positional targets: own-component edges never
-        // offer them.
-        if exclude_pts.contains(&seg.start) || exclude_pts.contains(&seg.end) {
-            continue;
-        }
-        out.push(SnapTarget {
-            x: m.x,
-            y: m.y,
-            kind: SnapKind::Midpoint,
-            snap_x: true,
-            snap_y: true,
-            span_lo: 0.,
-            span_hi: 0.,
-            span_is_x: false,
-        });
         // Edge spans: horizontal edge snaps Y within X range, vertical edge
         // snaps X within Y range.
         let horizontal = (a.y - b.y).abs() < 1e-9;
         let vertical = (a.x - b.x).abs() < 1e-9;
         if horizontal {
-            out.push(SnapTarget {
+            let t = SnapTarget {
                 x: m.x,
                 y: a.y,
                 kind: SnapKind::Edge,
@@ -184,9 +184,12 @@ pub fn targets(
                 span_lo: a.x.min(b.x),
                 span_hi: a.x.max(b.x),
                 span_is_x: true,
-            });
+            };
+            if visible.contains(Point2::new(t.x, t.y)) {
+                out.push(t);
+            }
         } else if vertical {
-            out.push(SnapTarget {
+            let t = SnapTarget {
                 x: a.x,
                 y: m.y,
                 kind: SnapKind::Edge,
@@ -195,7 +198,10 @@ pub fn targets(
                 span_lo: a.y.min(b.y),
                 span_hi: a.y.max(b.y),
                 span_is_x: false,
-            });
+            };
+            if visible.contains(Point2::new(t.x, t.y)) {
+                out.push(t);
+            }
         }
     }
     out
@@ -295,19 +301,23 @@ pub fn best(
         }
     }
     // Arc bodies — closest point on the arc curve (larger tolerance).
+    // Set membership (was linear scans per arc).
+    let excl_pts: std::collections::HashSet<PointId> = exclude_pts.iter().copied().collect();
+    let excl_segs: std::collections::HashSet<crate::core::ids::SegmentId> =
+        exclude_segs.iter().copied().collect();
     let arc_tol = tol * 1.8;
     for (sid, seg) in doc.all_segments() {
         if seg.kind != SegmentKind::Arc {
             continue;
         }
-        if exclude_segs.contains(&sid) {
+        if excl_segs.contains(&sid) {
             continue;
         }
         let Some(sc) = seg.ctrl else { continue };
-        if exclude_pts.contains(&seg.start)
-            || exclude_pts.contains(&seg.end)
-            || exclude_pts.contains(&sc)
-            || seg.center.is_some_and(|id| exclude_pts.contains(&id))
+        if excl_pts.contains(&seg.start)
+            || excl_pts.contains(&seg.end)
+            || excl_pts.contains(&sc)
+            || seg.center.is_some_and(|id| excl_pts.contains(&id))
         {
             continue;
         }

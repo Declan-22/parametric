@@ -2492,6 +2492,19 @@ impl Editor {
             ) else {
                 continue;
             };
+            // Cheap control-cage reject before the 48-eval nearest search
+            // (runs per bezier per mousemove while pen-chaining).
+            let (mut lox, mut hix) = (p0.x.min(p1.x), p0.x.max(p1.x));
+            let (mut loy, mut hiy) = (p0.y.min(p1.y), p0.y.max(p1.y));
+            for q in [c1, c2] {
+                lox = lox.min(q.x);
+                hix = hix.max(q.x);
+                loy = loy.min(q.y);
+                hiy = hiy.max(q.y);
+            }
+            if start.x < lox - tol || start.x > hix + tol || start.y < loy - tol || start.y > hiy + tol {
+                continue;
+            }
             // Only snap when starting ON the curve (chaining / G1).
             let (near, d, tan) = bezier::nearest_on_curve(p0, c1, c2, p1, start, 48);
             if d > tol {

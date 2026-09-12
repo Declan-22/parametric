@@ -3,7 +3,7 @@ use super::document::Document;
 use super::geometry::Point2;
 use super::ids::PointId;
 use smallvec::SmallVec;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // Real constraint solver: damped least-squares (Levenberg-Marquardt) over
 // FREE point positions.
@@ -144,6 +144,21 @@ fn ctrl_point(ctrl: &[Point2; 4], t: f64) -> Point2 {
 }
 
 const BEZ_SAMPLES: usize = 12;
+// Bernstein weights for the fixed 12-sample polyline, computed once.
+// The sample parameters never change, so recomputing these 13×4 weights
+// on every LM evaluation (hundreds per drag frame per bezier) was pure
+// waste.
+static BEZ_WTS: std::sync::LazyLock<[[f64; 4]; BEZ_SAMPLES + 1]> =
+    std::sync::LazyLock::new(|| {
+        let mut wts = [[0.0; 4]; BEZ_SAMPLES + 1];
+        let mut k = 0;
+        while k <= BEZ_SAMPLES {
+            let t = k as f64 / BEZ_SAMPLES as f64;
+            wts[k] = bernstein(t);
+            k += 1;
+        }
+        wts
+    });
 
 // A residual evaluated at one iterate: value plus sparse gradient over
 // FREE variable indices. Gradients are stack-allocated: no equation
@@ -201,6 +216,62 @@ impl Solver {
         let mut slots: Vec<PointId> = Vec::new();
         let mut index: HashMap<PointId, usize> = HashMap::new();
 
+        // Single-pass indexes over the document topology: point adjacency
+        // (for the drag-component BFS below) and per-point line/curve
+        // ownership (for tangent inference). Previously both were rebuilt
+        // by scanning all segments per constraint / per BFS frontier point.
+        let mut adjacency: HashMap<PointId, Vec<PointId>> = HashMap::new();
+        let mut touch_line: HashMap<PointId, crate::core::ids::SegmentId> = HashMap::new();
+        let mut touch_curve: HashMap<PointId, crate::core::ids::SegmentId> = HashMap::new();
+        {
+            let mut link = |a: PointId, b: PointId| {
+                if a == b {
+                    return;
+                }
+                adjacency.entry(a).or_default().push(b);
+                adjacency.entry(b).or_default().push(a);
+            };
+            for (sid, s) in doc.all_segments() {
+                // Segment clique: every defining point reaches the others.
+                let pts = [Some(s.start), Some(s.end), s.ctrl, s.center];
+                let mut prev: Option<PointId> = None;
+                for p in pts.into_iter().flatten() {
+                    if let Some(q) = prev {
+                        link(q, p);
+                    }
+                    prev = Some(p);
+                }
+                // Tangent inference ownership: endpoints only, matching the
+                // original scan (s.start/s.end == c.a).
+                use crate::core::document::SegmentKind as SK;
+                for p in [s.start, s.end] {
+                    if s.kind == SK::Line {
+                        touch_line.entry(p).or_insert(sid);
+                    } else if matches!(s.kind, SK::Arc | SK::Bezier) {
+                        touch_curve.entry(p).or_insert(sid);
+                    }
+                }
+                // Also link endpoints directly (clique closure for 2-pt segs
+                // is covered, but keep explicit for clarity with 4-pt).
+                link(s.start, s.end);
+            }
+            for c in &doc.constraints {
+                link(c.a, c.b);
+                if let Some(sid) = c.point_on_segment
+                    && let Some(seg) = doc.segment(sid)
+                {
+                    for p in [Some(seg.start), Some(seg.end), seg.ctrl, seg.center].into_iter().flatten() {
+                        link(c.a, p);
+                        link(c.b, p);
+                    }
+                }
+            }
+            for v in adjacency.values_mut() {
+                v.sort_by_key(|p| (p.idx, p.generation));
+                v.dedup();
+            }
+        }
+
         let mut slot_of = |pid: PointId| -> Option<usize> {
             if doc.point(pid).is_none() {
                 return None;
@@ -238,20 +309,9 @@ impl Solver {
                     use crate::core::document::SegmentKind as SK;
                     // Order-independent: classify by kind, not by position
                     // in the pair (pen chains store them in either order).
+                    // Uses the prebuilt per-point ownership index (no scan).
                     let inferred = || {
-                        let mut line = None;
-                        let mut curve = None;
-                        for (sid, s) in doc.all_segments() {
-                            if s.start != c.a && s.end != c.a {
-                                continue;
-                            }
-                            if s.kind == SK::Line && line.is_none() {
-                                line = Some(sid);
-                            } else if matches!(s.kind, SK::Arc | SK::Bezier) && curve.is_none() {
-                                curve = Some(sid);
-                            }
-                        }
-                        line.zip(curve)
+                        touch_line.get(&c.a).copied().zip(touch_curve.get(&c.a).copied())
                     };
                     let Some((first_id, second_id)) = c.tangent_segments.or_else(inferred) else {
                         continue;
@@ -681,61 +741,34 @@ impl Solver {
         }
 
         // A drag is solved over the whole geometric component, not just the
-        // cursor point.  Keeping the rest of a connected chain hard-fixed is
-        // the source of most apparent "over-constrained" angle failures: the
-        // only point allowed to move cannot rotate an edge whose other end is
-        // frozen.  Build the closure once here so segments, arcs, and
-        // explicit coincident links all share the same kinematic component.
-        let mut component = Vec::new();
-        for &(pid, _) in drag {
-            if !component.contains(&pid) {
+        // cursor point. Uses the prebuilt adjacency index: single BFS with
+        // HashSet membership (previously a per-frontier full document scan
+        // with linear Vec::contains, run twice — here and in
+        // component_points()).
+        let mut component: Vec<PointId> = Vec::new();
+        {
+            let mut seen: HashSet<PointId> = HashSet::new();
+            let mut queue: Vec<PointId> = Vec::new();
+            for &(pid, _) in drag {
+                if doc.point(pid).is_some() && seen.insert(pid) {
+                    queue.push(pid);
+                }
+            }
+            let mut cursor = 0;
+            while cursor < queue.len() {
+                let pid = queue[cursor];
+                cursor += 1;
                 component.push(pid);
+                if let Some(neighbours) = adjacency.get(&pid) {
+                    for &q in neighbours {
+                        if doc.point(q).is_some() && seen.insert(q) {
+                            queue.push(q);
+                        }
+                    }
+                }
             }
         }
-        let mut component_cursor = 0;
-        while component_cursor < component.len() {
-            let pid = component[component_cursor];
-            for (_, seg) in doc.all_segments() {
-                let mut linked = false;
-                if seg.start == pid || seg.end == pid || seg.ctrl == Some(pid) || seg.center == Some(pid) {
-                    linked = true;
-                }
-                if linked {
-                    for linked_pid in [Some(seg.start), Some(seg.end), seg.ctrl, seg.center].into_iter().flatten() {
-                        if doc.point(linked_pid).is_some() && !component.contains(&linked_pid) {
-                            component.push(linked_pid);
-                        }
-                    }
-                }
-            }
-            for c in &doc.constraints {
-                let mut linked = c.a == pid || c.b == pid;
-                if let Some(segment_id) = c.point_on_segment
-                    && let Some(seg) = doc.segment(segment_id)
-                    && (seg.start == pid || seg.end == pid || seg.ctrl == Some(pid) || seg.center == Some(pid))
-                {
-                    linked = true;
-                }
-                if linked {
-                    for linked_pid in [c.a, c.b] {
-                        if doc.point(linked_pid).is_some() && !component.contains(&linked_pid) {
-                            component.push(linked_pid);
-                        }
-                    }
-                    if let Some(segment_id) = c.point_on_segment
-                        && let Some(seg) = doc.segment(segment_id)
-                    {
-                        for linked_pid in [Some(seg.start), Some(seg.end), seg.ctrl, seg.center].into_iter().flatten() {
-                            if doc.point(linked_pid).is_some() && !component.contains(&linked_pid) {
-                                component.push(linked_pid);
-                            }
-                        }
-                    }
-                }
-            }
-            component_cursor += 1;
-        }
-        for pid in component {
+        for &pid in &component {
             let _ = slot_of(pid);
         }
 
@@ -785,7 +818,9 @@ impl Solver {
         // positions. Geometric equations dominate these anchors, allowing a
         // connected edge to rotate or translate while the anchors select the
         // nearby solution branch and suppress null-space drift.
-        for pid in component_points(doc, drag) {
+        // Reuses the component BFS above (previously recomputed via
+        // component_points() with a second full-document flood).
+        for &pid in &component {
             if drag.iter().any(|(dragged, _)| *dragged == pid) {
                 continue;
             }
@@ -1545,23 +1580,20 @@ impl Solver {
                     // 12-sample polyline arc-length minus target. Gradient
                     // chains polyline-segment derivatives through the
                     // Bernstein weights onto the four control points.
+                    // Stack-only: no heap allocation in the hot LM loop.
                     let ctrl = [self.pos(p0, x), self.pos(c1, x), self.pos(c2, x), self.pos(p1, x)];
-                    let n = BEZ_SAMPLES;
-                    let mut samp = Vec::with_capacity(n + 1);
-                    let mut wts = Vec::with_capacity(n + 1);
-                    for k in 0..=n {
-                        let t = k as f64 / n as f64;
-                        let w = bernstein(t);
-                        wts.push(w);
-                        samp.push(Point2::new(
+                    let wts = &*BEZ_WTS;
+                    let mut samp = [Point2::new(0., 0.); BEZ_SAMPLES + 1];
+                    for (k, w) in wts.iter().enumerate() {
+                        samp[k] = Point2::new(
                             w[0] * ctrl[0].x + w[1] * ctrl[1].x + w[2] * ctrl[2].x + w[3] * ctrl[3].x,
                             w[0] * ctrl[0].y + w[1] * ctrl[1].y + w[2] * ctrl[2].y + w[3] * ctrl[3].y,
-                        ));
+                        );
                     }
                     // dL/d sample j (polyline vertex derivatives).
-                    let mut dlen = vec![(0.0f64, 0.0f64); n + 1];
+                    let mut dlen = [(0.0f64, 0.0f64); BEZ_SAMPLES + 1];
                     let mut len = 0.0;
-                    for k in 0..n {
+                    for k in 0..BEZ_SAMPLES {
                         let dx = samp[k + 1].x - samp[k].x;
                         let dy = samp[k + 1].y - samp[k].y;
                         let l = (dx * dx + dy * dy).sqrt().max(1e-9);
@@ -1761,16 +1793,18 @@ impl Solver {
         // These are hot-path scratch values, not solver state: keeping them
         // here avoids allocating several large vectors for every iteration
         // of every live drag.
-        // Sparse normal equations: each geometric residual touches only a
-        // handful of scalar variables. Keeping rows sparse avoids allocating
-        // an n² matrix for a large document when the active component is
-        // small, and lets the iterative solve scale with actual connectivity.
-        let mut jtj: Vec<HashMap<usize, f64>> =
-            (0..n).map(|_| HashMap::with_capacity(8)).collect();
+        // Small systems (the ~always case: a drag touches a handful of
+        // points) accumulate JᵀJ directly into a dense n² matrix — no
+        // hashing. Large systems use adjacency-list sparse rows with linear
+        // scans (rows hold a handful of entries; hashing loses).
+        let use_dense = n <= 128;
+        let mut dense = if use_dense { vec![0.0; n * n] } else { Vec::new() };
+        // Sparse rows: Vec of (column, value) pairs, reused across iters.
+        let mut sparse: Vec<Vec<(usize, f64)>> =
+            if use_dense { Vec::new() } else { (0..n).map(|_| Vec::with_capacity(8)).collect() };
         let mut jtr = vec![0.0; n];
         let mut dx = vec![0.0; n];
         let mut trial = vec![Point2::new(0., 0.); self.n_free];
-        let mut dense = if n <= 128 { Some(vec![0.0; n * n]) } else { None };
         let mut cg_residual = vec![0.0; n];
         let mut cg_direction = vec![0.0; n];
         let mut cg_product = vec![0.0; n];
@@ -1782,45 +1816,60 @@ impl Solver {
                 break;
             }
 
-            for row in &mut jtj {
-                row.clear();
-            }
             jtr.fill(0.0);
-            for r in &residuals {
-                let w = r.weight;
-                // JᵀJ is symmetric. Assemble each gradient pair once and
-                // mirror it instead of doing the same multiplication twice.
-                for (i, &(vi, gi)) in r.grad.iter().enumerate() {
-                    for (j, &(vj, gj)) in r.grad.iter().enumerate().skip(i) {
-                        let value = w * gi * gj;
-                        *jtj[vi].entry(vj).or_insert(0.) += value;
-                        if vi != vj {
-                            *jtj[vj].entry(vi).or_insert(0.) += value;
-                        } else if j != i {
-                            // Two distinct gradient entries can refer to the
-                            // same variable; retain both cross terms.
-                            *jtj[vi].entry(vj).or_insert(0.) += value;
+            if use_dense {
+                dense.fill(0.0);
+                for r in &residuals {
+                    let w = r.weight;
+                    // JᵀJ is symmetric. Assemble each gradient pair once and
+                    // mirror it instead of doing the same multiplication twice.
+                    for (i, &(vi, gi)) in r.grad.iter().enumerate() {
+                        for (j, &(vj, gj)) in r.grad.iter().enumerate().skip(i) {
+                            let value = w * gi * gj;
+                            dense[vi * n + vj] += value;
+                            if vi != vj {
+                                dense[vj * n + vi] += value;
+                            } else if j != i {
+                                // Two distinct gradient entries can refer to the
+                                // same variable; retain both cross terms.
+                                dense[vi * n + vj] += value;
+                            }
                         }
+                        jtr[vi] -= w * gi * r.value;
                     }
-                    jtr[vi] -= w * gi * r.value;
                 }
-            }
-            for i in 0..n {
-                *jtj[i].entry(i).or_insert(0.) += lambda + 1e-12;
+                for i in 0..n {
+                    dense[i * n + i] += lambda + 1e-12;
+                }
+            } else {
+                for row in &mut sparse {
+                    row.clear();
+                }
+                for r in &residuals {
+                    let w = r.weight;
+                    for (i, &(vi, gi)) in r.grad.iter().enumerate() {
+                        for (j, &(vj, gj)) in r.grad.iter().enumerate().skip(i) {
+                            let value = w * gi * gj;
+                            sparse_add(&mut sparse[vi], vj, value);
+                            if vi != vj {
+                                sparse_add(&mut sparse[vj], vi, value);
+                            } else if j != i {
+                                sparse_add(&mut sparse[vi], vj, value);
+                            }
+                        }
+                        jtr[vi] -= w * gi * r.value;
+                    }
+                }
+                for i in 0..n {
+                    sparse_add(&mut sparse[i], i, lambda + 1e-12);
+                }
             }
 
-            let solved = if n <= 128 {
-                let dense_matrix = dense.as_mut().expect("small systems have dense scratch");
-                dense_matrix.fill(0.);
-                for (row, entries) in jtj.iter().enumerate() {
-                    for (&column, &value) in entries {
-                        dense_matrix[row * n + column] = value;
-                    }
-                }
-                gauss_solve_in_place(dense_matrix, n, &mut jtr, &mut dx)
+            let solved = if use_dense {
+                gauss_solve_in_place(&mut dense, n, &mut jtr, &mut dx)
             } else {
                 conjugate_gradient(
-                    &jtj,
+                    &sparse,
                     &jtr,
                     &mut dx,
                     &mut cg_residual,
@@ -2003,10 +2052,18 @@ impl Solver {
                 }
                 Eq::BezierLength { p0, c1, c2, p1, target } => {
                     let ctrl = [self.pos(p0, x), self.pos(c1, x), self.pos(c2, x), self.pos(p1, x)];
+                    let wts = &*BEZ_WTS;
+                    let at = |k: usize| {
+                        let w = wts[k];
+                        Point2::new(
+                            w[0] * ctrl[0].x + w[1] * ctrl[1].x + w[2] * ctrl[2].x + w[3] * ctrl[3].x,
+                            w[0] * ctrl[0].y + w[1] * ctrl[1].y + w[2] * ctrl[2].y + w[3] * ctrl[3].y,
+                        )
+                    };
                     let mut len = 0.0;
-                    let mut prev = ctrl_point(&ctrl, 0.0);
+                    let mut prev = at(0);
                     for k in 1..=BEZ_SAMPLES {
-                        let s = ctrl_point(&ctrl, k as f64 / BEZ_SAMPLES as f64);
+                        let s = at(k);
                         len += ((s.x - prev.x).powi(2) + (s.y - prev.y).powi(2)).sqrt();
                         prev = s;
                     }
@@ -2079,6 +2136,9 @@ impl Solver {
 /// Returns the geometric point component touched by a drag seed.  Segment
 /// topology is the primary graph; constraint pairs and point-on-segment
 /// references bridge otherwise separate records (including merged points).
+/// Kept for external callers; `Solver::build` uses its prebuilt adjacency
+/// index instead (single BFS, no per-frontier document scans).
+#[allow(dead_code)]
 fn component_points(doc: &Document, drag: &[(PointId, Point2)]) -> Vec<PointId> {
     let mut points: Vec<PointId> = drag.iter().map(|(id, _)| *id).collect();
     let mut cursor = 0;
@@ -2187,8 +2247,22 @@ fn gauss_solve_in_place(a: &mut [f64], n: usize, b: &mut [f64], out: &mut [f64])
     true
 }
 
+/// Adds `value` to entry `col` of a sparse row (linear scan: rows hold
+/// a handful of entries so this beats hashing).
+fn sparse_add(row: &mut Vec<(usize, f64)>, col: usize, value: f64) {
+    if let Some(entry) = row.iter_mut().find(|(c, _)| *c == col) {
+        entry.1 += value;
+    } else {
+        row.push((col, value));
+    }
+}
+
+fn sparse_diag(row: &[(usize, f64)], diag: usize) -> f64 {
+    row.iter().find(|(c, _)| *c == diag).map(|(_, v)| *v).unwrap_or(1.)
+}
+
 fn conjugate_gradient(
-    matrix: &[HashMap<usize, f64>],
+    matrix: &[Vec<(usize, f64)>],
     b: &[f64],
     out: &mut [f64],
     residual: &mut [f64],
@@ -2211,7 +2285,7 @@ fn conjugate_gradient(
     // Jacobi preconditioning normalizes mixed coordinate/angle residual
     // scales without building a second matrix or allocating per iteration.
     for i in 0..n {
-        let diagonal = matrix[i].get(&i).copied().unwrap_or(1.).max(1e-12);
+        let diagonal = sparse_diag(&matrix[i], i).max(1e-12);
         preconditioned[i] = residual[i] / diagonal;
         direction[i] = preconditioned[i];
     }
@@ -2227,10 +2301,11 @@ fn conjugate_gradient(
     for _ in 0..max_iter {
         product.fill(0.);
         for (row, entries) in matrix.iter().enumerate() {
-            product[row] = entries
-                .iter()
-                .map(|(&column, &value)| value * direction[column])
-                .sum();
+            let mut sum = 0.0;
+            for &(column, value) in entries {
+                sum += value * direction[column];
+            }
+            product[row] = sum;
         }
         let denom = dot(direction, product);
         if !denom.is_finite() || denom <= 1e-24 {
@@ -2242,7 +2317,7 @@ fn conjugate_gradient(
             residual[i] -= alpha * product[i];
         }
         for i in 0..n {
-            let diagonal = matrix[i].get(&i).copied().unwrap_or(1.).max(1e-12);
+            let diagonal = sparse_diag(&matrix[i], i).max(1e-12);
             preconditioned[i] = residual[i] / diagonal;
         }
         let next_rr = dot(residual, preconditioned);

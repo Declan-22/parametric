@@ -9,17 +9,74 @@ use crate::editor::ruler;
 use crate::editor::{Camera, SnapGuide};
 use crate::theme::Theme;
 
+/// Cached bezier flattening: tessellation plus its bounds for O(1)
+/// viewport culling (previously every curve scanned all ~160 samples per
+/// frame just to ask "are you visible?").
+pub struct BezEntry {
+    pub fp: u64,
+    pub pts: Vec<Point2>,
+    /// (min_x, min_y, max_x, max_y) over `pts`.
+    pub bb: [f64; 4],
+}
+
 #[derive(Default)]
 pub struct RenderCache {
     arcs: HashMap<crate::core::ids::SegmentId, (u64, Vec<Point2>)>,
-    beziers: HashMap<crate::core::ids::SegmentId, (u64, Vec<Point2>)>,
+    beziers: HashMap<crate::core::ids::SegmentId, BezEntry>,
+}
+
+/// Quantized zoom for cache fingerprints. Retessellating on every
+/// fractional wheel tick is invisible (<1 sample of difference) but costs
+/// a full flatten per curve; 1/64 steps keep tessellation visually
+/// identical while the cache actually hits during zoom gestures.
+fn zoom_key(zoom: f64) -> u64 {
+    (zoom * 64.0).round().max(1.0).to_bits()
+}
+
+fn bbox_of(pts: &[Point2]) -> [f64; 4] {
+    let mut bb = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+    for p in pts {
+        if p.x < bb[0] {
+            bb[0] = p.x;
+        }
+        if p.y < bb[1] {
+            bb[1] = p.y;
+        }
+        if p.x > bb[2] {
+            bb[2] = p.x;
+        }
+        if p.y > bb[3] {
+            bb[3] = p.y;
+        }
+    }
+    if bb[0].is_infinite() {
+        bb = [0., 0., 0., 0.];
+    }
+    bb
 }
 
 impl RenderCache {
     fn clear_if_oversized(&mut self) {
-        if self.arcs.len() + self.beziers.len() >= 4096 {
+        // Arcs only: beziers have their own incremental eviction below.
+        // The old combined clear wiped both maps at once, forcing every
+        // curve to retessellate on the same frame.
+        if self.arcs.len() >= 4096 {
             self.arcs.clear();
-            self.beziers.clear();
+        }
+    }
+
+    /// Incremental eviction for the (larger) bezier entries: drop an
+    /// arbitrary half instead of everything. The old all-clear made every
+    /// curve retessellate on the same frame (jank spike + transient 2x
+    /// memory from old + new Vecs).
+    fn evict_beziers_if_oversized(&mut self) {
+        const CAP: usize = 2048;
+        if self.beziers.len() >= CAP {
+            let kill: Vec<crate::core::ids::SegmentId> =
+                self.beziers.keys().take(CAP / 2).copied().collect();
+            for k in kill {
+                self.beziers.remove(&k);
+            }
         }
     }
 
@@ -28,7 +85,7 @@ impl RenderCache {
         doc: &Document,
         sid: crate::core::ids::SegmentId,
         zoom: f64,
-    ) -> Option<&Vec<Point2>> {
+    ) -> Option<&BezEntry> {
         let seg = doc.segment(sid)?;
         if seg.kind != SegmentKind::Bezier {
             return None;
@@ -40,8 +97,9 @@ impl RenderCache {
             doc.point(h2?)?,
             doc.point(seg.end)?,
         );
+        let zkey = zoom_key(zoom);
         let fingerprint = [
-            zoom.to_bits(),
+            zkey,
             a.x.to_bits(),
             a.y.to_bits(),
             b.x.to_bits(),
@@ -58,14 +116,23 @@ impl RenderCache {
         let needs_refresh = self
             .beziers
             .get(&sid)
-            .is_none_or(|(old, _)| *old != fingerprint);
+            .is_none_or(|e| e.fp != fingerprint);
         if needs_refresh {
             let n = crate::editor::bezier::adaptive_samples(a, b, c, d, zoom);
-            let samples = crate::editor::bezier::samples(a, b, c, d, n);
-            self.clear_if_oversized();
-            self.beziers.insert(sid, (fingerprint, samples));
+            self.evict_beziers_if_oversized();
+            // Reuse the retained allocation when the entry exists: during
+            // drags the fingerprint changes every frame, and a fresh Vec
+            // per curve per frame was pure allocator churn.
+            let entry = self.beziers.entry(sid).or_insert_with(|| BezEntry {
+                fp: 0,
+                pts: Vec::new(),
+                bb: [0., 0., 0., 0.],
+            });
+            crate::editor::bezier::samples_into(a, b, c, d, n, &mut entry.pts);
+            entry.fp = fingerprint;
+            entry.bb = bbox_of(&entry.pts);
         }
-        self.beziers.get(&sid).map(|(_, s)| s)
+        self.beziers.get(&sid)
     }
 
     fn arc_samples(
@@ -78,7 +145,7 @@ impl RenderCache {
         let ctrl = seg.ctrl?;
         let (a, b, c) = (doc.point(seg.start)?, doc.point(seg.end)?, doc.point(ctrl)?);
         let fingerprint = [
-            zoom.to_bits(),
+            zoom_key(zoom),
             a.x.to_bits(), a.y.to_bits(),
             b.x.to_bits(), b.y.to_bits(),
             c.x.to_bits(), c.y.to_bits(),
@@ -204,7 +271,19 @@ pub fn build_draw_list(
     let color: gpui::Background = rgb(0x808080).into();
     let accent: gpui::Background = rgb(t.accent).into();
     let element_count: usize = doc.layers.iter().map(|layer| layer.elements.len()).sum();
+    // Bezier handle ids, built ONCE per frame (was O(sel·segs): a full
+    // segment scan per selected point via is_bezier_handle).
+    let bezier_handles: std::collections::HashSet<crate::core::ids::PointId> = doc
+        .all_segments()
+        .filter(|(_, s)| s.kind == SegmentKind::Bezier)
+        .flat_map(|(_, s)| [s.ctrl, s.center].into_iter().flatten())
+        .collect();
     let mut list = Vec::with_capacity(element_count.saturating_mul(2).saturating_add(64));
+    // Reused screen-space workspaces for curve flattening: every curve in
+    // the frame shares these instead of allocating a Vec per curve per
+    // frame (the allocator churn showed up as heap growth while dragging).
+    let mut scr_buf: Vec<(f32, f32)> = Vec::new();
+    let mut sim_buf: Vec<(f32, f32)> = Vec::new();
     let mut owned_cache = RenderCache::default();
     let cache: &mut RenderCache = match cache {
         Some(cache) => cache,
@@ -325,7 +404,9 @@ pub fn build_draw_list(
                         {
                             continue;
                         }
-                        let n = crate::editor::arc::adaptive_samples(sa, sb, scp, camera.zoom);
+                        // Note: no outer adaptive_samples here — the cache
+                        // computes it internally (the old code computed it
+                        // twice: 3 atan2s discarded per arc per frame).
                         let Some(samples) = cache.arc_samples(doc, sid, camera.zoom) else {
                             continue;
                         };
@@ -335,9 +416,12 @@ pub fn build_draw_list(
                                 1.5,
                                 rgba((seg.stroke_color << 8) | ((seg.opacity.clamp(0., 1.) * 255.) as u32)).into(),
                             ));
-                            push_polyline(
+                            push_simplified_polyline(
                                 &mut list,
-                                &live.iter().map(|p| scr(*p)).collect::<Vec<_>>(),
+                                &mut scr_buf,
+                                &mut sim_buf,
+                                live,
+                                &scr,
                                 w,
                                 col,
                             );
@@ -364,8 +448,9 @@ pub fn build_draw_list(
                                     || selection.contains(&ElementRef::Point(seg.end))
                             })
                         {
+                            let cn = crate::editor::arc::adaptive_samples(sa, sb, scp, camera.zoom).max(32);
                             let comp =
-                                crate::editor::arc::complement_samples(sa, sb, scp, n.max(32));
+                                crate::editor::arc::complement_samples(sa, sb, scp, cn);
                             let pts: Vec<(f32, f32)> = comp.iter().map(|p| scr(*p)).collect();
                             dashed_polyline(&mut list, &pts, accent);
                         }
@@ -381,16 +466,30 @@ pub fn build_draw_list(
                         ) else {
                             continue;
                         };
-                        let n = crate::editor::bezier::adaptive_samples(p0, c1, c2, p1, camera.zoom);
-                        let _ = n;
-                        let Some(samples) = cache.bezier_samples(doc, sid, camera.zoom) else {
+                        // Note: adaptive count lives inside the cache —
+                        // the old outer computation was discarded.
+                        let Some(entry) = cache.bezier_samples(doc, sid, camera.zoom) else {
                             continue;
                         };
-                        if samples.iter().any(|p| visible.contains(*p)) {
-                            let live = trimmed_samples(doc, sid, samples);
-                            push_polyline(
+                        // O(1) bbox cull on the cached bounds (was a full
+                        // N-point scan per curve per frame).
+                        let bb = entry.bb;
+                        let vx0 = visible.origin.x;
+                        let vy0 = visible.origin.y;
+                        if bb[2] < vx0
+                            || bb[0] > vx0 + visible.size.w
+                            || bb[3] < vy0
+                            || bb[1] > vy0 + visible.size.h
+                        {
+                            // Still fall through to handles below.
+                        } else {
+                            let live = trimmed_samples(doc, sid, &entry.pts);
+                            push_simplified_polyline(
                                 &mut list,
-                                &live.iter().map(|p| scr(*p)).collect::<Vec<_>>(),
+                                &mut scr_buf,
+                                &mut sim_buf,
+                                live,
+                                &scr,
                                 seg.stroke_width.max(1.) as f32,
                                 color,
                             );
@@ -454,7 +553,7 @@ pub fn build_draw_list(
                 camera.zoom,
             );
             let pts = crate::editor::arc::samples_through(g.first_tangent, g.second_tangent, g.control, n);
-            push_polyline(&mut list, &pts.iter().map(|p| scr(*p)).collect::<Vec<_>>(), w, col);
+            push_simplified_polyline(&mut list, &mut scr_buf, &mut sim_buf, &pts, &scr, w, col);
         }
     }
     // Fillet drag affordances: committed fillet centers always show while
@@ -480,7 +579,7 @@ pub fn build_draw_list(
             camera.zoom,
         );
         let pts = crate::editor::arc::samples_through(g.first_tangent, g.second_tangent, g.control, n);
-        push_polyline(&mut list, &pts.iter().map(|p| scr(*p)).collect::<Vec<_>>(), 2.2, accent);
+        push_simplified_polyline(&mut list, &mut scr_buf, &mut sim_buf, &pts, &scr, 2.2, accent);
         let (x,y)=scr(g.center);
         list.push(Primitive::Circle { cx:x, cy:y, radius:4. });
     }
@@ -629,20 +728,20 @@ pub fn build_draw_list(
     if let Some(h) = hover
         && !selection.contains(&h)
     {
-        element_outline(doc, h, &scr, accent, &mut list, camera.zoom, cache);
+        element_outline(doc, h, &scr, accent, &mut list, camera.zoom, cache, &bezier_handles, &mut scr_buf, &mut sim_buf);
     }
 
     // 5) Selection highlights + point handles drawn after everything —
     // points are the topmost affordance in the entire stack.
     for &sel in selection {
-        element_outline(doc, sel, &scr, accent, &mut list, camera.zoom, cache);
+        element_outline(doc, sel, &scr, accent, &mut list, camera.zoom, cache, &bezier_handles, &mut scr_buf, &mut sim_buf);
     }
     for &sel in selection {
         for pid in doc.element_points(sel) {
             if let Some(p) = doc.point(pid) {
                 let (x, y) = scr(p);
                 // Bezier handle points render as diamonds, never dots.
-                if is_bezier_handle(doc, pid) {
+                if bezier_handles.contains(&pid) {
                     list.push(Primitive::Diamond {
                         cx: x,
                         cy: y,
@@ -733,8 +832,7 @@ pub fn build_draw_list(
                 if let (Some(a), Some(b)) = (pc.a, pc.b) {
                     let n = crate::editor::arc::adaptive_samples(a, b, pc.cursor, camera.zoom);
                     let arc = crate::editor::arc::samples_through(a, b, pc.cursor, n);
-                    let pts: Vec<(f32, f32)> = arc.iter().map(|p| scr(*p)).collect();
-                    push_polyline(&mut list, &pts, 1.5, color);
+                    push_simplified_polyline(&mut list, &mut scr_buf, &mut sim_buf, &arc, &scr, 1.5, color);
                     let comp = crate::editor::arc::complement_samples(a, b, pc.cursor, n.max(32));
                     dashed_polyline(
                         &mut list,
@@ -791,9 +889,7 @@ pub fn build_draw_list(
                                     camera.zoom,
                                 );
                                 let arc = crate::editor::arc::samples_through(a, b, pc.cursor, n);
-                                let pts: Vec<(f32, f32)> =
-                                    arc.iter().map(|p| scr(*p)).collect();
-                                push_polyline(&mut list, &pts, 1.5, color);
+                                push_simplified_polyline(&mut list, &mut scr_buf, &mut sim_buf, &arc, &scr, 1.5, color);
                             }
                         }
                     }
@@ -806,12 +902,7 @@ pub fn build_draw_list(
                     let end = pb.p1.unwrap_or(pb.cursor);
                     let (c1, c2) = pb.effective(end);
                     let pts = crate::editor::bezier::samples(pb.p0, c1, c2, end, 32);
-                    push_polyline(
-                        &mut list,
-                        &pts.iter().map(|p| scr(*p)).collect::<Vec<_>>(),
-                        1.5,
-                        accent,
-                    );
+                    push_simplified_polyline(&mut list, &mut scr_buf, &mut sim_buf, &pts, &scr, 1.5, accent);
                     // Anchor + live end dots.
                     for p in [pb.p0, end] {
                         let (x, y) = scr(p);
@@ -856,12 +947,7 @@ pub fn build_draw_list(
         let end = pb.p1.unwrap_or(pb.cursor);
         let (c1, c2) = pb.effective(end);
         let pts = crate::editor::bezier::samples(pb.p0, c1, c2, end, 32);
-        push_polyline(
-            &mut list,
-            &pts.iter().map(|p| scr(*p)).collect::<Vec<_>>(),
-            1.5,
-            accent,
-        );
+        push_simplified_polyline(&mut list, &mut scr_buf, &mut sim_buf, &pts, &scr, 1.5, accent);
     }
     list
 }
@@ -898,17 +984,13 @@ fn push_chord_preview(
 
 const LINE_W: f32 = 1.5;
 
-/// True when the point is a bezier handle (h1/h2 slot of any span).
-fn is_bezier_handle(doc: &Document, pid: crate::core::ids::PointId) -> bool {
-    doc.all_segments().any(|(_, s)| {
-        s.kind == SegmentKind::Bezier && (s.ctrl == Some(pid) || s.center == Some(pid))
-    })
-}
-
 // Solid polyline (arc rendering) with round joins AND round caps: a
 // disk per vertex fuses the butt-jointed quads below, so thick strokes
 // never crack at tessellation joints and curves read round instead of
 // faceted. Zero-length runs collapse to a single disk, never NaNs.
+// Disks are gated to width > 2.0: at thin UI widths (1–1.5px, the common
+// case) joint cracks are subpixel and the N extra Disk primitives double
+// the draw list for no visible change.
 fn push_polyline(
     list: &mut Vec<Primitive>,
     pts: &[(f32, f32)],
@@ -918,6 +1000,7 @@ fn push_polyline(
     if pts.is_empty() {
         return;
     }
+    list.reserve(pts.len());
     for w in pts.windows(2) {
         list.push(Primitive::Line {
             ax: w[0].0,
@@ -927,6 +1010,9 @@ fn push_polyline(
             width,
             color,
         });
+    }
+    if width <= 2.0 {
+        return;
     }
     let r = (width / 2.).max(0.5);
     let mut prev: Option<(f32, f32)> = None;
@@ -939,6 +1025,76 @@ fn push_polyline(
         prev = Some(p);
         list.push(Primitive::Disk { cx: p.0, cy: p.1, radius: r, color });
     }
+}
+
+// Streaming polyline simplification with a hard subpixel error bound
+// (greedy RDP: emit the farthest deviator, restart from it). Smooth
+// curves sampled at ~3px collapse 100+ tessellation points to ~10 with
+// <0.25px deviation — invisible under AA — so each curve emits ~10 GPU
+// primitives instead of ~100. Cusps survive: deviation spikes keep them.
+// O(n·run) worst case, trivial for n ≤ 1024.
+fn simplify_screen(out: &mut Vec<(f32, f32)>, pts: &[(f32, f32)]) {
+    const EPS: f32 = 0.25; // px
+    out.clear();
+    if pts.len() <= 2 {
+        out.extend_from_slice(pts);
+        return;
+    }
+    out.reserve(pts.len());
+    let mut anchor = 0usize;
+    out.push(pts[0]);
+    let mut i = 1usize;
+    while i < pts.len() {
+        let (ax, ay) = pts[anchor];
+        let (bx, by) = pts[i];
+        let dx = bx - ax;
+        let dy = by - ay;
+        let len = (dx * dx + dy * dy).sqrt();
+        let mut max_d = 0f32;
+        let mut max_j = anchor + 1;
+        if len > 1e-6 {
+            let inv = 1.0 / len;
+            for j in anchor + 1..i {
+                let d = ((pts[j].0 - ax) * dy - (pts[j].1 - ay) * dx).abs() * inv;
+                if d > max_d {
+                    max_d = d;
+                    max_j = j;
+                }
+            }
+        }
+        if max_d > EPS {
+            out.push(pts[max_j]);
+            anchor = max_j;
+        } else {
+            i += 1;
+        }
+    }
+    let last = pts[pts.len() - 1];
+    if out.last() != Some(&last) {
+        out.push(last);
+    }
+}
+
+/// Transform doc points to screen, simplify, and emit as one stroked
+/// polyline — with zero per-curve allocation once the caller's scratch
+/// buffers are warm. Replaces the `collect::<Vec<_>>()` + `push_polyline`
+/// pattern at every curve paint site.
+fn push_simplified_polyline(
+    list: &mut Vec<Primitive>,
+    scr_buf: &mut Vec<(f32, f32)>,
+    sim_buf: &mut Vec<(f32, f32)>,
+    pts: &[Point2],
+    scr: &impl Fn(Point2) -> (f32, f32),
+    width: f32,
+    color: gpui::Background,
+) {
+    scr_buf.clear();
+    scr_buf.reserve(pts.len());
+    for p in pts {
+        scr_buf.push(scr(*p));
+    }
+    simplify_screen(sim_buf, scr_buf);
+    push_polyline(list, sim_buf, width, color);
 }
 
 // Dashed polyline (missing arc portion) — continuous dash pattern
@@ -1119,6 +1275,9 @@ fn element_outline(
     list: &mut Vec<Primitive>,
     zoom: f64,
     cache: &mut RenderCache,
+    bezier_handles: &std::collections::HashSet<crate::core::ids::PointId>,
+    scr_buf: &mut Vec<(f32, f32)>,
+    sim_buf: &mut Vec<(f32, f32)>,
 ) {
     match el {
         // Points use the SAME styling everywhere: one clean small dot —
@@ -1126,7 +1285,7 @@ fn element_outline(
         ElementRef::Point(pid) => {
             if let Some(p) = doc.point(pid) {
                 let (x, y) = scr(p);
-                if is_bezier_handle(doc, pid) {
+                if bezier_handles.contains(&pid) {
                     list.push(Primitive::Diamond {
                         cx: x,
                         cy: y,
@@ -1147,15 +1306,13 @@ fn element_outline(
                 && let Some(samples) = cache.arc_samples(doc, sid, zoom)
             {
                 let live = trimmed_samples(doc, sid, samples);
-                let pts: Vec<(f32, f32)> = live.iter().map(|p| scr(*p)).collect();
-                push_polyline(list, &pts, 2.5, accent);
+                push_simplified_polyline(list, scr_buf, sim_buf, live, scr, 2.5, accent);
             } else if let Some(seg) = doc.segment(sid)
                 && seg.kind == SegmentKind::Bezier
-                && let Some(samples) = cache.bezier_samples(doc, sid, zoom)
+                && let Some(entry) = cache.bezier_samples(doc, sid, zoom)
             {
-                let live = trimmed_samples(doc, sid, samples);
-                let pts: Vec<(f32, f32)> = live.iter().map(|p| scr(*p)).collect();
-                push_polyline(list, &pts, 2.5, accent);
+                let live = trimmed_samples(doc, sid, &entry.pts);
+                push_simplified_polyline(list, scr_buf, sim_buf, live, scr, 2.5, accent);
             } else if let Some((a, b)) = fillet_trimmed_line(doc, sid).or_else(|| doc.segment_geom(sid)) {
                 let (ax, ay) = scr(a);
                 let (bx, by) = scr(b);

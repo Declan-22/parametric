@@ -186,6 +186,12 @@ pub fn update(ed: &mut Editor) {
     if let Some(drag) = &ed.dragging {
         let dragged: std::collections::HashSet<_> =
             drag.points.iter().map(|(id, _)| *id).collect();
+        // Radius-annotated arcs, collected once (was O(A·D): a full
+        // dimension scan per arc per frame).
+        let radius_segs: std::collections::HashSet<_> = ed.doc.dimensions.iter().filter_map(|d| match d.target {
+            crate::core::constraints::DimTarget::Radius { seg } => Some(seg),
+            _ => None,
+        }).collect();
         for (seg_id, seg) in ed.doc.all_segments() {
             if seg.kind != crate::core::document::SegmentKind::Arc {
                 continue;
@@ -193,12 +199,7 @@ pub fn update(ed: &mut Editor) {
             // A persisted radius dimension is the authoritative annotation;
             // suppress the temporary resize accent so the two annotations do
             // not overlap or disagree while the arc is dragged.
-            if ed.doc.dimensions.iter().any(|d| {
-                matches!(
-                    d.target,
-                    crate::core::constraints::DimTarget::Radius { seg: sid } if sid == seg_id
-                )
-            }) {
+            if radius_segs.contains(&seg_id) {
                 continue;
             }
             let is_dragged = seg.ctrl.is_some_and(|c| dragged.contains(&c))
@@ -248,16 +249,16 @@ pub fn update(ed: &mut Editor) {
                 .map(|&(_, s)| s)
                 .or_else(|| ed.doc.point(pid))
         };
+        // CurveLength-annotated spans, collected once (was O(B·D)).
+        let curvelen_segs: std::collections::HashSet<_> = ed.doc.dimensions.iter().filter_map(|d| match d.target {
+            crate::core::constraints::DimTarget::CurveLength { seg } => Some(seg),
+            _ => None,
+        }).collect();
         for (seg_id, seg) in ed.doc.all_segments() {
             if seg.kind != crate::core::document::SegmentKind::Bezier {
                 continue;
             }
-            if ed.doc.dimensions.iter().any(|d| {
-                matches!(
-                    d.target,
-                    crate::core::constraints::DimTarget::CurveLength { seg: sid } if sid == seg_id
-                )
-            }) {
+            if curvelen_segs.contains(&seg_id) {
                 continue;
             }
             let members = [
@@ -269,9 +270,14 @@ pub fn update(ed: &mut Editor) {
             if !members.into_iter().flatten().any(|p| dragged.contains(&p)) {
                 continue;
             }
-            // Start vs current arc-length of the EXACT curve.
+            // Start vs current arc-length of the EXACT curve, sampled at
+            // the same adaptive count the replica below uses (was two
+            // fixed-48 flattens PLUS the replica's own sampling — three
+            // tessellations per bezier per frame during drags).
+            let zoom = ed.camera.zoom;
             let bez = |p0: Point2, c1: Point2, c2: Point2, p1: Point2| {
-                crate::editor::bezier::samples(p0, c1, c2, p1, 48)
+                let n = bezier_sample_count(zoom, p0, c1, c2, p1);
+                crate::editor::bezier::samples(p0, c1, c2, p1, n)
             };
             let (h1, h2) = seg.bezier_handles();
             let (Some(p0), Some(c1), Some(c2), Some(p1)) = (
@@ -352,8 +358,11 @@ pub fn update(ed: &mut Editor) {
     }
 
     // Stored dimensions: rendered at their own angle and placement.
-    let dims = ed.doc.dimensions.clone();
-    for (i, d) in dims.iter().enumerate() {
+    // Indexed copy per dim (Dimension is Copy) — was a full Vec clone
+    // per frame.
+    let ndims = ed.doc.dimensions.len();
+    for i in 0..ndims {
+        let d = ed.doc.dimensions[i];
         let editing = ed
             .dim_input.as_ref()
             .is_some_and(|input| input.existing == Some(i));
@@ -899,23 +908,25 @@ pub(crate) fn bezier_replica(
         .collect();
     // Arclength fraction for the label ride, interpolated between
     // samples so the container glides instead of stepping vertex to
-    // vertex.
+    // vertex. Single walk with a running length (was a cum Vec per dim
+    // per frame).
     let mut total = 0.;
-    let mut cum = vec![0.];
     for w in off.windows(2) {
         total += pick::distance(w[0], w[1]);
-        cum.push(total);
     }
     let target_len = total * slide.clamp(0., 1.);
     let mut li = 0;
     let mut lt = 0.;
-    for i in 0..off.len().saturating_sub(1) {
-        if cum[i + 1] <= target_len {
+    let mut run = 0.;
+    for (i, w) in off.windows(2).enumerate() {
+        let seglen = pick::distance(w[0], w[1]);
+        if run + seglen <= target_len {
+            run += seglen;
             li = i + 1;
             continue;
         }
-        let seg = (cum[i + 1] - cum[i]).max(1e-12);
-        lt = ((target_len - cum[i]) / seg).clamp(0., 1.);
+        let seg = seglen.max(1e-12);
+        lt = ((target_len - run) / seg).clamp(0., 1.);
         li = i;
         break;
     }
@@ -971,20 +982,23 @@ pub(crate) fn bezier_sample_count(
 /// Unlike nearest-vertex lookup this glides smoothly — no teleporting
 /// when the cursor sits equidistant to distant samples.
 pub(crate) fn project_polyline(pts: &[Point2], at: Point2) -> (f64, f64, f64) {
+    // Allocation-free: two passes over the windows (total, then the winning
+    // segment with its running arclength) instead of a cum Vec per call.
+    // Runs per mousemove during dim placement/drag.
     let mut total = 0f64;
-    let mut cum = vec![0f64];
     for w in pts.windows(2) {
         total += pick::distance(w[0], w[1]);
-        cum.push(total);
     }
     if pts.len() < 2 || total < 1e-9 {
         return (0., total.max(0.), f64::MAX);
     }
-    let mut best = (0usize, 0f64, f64::MAX, 0f64);
-    for (i, w) in pts.windows(2).enumerate() {
+    let mut best = (0f64, 0f64, f64::MAX, 0f64, 0f64);
+    let mut run = 0f64;
+    for w in pts.windows(2) {
         let (ax, ay) = (w[0].x, w[0].y);
         let (dx, dy) = (w[1].x - ax, w[1].y - ay);
         let len2 = dx * dx + dy * dy;
+        let seglen = len2.sqrt();
         let t = if len2 < 1e-12 {
             0.
         } else {
@@ -995,18 +1009,17 @@ pub(crate) fn project_polyline(pts: &[Point2], at: Point2) -> (f64, f64, f64) {
         let py = ay + dy * t;
         let d = ((at.x - px) * (at.x - px) + (at.y - py) * (at.y - py)).sqrt();
         if d < best.2 {
-            let seglen = len2.sqrt();
             let (nx, ny) = if seglen < 1e-12 {
                 (0., 0.)
             } else {
                 (-dy / seglen, dx / seglen)
             };
-            best = (i, t, d, (at.x - px) * nx + (at.y - py) * ny);
+            best = (run, t, d, (at.x - px) * nx + (at.y - py) * ny, seglen);
         }
+        run += seglen;
     }
-    let (i, t, _, signed) = best;
-    let seglen = if i + 1 < cum.len() { cum[i + 1] - cum[i] } else { 0. };
-    (cum[i] + t * seglen, total, signed)
+    let (run_at, t, _, signed, seglen) = best;
+    (run_at + t * seglen, total, signed)
 }
 
 /// Unit direction + LEFT normal of a vector (doc space is y-down like the
@@ -1160,9 +1173,24 @@ fn update_constraint_markers(ed: &mut Editor) {
         })
         .unwrap_or((Vec::new(), Vec::new()));
 
-    let constraints = ed.doc.constraints.clone();
+    // Indexed walk (Constraint is Copy) — was a full Vec clone per frame.
+    // Edge-pair membership precomputed once (was O(C·S): a segment scan
+    // per constraint per frame).
+    let edge_pairs: std::collections::HashSet<(crate::core::ids::PointId, crate::core::ids::PointId)> = ed
+        .doc
+        .all_segments()
+        .map(|(_, s)| {
+            if (s.start.idx, s.start.generation) <= (s.end.idx, s.end.generation) {
+                (s.start, s.end)
+            } else {
+                (s.end, s.start)
+            }
+        })
+        .collect();
+    let nconstraints = ed.doc.constraints.len();
     let mut tangent_pairs = std::collections::HashSet::new();
-    for c in constraints {
+    for ci in 0..nconstraints {
+        let c = ed.doc.constraints[ci];
         if c.kind == crate::core::constraints::ConstraintKind::Tangent
             && let Some((first, second)) = c.tangent_segments
         {
@@ -1182,10 +1210,12 @@ fn update_constraint_markers(ed: &mut Editor) {
 
         // -- position: deterministic per structural case --
         let mut guide: Option<[f32; 4]> = None;
-        let is_edge_pair = |s: crate::core::document::Segment| {
-            (s.start == c.a && s.end == c.b) || (s.start == c.b && s.end == c.a)
+        let key = if (c.a.idx, c.a.generation) <= (c.b.idx, c.b.generation) {
+            (c.a, c.b)
+        } else {
+            (c.b, c.a)
         };
-        let has_own_edge = ed.doc.all_segments().any(|(_, s)| is_edge_pair(s));
+        let has_own_edge = edge_pairs.contains(&key);
         let mid = (((ma.x + mb.x) / 2.) as f32, ((ma.y + mb.y) / 2.) as f32);
         let pair_junction = c.tangent_segments.and_then(|(first, second)| {
             let first = ed.doc.segment(first)?;

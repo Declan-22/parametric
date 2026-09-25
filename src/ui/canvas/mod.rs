@@ -589,6 +589,10 @@ impl CanvasView {
                     f64::from(c.y),
                 ))
             });
+            // Coarse tessellation while dragging (preview quality, full
+            // detail returns on release via the fingerprint change).
+            ed.render_cache.borrow_mut().tess_cap =
+                if ed.dragging.is_some() { 64 } else { usize::MAX };
             let list = paint::build_draw_list(
                 &ed.doc,
                 &ed.camera,

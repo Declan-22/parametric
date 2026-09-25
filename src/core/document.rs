@@ -1,6 +1,8 @@
 use super::constraints::{Constraint, ConstraintKind, Dimension, ElementRef};
 use super::geometry::{Point2, Rect};
 use super::ids::{FillId, PointId, SegmentId};
+use std::cell::RefCell;
+use std::rc::Rc;
 
 // The permanent design. "What exists in the document?"
 // No GPUI types here — the engine is UI-independent.
@@ -24,7 +26,7 @@ impl Default for DocSettings {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct Document {
     // View/snap toggles. Saved PER design; new designs seed from the
     // app-level "last used" prefs (Registry) instead of hard-coded values.
@@ -41,6 +43,27 @@ pub struct Document {
     /// Parametric edge treatments. The source segments remain identifiable so
     /// the treatment can be removed without losing the user's geometry.
     pub modifiers: Vec<crate::core::fillet::Fillet>,
+    // Cached solver topology (fingerprint-gated). Runtime-only: never
+    // persisted, and deliberately excluded from PartialEq below so a warm
+    // cache never compares unequal to an identical cold document.
+    topo: RefCell<Option<(u64, Rc<super::graph::Topology>)>>,
+}
+
+// Equality is structural content only. The topology cache is derived state:
+// excluding it keeps history comparison (`snap != doc`) and save/load
+// round-trips exact regardless of cache warmth. Keep this in sync with the
+// fields above when adding new ones.
+impl PartialEq for Document {
+    fn eq(&self, other: &Self) -> bool {
+        self.settings == other.settings
+            && self.layers == other.layers
+            && self.points == other.points
+            && self.segments == other.segments
+            && self.fills == other.fills
+            && self.constraints == other.constraints
+            && self.dimensions == other.dimensions
+            && self.modifiers == other.modifiers
+    }
 }
 
 // -- entities --
@@ -418,6 +441,12 @@ impl Document {
     /// All fills in the document (id + payload).
     pub fn all_fills(&self) -> impl Iterator<Item = (FillId, &Fill)> + '_ {
         self.fills.iter().map(|(idx, generation, f)| (FillId { idx, generation: generation }, f))
+    }
+
+    /// Shared solver topology, rebuilt only when the structural
+    /// fingerprint changed. Drags (pure moves) always hit cache.
+    pub fn topology(&self) -> Rc<super::graph::Topology> {
+        super::graph::Topology::for_document(self, &mut self.topo.borrow_mut())
     }
 
     // -- fills --

@@ -254,6 +254,9 @@ pub fn update(ed: &mut Editor) {
             crate::core::constraints::DimTarget::CurveLength { seg } => Some(seg),
             _ => None,
         }).collect();
+        // One scratch buffer for the whole frame: cur and start sampling
+        // share it sequentially instead of allocating two Vecs per bezier.
+        let mut scratch: Vec<Point2> = Vec::new();
         for (seg_id, seg) in ed.doc.all_segments() {
             if seg.kind != crate::core::document::SegmentKind::Bezier {
                 continue;
@@ -271,14 +274,10 @@ pub fn update(ed: &mut Editor) {
                 continue;
             }
             // Start vs current arc-length of the EXACT curve, sampled at
-            // the same adaptive count the replica below uses (was two
-            // fixed-48 flattens PLUS the replica's own sampling — three
-            // tessellations per bezier per frame during drags).
+            // the same adaptive count the replica below uses. One scratch
+            // buffer serves both passes plus the replica (which runs last,
+            // on the current samples, only when the gate passes).
             let zoom = ed.camera.zoom;
-            let bez = |p0: Point2, c1: Point2, c2: Point2, p1: Point2| {
-                let n = bezier_sample_count(zoom, p0, c1, c2, p1);
-                crate::editor::bezier::samples(p0, c1, c2, p1, n)
-            };
             let (h1, h2) = seg.bezier_handles();
             let (Some(p0), Some(c1), Some(c2), Some(p1)) = (
                 ed.doc.point(seg.start),
@@ -288,9 +287,6 @@ pub fn update(ed: &mut Editor) {
             ) else {
                 continue;
             };
-            let cur_pts = bez(p0, c1, c2, p1);
-            let cur_len: f64 =
-                cur_pts.windows(2).map(|w| pick::distance(w[0], w[1])).sum();
             let (Some(s0), Some(s1), Some(s2), Some(s3)) = (
                 start_of(seg.start),
                 h1.and_then(|id| start_of(id)),
@@ -299,16 +295,23 @@ pub fn update(ed: &mut Editor) {
             ) else {
                 continue;
             };
-            let start_pts = bez(s0, s1, s2, s3);
+            let n = bezier_sample_count(zoom, s0, s1, s2, s3);
+            crate::editor::bezier::samples_into(s0, s1, s2, s3, n, &mut scratch);
             let start_len: f64 =
-                start_pts.windows(2).map(|w| pick::distance(w[0], w[1])).sum();
+                scratch.windows(2).map(|w| pick::distance(w[0], w[1])).sum();
+            let n = bezier_sample_count(zoom, p0, c1, c2, p1);
+            crate::editor::bezier::samples_into(p0, c1, c2, p1, n, &mut scratch);
+            let cur_len: f64 =
+                scratch.windows(2).map(|w| pick::distance(w[0], w[1])).sum();
             if (cur_len - start_len).abs() <= 0.5 {
                 continue;
             }
             // Transient replica of the exact curve: fixed small pixel
-            // offset, label mid-curve.
-            let zoom = ed.camera.zoom;
-            let Some((pts, stubs, lcx, lcy)) = bezier_replica(ed, seg_id, 18. / zoom, 0.5) else {
+            // offset, label mid-curve. Runs on the current samples still
+            // in the scratch buffer, only when the gate above passes.
+            let Some((pts, stubs, lcx, lcy)) =
+                bezier_replica(ed, seg_id, &scratch, 18. / zoom, 0.5)
+            else {
                 continue;
             };
             ed.curve_dim_renders.push(CurveDimRender {
@@ -849,8 +852,17 @@ fn push_dim_target(
             // Bezier-only: the dim line IS the exact curve shape — an
             // offset replica of the sampled path, NOT the chord. Offset is
             // user-controlled (doc units, like a line dim); the label rides
-            // the replica at the placed arclength fraction.
-            let Some((pts, stubs, lcx, lcy)) = bezier_replica(ed, *seg, offset, slide) else {
+            // the replica at the placed arclength fraction. Samples come
+            // from the render cache (tessellated for paint anyway) so this
+            // never flattens on its own.
+            let replica = {
+                let mut cache = ed.render_cache.borrow_mut();
+                let Some(entry) = cache.bezier_samples(&ed.doc, *seg, ed.camera.zoom) else {
+                    return;
+                };
+                bezier_replica(ed, *seg, &entry.pts, offset, slide)
+            };
+            let Some((pts, stubs, lcx, lcy)) = replica else {
                 return;
             };
             ed.curve_dim_renders.push(CurveDimRender {
@@ -868,14 +880,14 @@ fn push_dim_target(
     }
 }
 
-/// Offset replica of a bezier span: resamples the exact curve, pushes each
-/// sample along the chord normal by `offset` (doc units), projects to
-/// screen. Returns (screen polyline, offset stubs clamping the replica to
-/// the real endpoints, label_cx, label_cy). None for non-beziers or
-/// degenerate spans.
+/// Offset replica of a bezier span from precomputed samples: pushes each
+/// sample along the chord normal by `offset`, projects to screen. The
+/// caller supplies the samples (drag scratch or render cache) so the
+/// replica never tessellates on its own.
 pub(crate) fn bezier_replica(
     ed: &Editor,
     sid: crate::core::ids::SegmentId,
+    src: &[Point2],
     offset: f64,
     slide: f64,
 ) -> Option<(Vec<[f32; 2]>, Vec<[f32; 4]>, f32, f32)> {
@@ -883,26 +895,12 @@ pub(crate) fn bezier_replica(
     if seg_d.kind != crate::core::document::SegmentKind::Bezier {
         return None;
     }
-    let (h1, h2) = seg_d.bezier_handles();
-    let (p0, c1, c2, p1) = (
-        ed.doc.point(seg_d.start)?,
-        ed.doc.point(h1?)?,
-        ed.doc.point(h2?)?,
-        ed.doc.point(seg_d.end)?,
-    );
-    let pts = crate::editor::bezier::samples(
-        p0,
-        c1,
-        c2,
-        p1,
-        bezier_sample_count(ed.camera.zoom, p0, c1, c2, p1),
-    );
-    if pts.len() < 2 {
+    if src.len() < 2 {
         return None;
     }
-    let (a0, b0) = (pts[0], pts[pts.len() - 1]);
+    let (a0, b0) = (src[0], src[src.len() - 1]);
     let (_, n) = dim_axes(b0.x - a0.x, b0.y - a0.y);
-    let off: Vec<Point2> = pts
+    let off: Vec<Point2> = src
         .iter()
         .map(|p| Point2::new(p.x + n.0 * offset, p.y + n.1 * offset))
         .collect();
@@ -946,8 +944,8 @@ pub(crate) fn bezier_replica(
         .collect();
     // Clamping stubs: replica ends back to the real curve endpoints.
     let (r0, r1) = (
-        ed.camera.unit_to_screen(pts[0]),
-        ed.camera.unit_to_screen(pts[pts.len() - 1]),
+        ed.camera.unit_to_screen(src[0]),
+        ed.camera.unit_to_screen(src[src.len() - 1]),
     );
     let stubs = vec![
         [scr[0][0], scr[0][1], r0.x as f32, r0.y as f32],

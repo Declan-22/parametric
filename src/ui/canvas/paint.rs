@@ -19,10 +19,19 @@ pub struct BezEntry {
     pub bb: [f64; 4],
 }
 
-#[derive(Default)]
 pub struct RenderCache {
     arcs: HashMap<crate::core::ids::SegmentId, (u64, Vec<Point2>)>,
     beziers: HashMap<crate::core::ids::SegmentId, BezEntry>,
+    /// Max bezier tessellation samples; the canvas sets a low cap while a
+    /// drag is active (preview quality) and restores full after. Part of
+    /// the fingerprint so capped geometry never survives the gesture.
+    pub tess_cap: usize,
+}
+
+impl Default for RenderCache {
+    fn default() -> Self {
+        Self { arcs: HashMap::new(), beziers: HashMap::new(), tess_cap: usize::MAX }
+    }
 }
 
 /// Quantized zoom for cache fingerprints. Retessellating on every
@@ -100,6 +109,7 @@ impl RenderCache {
         let zkey = zoom_key(zoom);
         let fingerprint = [
             zkey,
+            self.tess_cap as u64,
             a.x.to_bits(),
             a.y.to_bits(),
             b.x.to_bits(),
@@ -118,7 +128,7 @@ impl RenderCache {
             .get(&sid)
             .is_none_or(|e| e.fp != fingerprint);
         if needs_refresh {
-            let n = crate::editor::bezier::adaptive_samples(a, b, c, d, zoom);
+            let n = crate::editor::bezier::adaptive_samples(a, b, c, d, zoom).min(self.tess_cap);
             self.evict_beziers_if_oversized();
             // Reuse the retained allocation when the entry exists: during
             // drags the fingerprint changes every frame, and a fresh Vec
@@ -466,33 +476,47 @@ pub fn build_draw_list(
                         ) else {
                             continue;
                         };
-                        // Note: adaptive count lives inside the cache —
-                        // the old outer computation was discarded.
-                        let Some(entry) = cache.bezier_samples(doc, sid, camera.zoom) else {
-                            continue;
-                        };
-                        // O(1) bbox cull on the cached bounds (was a full
-                        // N-point scan per curve per frame).
-                        let bb = entry.bb;
                         let vx0 = visible.origin.x;
                         let vy0 = visible.origin.y;
-                        if bb[2] < vx0
-                            || bb[0] > vx0 + visible.size.w
-                            || bb[3] < vy0
-                            || bb[1] > vy0 + visible.size.h
-                        {
-                            // Still fall through to handles below.
-                        } else {
-                            let live = trimmed_samples(doc, sid, &entry.pts);
-                            push_simplified_polyline(
-                                &mut list,
-                                &mut scr_buf,
-                                &mut sim_buf,
-                                live,
-                                &scr,
-                                seg.stroke_width.max(1.) as f32,
-                                color,
-                            );
+                        let (vx1, vy1) = (vx0 + visible.size.w, vy0 + visible.size.h);
+                        // Cage pre-cull before tessellation: the control
+                        // bbox contains the curve, so fully-outside spans
+                        // skip the cache entirely (handles still run below).
+                        let (mut lox, mut hix) = (p0.x.min(p1.x), p0.x.max(p1.x));
+                        let (mut loy, mut hiy) = (p0.y.min(p1.y), p0.y.max(p1.y));
+                        for q in [c1, c2] {
+                            lox = lox.min(q.x);
+                            hix = hix.max(q.x);
+                            loy = loy.min(q.y);
+                            hiy = hiy.max(q.y);
+                        }
+                        if hix >= vx0 && lox <= vx1 && hiy >= vy0 && loy <= vy1 {
+                            // Note: adaptive count lives inside the cache —
+                            // the old outer computation was discarded.
+                            let Some(entry) = cache.bezier_samples(doc, sid, camera.zoom) else {
+                                continue;
+                            };
+                            // O(1) bbox cull on the cached bounds (was a full
+                            // N-point scan per curve per frame).
+                            let bb = entry.bb;
+                            if bb[2] < vx0
+                                || bb[0] > vx0 + visible.size.w
+                                || bb[3] < vy0
+                                || bb[1] > vy0 + visible.size.h
+                            {
+                                // Still fall through to handles below.
+                            } else {
+                                let live = trimmed_samples(doc, sid, &entry.pts);
+                                push_simplified_polyline(
+                                    &mut list,
+                                    &mut scr_buf,
+                                    &mut sim_buf,
+                                    live,
+                                    &scr,
+                                    seg.stroke_width.max(1.) as f32,
+                                    color,
+                                );
+                            }
                         }
                         // Handles whenever the span OR any of its four
                         // points (endpoints included) is selected or
@@ -749,11 +773,17 @@ pub fn build_draw_list(
                     });
                     continue;
                 }
-                list.push(Primitive::Circle {
-                    cx: x,
-                    cy: y,
-                    radius: 4.,
-                });
+                // Directly picked points fill accent; corners of selected
+                // shapes stay white dots.
+                if selection.contains(&ElementRef::Point(pid)) {
+                    list.push(Primitive::Disk { cx: x, cy: y, radius: 4., color: accent });
+                } else {
+                    list.push(Primitive::Circle {
+                        cx: x,
+                        cy: y,
+                        radius: 4.,
+                    });
+                }
             }
         }
     }

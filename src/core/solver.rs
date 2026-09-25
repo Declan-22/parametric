@@ -112,11 +112,11 @@ enum Eq {
     // where the arc representation flips branches. Deliberate large drags
     // can still invert through an explicit endpoint/arc reshape.
     ArcBend { s: usize, e: usize, c: usize, side: f64 },
-    Tangent { l1: usize, l2: usize, o: usize, p: usize },
+    Tangent { l1: usize, l2: usize, o: usize, p: usize, branch: f32 },
     // Residual: cross(line_dir, contact-handle)/mean_len — a line tangent
     // to a BEZIER at the contact endpoint (handle = the contact's near
     // handle). Same form as Parallel, different segment pairing.
-    LineBezierTangent { l1: usize, l2: usize, h: usize, p: usize },
+    LineBezierTangent { l1: usize, l2: usize, h: usize, p: usize, branch: f32 },
     // Residual: 12-sample polyline arc-length of the cubic - target.
     BezierLength { p0: usize, c1: usize, c2: usize, p1: usize, target: f64 },
     // Residual: midpoint span between two edges minus target. axis 0/1 =
@@ -124,8 +124,12 @@ enum Eq {
     // |midB-midA| distance. Linear ±0.5 weights except the normalized case.
     MidSpan { a1: usize, a2: usize, b1: usize, b2: usize, axis: u8, target: f64 },
     CirclePoint { p: usize, o: usize, radius: f64 },
-    Parallel { a1: usize, a2: usize, b1: usize, b2: usize },
-    Perpendicular { a1: usize, a2: usize, b1: usize, b2: usize },
+    // `branch` (+1/-1/0) is the placed orientation side captured at build
+    // (unit dot for cross-form equations, unit cross for dot-form ones).
+    // A barrier residual holds it: zero while the branch matches, pushing
+    // back once crossed — like ArcBend, it never fights the approach.
+    Parallel { a1: usize, a2: usize, b1: usize, b2: usize, branch: f32 },
+    Perpendicular { a1: usize, a2: usize, b1: usize, b2: usize, branch: f32 },
 }
 
 /// Cubic Bernstein weights at t.
@@ -141,6 +145,29 @@ fn ctrl_point(ctrl: &[Point2; 4], t: f64) -> Point2 {
         w[0] * ctrl[0].x + w[1] * ctrl[1].x + w[2] * ctrl[2].x + w[3] * ctrl[3].x,
         w[0] * ctrl[0].y + w[1] * ctrl[1].y + w[2] * ctrl[2].y + w[3] * ctrl[3].y,
     )
+}
+
+/// Placed orientation side of two directions for branch barriers: unit
+/// dot (cross-form equations) or unit cross (dot-form ones), 0 when
+/// degenerate. Captured at build; the barrier only engages past the flip.
+fn dot_branch(ux: f64, uy: f64, vx: f64, vy: f64) -> f32 {
+    unit_branch(ux * vx + uy * vy, ux * ux + uy * uy, vx * vx + vy * vy)
+}
+
+fn cross_branch(ux: f64, uy: f64, vx: f64, vy: f64) -> f32 {
+    unit_branch(ux * vy - uy * vx, ux * ux + uy * uy, vx * vx + vy * vy)
+}
+
+fn unit_branch(num: f64, lu2: f64, lv2: f64) -> f32 {
+    let denom = (lu2 * lv2).sqrt().max(1e-18);
+    let v = num / denom;
+    if v > 1e-6 {
+        1.0
+    } else if v < -1e-6 {
+        -1.0
+    } else {
+        0.0
+    }
 }
 
 const BEZ_SAMPLES: usize = 12;
@@ -171,6 +198,31 @@ struct Residual {
     // (free variable index, d value / d variable)
     grad: GradBuf,
     weight: f64,
+}
+
+/// Slots an equation reads (`usize::MAX` pads unused lanes).
+fn eq_slots(eq: Eq) -> [usize; 4] {
+    match eq {
+        Eq::Horizontal { a, b }
+        | Eq::Vertical { a, b }
+        | Eq::Distance { a, b, .. }
+        | Eq::DistanceBranch { a, b, .. }
+        | Eq::DistanceX { a, b, .. }
+        | Eq::DistanceY { a, b, .. } => [a, b, usize::MAX, usize::MAX],
+        Eq::PointLineDist { p, l1, l2, .. } => [p, l1, l2, usize::MAX],
+        Eq::LineDist { a1, a2, b1, .. } => [a1, a2, b1, usize::MAX],
+        Eq::Angle { a1, a2, b1, b2, .. }
+        | Eq::Parallel { a1, a2, b1, b2, .. }
+        | Eq::Perpendicular { a1, a2, b1, b2, .. }
+        | Eq::MidSpan { a1, a2, b1, b2, .. } => [a1, a2, b1, b2],
+        Eq::ArcRadius { s, e, c, .. }
+        | Eq::ArcBend { s, e, c, .. } => [s, e, c, usize::MAX],
+        Eq::EqualRadius { o, a, b } => [o, a, b, usize::MAX],
+        Eq::Tangent { l1, l2, o, p, .. } => [l1, l2, o, p],
+        Eq::LineBezierTangent { l1, l2, h, p, .. } => [l1, l2, h, p],
+        Eq::BezierLength { p0, c1, c2, p1, .. } => [p0, c1, c2, p1],
+        Eq::CirclePoint { p, o, .. } => [p, o, usize::MAX, usize::MAX],
+    }
 }
 
 pub struct Solver {
@@ -216,61 +268,15 @@ impl Solver {
         let mut slots: Vec<PointId> = Vec::new();
         let mut index: HashMap<PointId, usize> = HashMap::new();
 
-        // Single-pass indexes over the document topology: point adjacency
-        // (for the drag-component BFS below) and per-point line/curve
-        // ownership (for tangent inference). Previously both were rebuilt
-        // by scanning all segments per constraint / per BFS frontier point.
-        let mut adjacency: HashMap<PointId, Vec<PointId>> = HashMap::new();
-        let mut touch_line: HashMap<PointId, crate::core::ids::SegmentId> = HashMap::new();
-        let mut touch_curve: HashMap<PointId, crate::core::ids::SegmentId> = HashMap::new();
-        {
-            let mut link = |a: PointId, b: PointId| {
-                if a == b {
-                    return;
-                }
-                adjacency.entry(a).or_default().push(b);
-                adjacency.entry(b).or_default().push(a);
-            };
-            for (sid, s) in doc.all_segments() {
-                // Segment clique: every defining point reaches the others.
-                let pts = [Some(s.start), Some(s.end), s.ctrl, s.center];
-                let mut prev: Option<PointId> = None;
-                for p in pts.into_iter().flatten() {
-                    if let Some(q) = prev {
-                        link(q, p);
-                    }
-                    prev = Some(p);
-                }
-                // Tangent inference ownership: endpoints only, matching the
-                // original scan (s.start/s.end == c.a).
-                use crate::core::document::SegmentKind as SK;
-                for p in [s.start, s.end] {
-                    if s.kind == SK::Line {
-                        touch_line.entry(p).or_insert(sid);
-                    } else if matches!(s.kind, SK::Arc | SK::Bezier) {
-                        touch_curve.entry(p).or_insert(sid);
-                    }
-                }
-                // Also link endpoints directly (clique closure for 2-pt segs
-                // is covered, but keep explicit for clarity with 4-pt).
-                link(s.start, s.end);
-            }
-            for c in &doc.constraints {
-                link(c.a, c.b);
-                if let Some(sid) = c.point_on_segment
-                    && let Some(seg) = doc.segment(sid)
-                {
-                    for p in [Some(seg.start), Some(seg.end), seg.ctrl, seg.center].into_iter().flatten() {
-                        link(c.a, p);
-                        link(c.b, p);
-                    }
-                }
-            }
-            for v in adjacency.values_mut() {
-                v.sort_by_key(|p| (p.idx, p.generation));
-                v.dedup();
-            }
-        }
+        // Shared topology (SOL-06): point adjacency for the component BFS
+        // plus per-point line/curve ownership for tangent inference, cached
+        // on the document behind its structural fingerprint. Drags are pure
+        // moves, so every frame of a gesture hits cache instead of
+        // rebuilding three HashMaps from scratch.
+        let topo = doc.topology();
+        let adjacency = &topo.adjacency;
+        let touch_line = &topo.touch_line;
+        let touch_curve = &topo.touch_curve;
 
         let mut slot_of = |pid: PointId| -> Option<usize> {
             if doc.point(pid).is_none() {
@@ -339,12 +345,23 @@ impl Solver {
                             if s.kind != SK::Bezier { return None; }
                             if s.start == endpoint { s.ctrl } else if s.end == endpoint { s.center } else { None }
                         };
+                        let branch = match (
+                            handle(&first, a).and_then(|id| doc.point(id)),
+                            handle(&second, b).and_then(|id| doc.point(id)),
+                            doc.point(a),
+                            doc.point(b),
+                        ) {
+                            (Some(pa), Some(pb), Some(ea), Some(eb)) => dot_branch(
+                                ea.x - pa.x, ea.y - pa.y, eb.x - pb.x, eb.y - pb.y,
+                            ),
+                            _ => 0.0,
+                        };
                         let (Some(ha), Some(hb), Some(a), Some(b)) = (
                             handle(&first, a).and_then(|id| slot_of(id)),
                             handle(&second, b).and_then(|id| slot_of(id)),
                             slot_of(a), slot_of(b),
                         ) else { continue };
-                        eqs.push(Eq::Parallel { a1: ha, a2: a, b1: hb, b2: b });
+                        eqs.push(Eq::Parallel { a1: ha, a2: a, b1: hb, b2: b, branch });
                         continue;
                     }
                     let (line_id, curve_id, line, curve) = match (first.kind, second.kind) {
@@ -367,7 +384,18 @@ impl Solver {
                         ) else {
                             continue;
                         };
-                        eqs.push(Eq::Tangent { l1, l2, o, p });
+                        let branch = match (
+                            doc.point(line.start),
+                            doc.point(line.end),
+                            curve.center.and_then(|id| doc.point(id)),
+                            doc.point(c.a),
+                        ) {
+                            (Some(ls), Some(le), Some(o), Some(cp)) => cross_branch(
+                                le.x - ls.x, le.y - ls.y, cp.x - o.x, cp.y - o.y,
+                            ),
+                            _ => 0.0,
+                        };
+                        eqs.push(Eq::Tangent { l1, l2, o, p, branch });
                         let edge_drag = drag.iter().filter(|(id, _)| {
                             *id == line.start || *id == line.end
                         }).count() == 2;
@@ -419,7 +447,18 @@ impl Solver {
                         else {
                             continue;
                         };
-                        eqs.push(Eq::LineBezierTangent { l1, l2, h, p });
+                        let branch = match (
+                            doc.point(line.start),
+                            doc.point(line.end),
+                            handle.and_then(|id| doc.point(id)),
+                            doc.point(c.a),
+                        ) {
+                            (Some(ls), Some(le), Some(hp), Some(cp)) => dot_branch(
+                                le.x - ls.x, le.y - ls.y, cp.x - hp.x, cp.y - hp.y,
+                            ),
+                            _ => 0.0,
+                        };
+                        eqs.push(Eq::LineBezierTangent { l1, l2, h, p, branch });
                         let _ = curve_id;
                     }
                 }
@@ -428,14 +467,36 @@ impl Solver {
                     let (Some(a_seg), Some(b_seg)) = (doc.segment(first), doc.segment(second)) else { continue };
                     let (Some(a1), Some(a2), Some(b1), Some(b2)) = (
                         slot_of(a_seg.start), slot_of(a_seg.end), slot_of(b_seg.start), slot_of(b_seg.end)) else { continue };
-                    eqs.push(Eq::Parallel { a1, a2, b1, b2 });
+                    let branch = match (
+                        doc.point(a_seg.start),
+                        doc.point(a_seg.end),
+                        doc.point(b_seg.start),
+                        doc.point(b_seg.end),
+                    ) {
+                        (Some(aa), Some(ab), Some(ba), Some(bb)) => dot_branch(
+                            ab.x - aa.x, ab.y - aa.y, bb.x - ba.x, bb.y - ba.y,
+                        ),
+                        _ => 0.0,
+                    };
+                    eqs.push(Eq::Parallel { a1, a2, b1, b2, branch });
                 }
                 ConstraintKind::Perpendicular => {
                     let Some((first, second)) = c.tangent_segments else { continue };
                     let (Some(a_seg), Some(b_seg)) = (doc.segment(first), doc.segment(second)) else { continue };
                     let (Some(a1), Some(a2), Some(b1), Some(b2)) = (
                         slot_of(a_seg.start), slot_of(a_seg.end), slot_of(b_seg.start), slot_of(b_seg.end)) else { continue };
-                    eqs.push(Eq::Perpendicular { a1, a2, b1, b2 });
+                    let branch = match (
+                        doc.point(a_seg.start),
+                        doc.point(a_seg.end),
+                        doc.point(b_seg.start),
+                        doc.point(b_seg.end),
+                    ) {
+                        (Some(aa), Some(ab), Some(ba), Some(bb)) => cross_branch(
+                            ab.x - aa.x, ab.y - aa.y, bb.x - ba.x, bb.y - ba.y,
+                        ),
+                        _ => 0.0,
+                    };
+                    eqs.push(Eq::Perpendicular { a1, a2, b1, b2, branch });
                 }
             }
         }
@@ -969,36 +1030,63 @@ impl Solver {
             n_free = next;
         }
 
-        let active_eqs = eqs
+        let mut active_eqs: Vec<Eq> = eqs
             .iter()
             .copied()
             .filter(|&eq| {
-                let slots = match eq {
-                    Eq::Horizontal { a, b }
-                    | Eq::Vertical { a, b }
-                    | Eq::Distance { a, b, .. }
-                    | Eq::DistanceBranch { a, b, .. }
-                    | Eq::DistanceX { a, b, .. }
-                    | Eq::DistanceY { a, b, .. } => [a, b, usize::MAX, usize::MAX],
-                    Eq::PointLineDist { p, l1, l2, .. } => [p, l1, l2, usize::MAX],
-                    Eq::LineDist { a1, a2, b1, .. } => [a1, a2, b1, usize::MAX],
-                    Eq::Angle { a1, a2, b1, b2, .. }
-                    | Eq::Parallel { a1, a2, b1, b2 }
-                    | Eq::Perpendicular { a1, a2, b1, b2 }
-                    | Eq::MidSpan { a1, a2, b1, b2, .. } => [a1, a2, b1, b2],
-                    Eq::ArcRadius { s, e, c, .. }
-                    | Eq::ArcBend { s, e, c, .. } => [s, e, c, usize::MAX],
-                    Eq::EqualRadius { o, a, b } => [o, a, b, usize::MAX],
-                    Eq::Tangent { l1, l2, o, p } => [l1, l2, o, p],
-                    Eq::LineBezierTangent { l1, l2, h, p } => [l1, l2, h, p],
-                    Eq::BezierLength { p0, c1, c2, p1, .. } => [p0, c1, c2, p1],
-                    Eq::CirclePoint { p, o, .. } => [p, o, usize::MAX, usize::MAX],
-                };
-                slots.iter().any(|&slot| {
+                eq_slots(eq).iter().any(|&slot| {
                     slot != usize::MAX && free_of[slot].is_some()
                 })
             })
             .collect();
+
+        // Anchor-only followers skip iteration: their sole residuals are
+        // soft anchors, minimized exactly at the anchor independent of all
+        // other variables — pinning them shrinks the dense system (cubic
+        // cost) at a bit-identical optimum. Dragged slots always carry
+        // drag residuals and are never eligible. Output coverage is
+        // unchanged: pinned slots still report (at their anchor) in
+        // `positions` like any other fixed slot.
+        let dragged: HashSet<usize> = drag_idx.iter().map(|&(s, _)| s).collect();
+        let mut touched = vec![false; slots.len()];
+        for eq in &active_eqs {
+            for slot in eq_slots(*eq) {
+                if slot != usize::MAX {
+                    touched[slot] = true;
+                }
+            }
+        }
+        let mut pinned_any = false;
+        for (s, free) in free_of.iter_mut().enumerate() {
+            if free.is_none() || touched[s] || dragged.contains(&s) {
+                continue;
+            }
+            if let Some(&(_, anchor, _)) = aux_idx.iter().find(|(slot, _, _)| *slot == s) {
+                *free = None;
+                fixed[s] = true;
+                fixed_pos[s] = anchor;
+                pinned_any = true;
+            }
+        }
+        if pinned_any {
+            let mut next = 0;
+            for slot in &mut free_of {
+                if slot.is_some() {
+                    *slot = Some(next);
+                    next += 1;
+                }
+            }
+            n_free = next;
+            active_eqs = eqs
+                .iter()
+                .copied()
+                .filter(|&eq| {
+                    eq_slots(eq).iter().any(|&slot| {
+                        slot != usize::MAX && free_of[slot].is_some()
+                    })
+                })
+                .collect();
+        }
 
         Solver {
             slots,
@@ -1138,6 +1226,25 @@ impl Solver {
             .collect();
     }
 
+    /// Removes curve-length equations for interactive drag solves. The
+    /// 12-sample polyline equation is the priciest residual in the system
+    /// and runs ~9x per LM iteration; live drags solve endpoints only and
+    /// the exact length is re-established on commit
+    /// (`enforce_dragged_curve_lengths`). Discrete applies and validations
+    /// never call this.
+    pub fn strip_curve_length(&mut self) {
+        if !self.eqs.iter().any(|eq| matches!(eq, Eq::BezierLength { .. })) {
+            return;
+        }
+        self.eqs.retain(|eq| !matches!(eq, Eq::BezierLength { .. }));
+        self.active_eqs = self
+            .eqs
+            .iter()
+            .copied()
+            .filter(|&eq| self.eq_touches_free(eq))
+            .collect();
+    }
+
     pub fn is_empty(&self) -> bool {
         self.n_free == 0 && self.eqs.is_empty()
     }
@@ -1161,28 +1268,7 @@ impl Solver {
     /// residuals during a local drag only burns CPU because every variable in
     /// their gradient is fixed.
     fn eq_touches_free(&self, eq: Eq) -> bool {
-        let slots: [usize; 4] = match eq {
-            Eq::Horizontal { a, b }
-            | Eq::Vertical { a, b }
-            | Eq::Distance { a, b, .. }
-            | Eq::DistanceBranch { a, b, .. }
-            | Eq::DistanceX { a, b, .. }
-            | Eq::DistanceY { a, b, .. } => [a, b, usize::MAX, usize::MAX],
-            Eq::PointLineDist { p, l1, l2, .. } => [p, l1, l2, usize::MAX],
-            Eq::LineDist { a1, a2, b1, .. } => [a1, a2, b1, usize::MAX],
-            Eq::Angle { a1, a2, b1, b2, .. } => [a1, a2, b1, b2],
-            Eq::ArcRadius { s, e, c, .. } => [s, e, c, usize::MAX],
-            Eq::EqualRadius { o, a, b } => [o, a, b, usize::MAX],
-            Eq::ArcBend { s, e, c, .. } => [s, e, c, usize::MAX],
-            Eq::Tangent { l1, l2, o, p } => [l1, l2, o, p],
-            Eq::LineBezierTangent { l1, l2, h, p } => [l1, l2, h, p],
-            Eq::BezierLength { p0, c1, c2, p1, .. } => [p0, c1, c2, p1],
-            Eq::CirclePoint { p, o, .. } => [p, o, usize::MAX, usize::MAX],
-            Eq::Parallel { a1, a2, b1, b2 }
-            | Eq::Perpendicular { a1, a2, b1, b2 }
-            | Eq::MidSpan { a1, a2, b1, b2, .. } => [a1, a2, b1, b2],
-        };
-        slots
+        eq_slots(eq)
             .iter()
             .any(|&slot| slot != usize::MAX && self.free_of[slot].is_some())
     }
@@ -1490,7 +1576,7 @@ impl Solver {
                         weight: EQ_WEIGHT,
                     });
                 }
-                Eq::Tangent { l1, l2, o, p } => {
+                Eq::Tangent { l1, l2, o, p, branch } => {
                     // Transverse distance in doc units: dot/mean_len, 0 when
                     // perpendicular. Raw dot scaled with length*radius so
                     // long lines yanked arcs on micro-drags; pure cosine was
@@ -1514,6 +1600,24 @@ impl Solver {
                     if let Some(v) = self.free_of[o] { grad.push((v * 2, -drx)); grad.push((v * 2 + 1, -dry)); }
                     if let Some(v) = self.free_of[p] { grad.push((v * 2, drx)); grad.push((v * 2 + 1, dry)); }
                     out.push(Residual { value, grad, weight: EQ_WEIGHT });
+                    // Branch hold: unit cross of line dir and radius keeps
+                    // the placed side; zero while matched, so approaches
+                    // never fight it.
+                    if branch != 0.0 {
+                        let inv = 1.0 / (lv * lr).max(1e-9);
+                        let q = (vx * ry - vy * rx) * inv;
+                        if branch as f64 * q < 0.0 {
+                            let w = -(branch as f64) * m;
+                            let lv2 = lv * lv;
+                            let lr2 = lr * lr;
+                            let mut bgrad = GradBuf::new();
+                            if let Some(v) = self.free_of[l1] { bgrad.push((v * 2, -w * (ry * inv - q * vx / lv2))); bgrad.push((v * 2 + 1, -w * (-rx * inv - q * vy / lv2))); }
+                            if let Some(v) = self.free_of[l2] { bgrad.push((v * 2, w * (ry * inv - q * vx / lv2))); bgrad.push((v * 2 + 1, w * (-rx * inv - q * vy / lv2))); }
+                            if let Some(v) = self.free_of[o] { bgrad.push((v * 2, -w * (-vy * inv - q * rx / lr2))); bgrad.push((v * 2 + 1, -w * (vx * inv - q * ry / lr2))); }
+                            if let Some(v) = self.free_of[p] { bgrad.push((v * 2, w * (-vy * inv - q * rx / lr2))); bgrad.push((v * 2 + 1, w * (vx * inv - q * ry / lr2))); }
+                            out.push(Residual { value: -branch as f64 * q * m, grad: bgrad, weight: EQ_WEIGHT });
+                        }
+                    }
                 }
                 Eq::CirclePoint { p, o, radius } => {
                     let (point, center) = (self.pos(p, x), self.pos(o, x));
@@ -1531,7 +1635,7 @@ impl Solver {
                     }
                     out.push(Residual { value: length - radius, grad, weight: EQ_WEIGHT });
                 }
-                Eq::Parallel { a1, a2, b1, b2 } => {
+                Eq::Parallel { a1, a2, b1, b2, branch } => {
                     // Transverse distance in doc units: cross/mean_len.
                     let (a, b, c, d) = (self.pos(a1, x), self.pos(a2, x), self.pos(b1, x), self.pos(b2, x));
                     let ux = b.x - a.x; let uy = b.y - a.y;
@@ -1551,8 +1655,25 @@ impl Solver {
                     if let Some(i) = self.free_of[b1] { grad.push((i * 2, -dvx)); grad.push((i * 2 + 1, -dvy)); }
                     if let Some(i) = self.free_of[b2] { grad.push((i * 2, dvx)); grad.push((i * 2 + 1, dvy)); }
                     out.push(Residual { value, grad, weight: EQ_WEIGHT });
+                    // Branch hold: unit dot keeps the placed direction;
+                    // zero short of the flip, so rotation never fights it.
+                    if branch != 0.0 {
+                        let inv = 1.0 / (lu * lv).max(1e-9);
+                        let dot = (ux * vx + uy * vy) * inv;
+                        if branch as f64 * dot < 0.0 {
+                            let w = -(branch as f64) * m;
+                            let lu2 = lu * lu;
+                            let lv2 = lv * lv;
+                            let mut bgrad = GradBuf::new();
+                            if let Some(i) = self.free_of[a1] { bgrad.push((i * 2, -w * (vx * inv - dot * ux / lu2))); bgrad.push((i * 2 + 1, -w * (vy * inv - dot * uy / lu2))); }
+                            if let Some(i) = self.free_of[a2] { bgrad.push((i * 2, w * (vx * inv - dot * ux / lu2))); bgrad.push((i * 2 + 1, w * (vy * inv - dot * uy / lu2))); }
+                            if let Some(i) = self.free_of[b1] { bgrad.push((i * 2, -w * (ux * inv - dot * vx / lv2))); bgrad.push((i * 2 + 1, -w * (uy * inv - dot * vy / lv2))); }
+                            if let Some(i) = self.free_of[b2] { bgrad.push((i * 2, w * (ux * inv - dot * vx / lv2))); bgrad.push((i * 2 + 1, w * (uy * inv - dot * vy / lv2))); }
+                            out.push(Residual { value: -branch as f64 * dot * m, grad: bgrad, weight: EQ_WEIGHT });
+                        }
+                    }
                 }
-                Eq::LineBezierTangent { l1, l2, h, p } => {
+                Eq::LineBezierTangent { l1, l2, h, p, branch } => {
                     // Line direction crossed with the bezier's end-handle
                     // direction (contact -> its near handle), over the
                     // mean length: zero exactly at G1. Same form as
@@ -1575,6 +1696,22 @@ impl Solver {
                     if let Some(i) = self.free_of[h] { grad.push((i * 2, -dvx)); grad.push((i * 2 + 1, -dvy)); }
                     if let Some(i) = self.free_of[p] { grad.push((i * 2, dvx)); grad.push((i * 2 + 1, dvy)); }
                     out.push(Residual { value, grad, weight: EQ_WEIGHT });
+                    // Same dot-branch hold as Parallel (segments l1->l2, h->p).
+                    if branch != 0.0 {
+                        let inv = 1.0 / (lu * lv).max(1e-9);
+                        let dot = (ux * vx + uy * vy) * inv;
+                        if branch as f64 * dot < 0.0 {
+                            let w = -(branch as f64) * m;
+                            let lu2 = lu * lu;
+                            let lv2 = lv * lv;
+                            let mut bgrad = GradBuf::new();
+                            if let Some(i) = self.free_of[l1] { bgrad.push((i * 2, -w * (vx * inv - dot * ux / lu2))); bgrad.push((i * 2 + 1, -w * (vy * inv - dot * uy / lu2))); }
+                            if let Some(i) = self.free_of[l2] { bgrad.push((i * 2, w * (vx * inv - dot * ux / lu2))); bgrad.push((i * 2 + 1, w * (vy * inv - dot * uy / lu2))); }
+                            if let Some(i) = self.free_of[h] { bgrad.push((i * 2, -w * (ux * inv - dot * vx / lv2))); bgrad.push((i * 2 + 1, -w * (uy * inv - dot * vy / lv2))); }
+                            if let Some(i) = self.free_of[p] { bgrad.push((i * 2, w * (ux * inv - dot * vx / lv2))); bgrad.push((i * 2 + 1, w * (uy * inv - dot * vy / lv2))); }
+                            out.push(Residual { value: -branch as f64 * dot * m, grad: bgrad, weight: EQ_WEIGHT });
+                        }
+                    }
                 }
                 Eq::BezierLength { p0, c1, c2, p1, target } => {
                     // 12-sample polyline arc-length minus target. Gradient
@@ -1619,7 +1756,7 @@ impl Solver {
                     }
                     out.push(Residual { value: len - target, grad, weight: DIM_WEIGHT });
                 }
-                Eq::Perpendicular { a1, a2, b1, b2 } => {
+                Eq::Perpendicular { a1, a2, b1, b2, branch } => {
                     // Normalized dot product: zero exactly when the two
                     // directions are perpendicular, independent of scale.
                     let (a, b, c, d) = (self.pos(a1, x), self.pos(a2, x), self.pos(b1, x), self.pos(b2, x));
@@ -1639,6 +1776,22 @@ impl Solver {
                     if let Some(i) = self.free_of[b1] { grad.push((i * 2, -dvx)); grad.push((i * 2 + 1, -dvy)); }
                     if let Some(i) = self.free_of[b2] { grad.push((i * 2, dvx)); grad.push((i * 2 + 1, dvy)); }
                     out.push(Residual { value: dot / m, grad, weight: EQ_WEIGHT });
+                    // Branch hold: unit cross keeps the placed quadrant.
+                    if branch != 0.0 {
+                        let inv = 1.0 / (lu * lv).max(1e-9);
+                        let q = (ux * vy - uy * vx) * inv;
+                        if branch as f64 * q < 0.0 {
+                            let w = -(branch as f64) * m;
+                            let lu2 = lu * lu;
+                            let lv2 = lv * lv;
+                            let mut bgrad = GradBuf::new();
+                            if let Some(i) = self.free_of[a1] { bgrad.push((i * 2, -w * (vy * inv - q * ux / lu2))); bgrad.push((i * 2 + 1, -w * (-vx * inv - q * uy / lu2))); }
+                            if let Some(i) = self.free_of[a2] { bgrad.push((i * 2, w * (vy * inv - q * ux / lu2))); bgrad.push((i * 2 + 1, w * (-vx * inv - q * uy / lu2))); }
+                            if let Some(i) = self.free_of[b1] { bgrad.push((i * 2, -w * (-uy * inv - q * vx / lv2))); bgrad.push((i * 2 + 1, -w * (ux * inv - q * vy / lv2))); }
+                            if let Some(i) = self.free_of[b2] { bgrad.push((i * 2, w * (-uy * inv - q * vx / lv2))); bgrad.push((i * 2 + 1, w * (ux * inv - q * vy / lv2))); }
+                            out.push(Residual { value: -branch as f64 * q * m, grad: bgrad, weight: EQ_WEIGHT });
+                        }
+                    }
                 }
                 Eq::ArcRadius { s, e, c, target } => {
                     let (ps, pe, pc) = (self.pos(s, x), self.pos(e, x), self.pos(c, x));
@@ -2025,7 +2178,7 @@ impl Solver {
                     lin = lin.max((min_h - side * h).max(0.));
                     continue;
                 }
-                Eq::Tangent { l1, l2, o, p } => {
+                Eq::Tangent { l1, l2, o, p, branch } => {
                     let (a, b, center, contact) = (self.pos(l1, x), self.pos(l2, x), self.pos(o, x), self.pos(p, x));
                     let vx = b.x - a.x;
                     let vy = b.y - a.y;
@@ -2036,9 +2189,13 @@ impl Solver {
                     let m = ((lv + lr) / 2.).max(1e-9);
                     let v = (vx * rx + vy * ry).abs() / m;
                     lin = lin.max(v);
+                    if branch != 0.0 {
+                        let q = (vx * ry - vy * rx) / (lv * lr).max(1e-9);
+                        lin = lin.max((-branch as f64 * q * m).max(0.));
+                    }
                     continue;
                 }
-                Eq::LineBezierTangent { l1, l2, h, p } => {
+                Eq::LineBezierTangent { l1, l2, h, p, branch } => {
                     let (a, b, c, d) = (self.pos(l1, x), self.pos(l2, x), self.pos(h, x), self.pos(p, x));
                     let ux = b.x - a.x;
                     let uy = b.y - a.y;
@@ -2048,6 +2205,10 @@ impl Solver {
                     let lv = (vx * vx + vy * vy).sqrt().max(1e-9);
                     let m = ((lu + lv) / 2.).max(1e-9);
                     lin = lin.max((ux * vy - uy * vx).abs() / m);
+                    if branch != 0.0 {
+                        let dot = (ux * vx + uy * vy) / (lu * lv).max(1e-9);
+                        lin = lin.max((-branch as f64 * dot * m).max(0.));
+                    }
                     continue;
                 }
                 Eq::BezierLength { p0, c1, c2, p1, target } => {
@@ -2070,7 +2231,7 @@ impl Solver {
                     lin = lin.max((len - target).abs());
                     continue;
                 }
-                Eq::Perpendicular { a1, a2, b1, b2 } => {
+                Eq::Perpendicular { a1, a2, b1, b2, branch } => {
                     let (a, b, c, d) = (self.pos(a1, x), self.pos(a2, x), self.pos(b1, x), self.pos(b2, x));
                     let ux = b.x - a.x;
                     let uy = b.y - a.y;
@@ -2079,6 +2240,11 @@ impl Solver {
                     let lu = (ux * ux + uy * uy).sqrt().max(1e-9);
                     let lv = (vx * vx + vy * vy).sqrt().max(1e-9);
                     lin = lin.max(((ux * vx + uy * vy) / ((lu + lv) / 2.).max(1e-9)).abs());
+                    if branch != 0.0 {
+                        let m = ((lu + lv) / 2.).max(1e-9);
+                        let q = (ux * vy - uy * vx) / (lu * lv).max(1e-9);
+                        lin = lin.max((-branch as f64 * q * m).max(0.));
+                    }
                     continue;
                 }
                 Eq::CirclePoint { p, o, radius } => {
@@ -2087,7 +2253,7 @@ impl Solver {
                     lin = lin.max((((point.x - center.x).powi(2) + (point.y - center.y).powi(2)).sqrt() - radius.abs()).abs());
                     continue;
                 }
-                Eq::Parallel { a1, a2, b1, b2 } => {
+                Eq::Parallel { a1, a2, b1, b2, branch } => {
                     let (a, b, c, d) = (self.pos(a1, x), self.pos(a2, x), self.pos(b1, x), self.pos(b2, x));
                     let ux = b.x - a.x;
                     let uy = b.y - a.y;
@@ -2098,6 +2264,10 @@ impl Solver {
                     let m = ((lu + lv) / 2.).max(1e-9);
                     let v = (ux * vy - uy * vx).abs() / m;
                     lin = lin.max(v);
+                    if branch != 0.0 {
+                        let dot = (ux * vx + uy * vy) / (lu * lv).max(1e-9);
+                        lin = lin.max((-branch as f64 * dot * m).max(0.));
+                    }
                     continue;
                 }
                 Eq::MidSpan { a1, a2, b1, b2, axis, target } => {
@@ -2492,6 +2662,164 @@ mod tests {
         let solution = Solver::build(&doc, &[(b, Point2::new(140., 35.))], &[]).solve();
         assert!(solution.constraints_satisfied());
         let _ = segment;
+    }
+
+    #[test]
+    fn strip_curve_length_removes_length_equation_for_live_drags() {
+        let mut doc = Document::new();
+        let p0 = doc.add_point(Point2::new(0., 0.));
+        let c1 = doc.add_point(Point2::new(30., 0.));
+        let c2 = doc.add_point(Point2::new(70., 0.));
+        let p1 = doc.add_point(Point2::new(100., 0.));
+        let seg = doc.add_bezier_segment(p0, c1, c2, p1);
+        doc.add_dimension(Dimension {
+            target: DimTarget::CurveLength { seg },
+            value: 100., offset: 20., slide: 0.5, sweep: 0.,
+        });
+
+        // Full system (discrete apply path) keeps the equation and converges.
+        let aux = doc
+            .all_points()
+            .map(|(id, point)| (id, point))
+            .collect::<Vec<_>>();
+        let full = Solver::build_with_anchor(&doc, &[], &aux, 2.0).solve();
+        assert!(full.constraints_satisfied());
+
+        // Live drag path: the strip removes it, the rest still solves.
+        let mut live = Solver::build(&doc, &[(p1, Point2::new(120., 10.))], &[]);
+        assert!(live.eqs.iter().any(|eq| matches!(eq, Eq::BezierLength { .. })));
+        live.strip_curve_length();
+        assert!(!live.eqs.iter().any(|eq| matches!(eq, Eq::BezierLength { .. })));
+        assert!(!live.active_eqs.iter().any(|eq| matches!(eq, Eq::BezierLength { .. })));
+        let solution = live.solve();
+        assert!(solution.is_valid());
+    }
+
+    #[test]
+    fn anchor_only_followers_pin_without_changing_the_answer() {
+        let mut doc = Document::new();
+        let a = doc.add_point(Point2::new(0., 0.));
+        let b = doc.add_point(Point2::new(100., 0.));
+        let t = doc.add_point(Point2::new(150., 0.));
+        doc.add_segment(a, b);
+        doc.add_segment(b, t);
+        doc.add_dimension(Dimension {
+            target: DimTarget::Points { a, b, mode: crate::core::constraints::DimMode::Aligned },
+            value: 100., offset: 20., slide: 0.5, sweep: 0.,
+        });
+        let target = Point2::new(100., 50.);
+        let solver = Solver::build(&doc, &[(b, target)], &[]);
+        // t rides no equation: pinned exactly at its anchor, out of the
+        // dense system. a and b stay free.
+        let t_slot = solver.index[&t];
+        assert!(solver.free_of[t_slot].is_none());
+        assert!(solver.n_free < 3);
+        let solution = solver.solve();
+        assert!(solution.constraints_satisfied());
+        let (_, tp) = solution.positions.iter().find(|(id, _)| *id == t).unwrap();
+        assert_eq!((tp.x, tp.y), (150., 0.));
+    }
+
+    fn unit_dot(doc: &Document, a0: PointId, a1: PointId, b0: PointId, b1: PointId) -> f64 {
+        let (pa0, pa1, pb0, pb1) = (
+            doc.point(a0).unwrap(),
+            doc.point(a1).unwrap(),
+            doc.point(b0).unwrap(),
+            doc.point(b1).unwrap(),
+        );
+        let (ux, uy) = (pa1.x - pa0.x, pa1.y - pa0.y);
+        let (vx, vy) = (pb1.x - pb0.x, pb1.y - pb0.y);
+        let denom = (ux * ux + uy * uy).sqrt().max(1e-9) * (vx * vx + vy * vy).sqrt().max(1e-9);
+        (ux * vx + uy * vy) / denom
+    }
+
+    fn unit_cross(doc: &Document, a0: PointId, a1: PointId, b0: PointId, b1: PointId) -> f64 {
+        let (pa0, pa1, pb0, pb1) = (
+            doc.point(a0).unwrap(),
+            doc.point(a1).unwrap(),
+            doc.point(b0).unwrap(),
+            doc.point(b1).unwrap(),
+        );
+        let (ux, uy) = (pa1.x - pa0.x, pa1.y - pa0.y);
+        let (vx, vy) = (pb1.x - pb0.x, pb1.y - pb0.y);
+        let denom = (ux * ux + uy * uy).sqrt().max(1e-9) * (vx * vx + vy * vy).sqrt().max(1e-9);
+        (ux * vy - uy * vx) / denom
+    }
+
+    fn apply_positions(doc: &mut Document, positions: &[(PointId, Point2)]) {
+        for &(id, p) in positions {
+            doc.move_point(id, p);
+        }
+    }
+
+    #[test]
+    fn parallel_drag_across_keeps_orientation() {
+        let mut doc = Document::new();
+        let a0 = doc.add_point(Point2::new(0., 0.));
+        let a1 = doc.add_point(Point2::new(100., 0.));
+        let b0 = doc.add_point(Point2::new(0., 50.));
+        let b1 = doc.add_point(Point2::new(100., 50.));
+        let first = doc.add_segment(a0, a1);
+        let second = doc.add_segment(b0, b1);
+        doc.add_parallel_constraint(first, second);
+        assert!(unit_dot(&doc, a0, a1, b0, b1) > 0.99);
+        // Pull the far endpoint across to the mirrored side: the unsigned
+        // equation is met on both branches, the hold keeps the placed one.
+        let solution = Solver::build(&doc, &[(b1, Point2::new(-100., 50.))], &[]).solve();
+        assert!(solution.is_valid());
+        let mut moved = doc.clone();
+        apply_positions(&mut moved, &solution.positions);
+        assert!(unit_dot(&moved, a0, a1, b0, b1) > 0.9);
+        assert!(solution.constraints_satisfied());
+    }
+
+    #[test]
+    fn perpendicular_drag_across_keeps_quadrant() {
+        let mut doc = Document::new();
+        let a0 = doc.add_point(Point2::new(0., 0.));
+        let a1 = doc.add_point(Point2::new(100., 0.));
+        let b0 = doc.add_point(Point2::new(50., -50.));
+        let b1 = doc.add_point(Point2::new(50., 50.));
+        let first = doc.add_segment(a0, a1);
+        let second = doc.add_segment(b0, b1);
+        doc.add_perpendicular_constraint(first, second);
+        assert!(unit_cross(&doc, a0, a1, b0, b1) > 0.99);
+        // Swing the far end through the line: perpendicular is met on both
+        // sides, the hold keeps the placed quadrant.
+        let solution = Solver::build(&doc, &[(b1, Point2::new(50., -150.))], &[]).solve();
+        assert!(solution.is_valid());
+        let mut moved = doc.clone();
+        apply_positions(&mut moved, &solution.positions);
+        assert!(unit_cross(&moved, a0, a1, b0, b1) > 0.0);
+        assert!(solution.constraints_satisfied());
+    }
+
+    #[test]
+    fn tangent_drag_across_keeps_contact_side() {
+        let mut doc = Document::new();
+        let s = doc.add_point(Point2::new(0., 0.));
+        let e = doc.add_point(Point2::new(100., 0.));
+        let ctrl = doc.add_point(Point2::new(50., 30.));
+        let center = doc.add_point(Point2::new(50., -26.6666666667));
+        let arc = doc.add_arc_segment(s, ctrl, e, center);
+        let ls = doc.add_point(Point2::new(0., 30.));
+        let le = doc.add_point(Point2::new(100., 30.));
+        let line = doc.add_segment(ls, le);
+        let cp = doc.add_point(Point2::new(50., 30.));
+        doc.add_tangent_constraint(line, arc, cp);
+        // Line direction x radius at the contact: same side before/after.
+        let side_of = |doc: &Document| {
+            let (pls, ple) = (doc.point(ls).unwrap(), doc.point(le).unwrap());
+            let (o, c) = (doc.point(center).unwrap(), doc.point(cp).unwrap());
+            (ple.x - pls.x) * (c.y - o.y) - (ple.y - pls.y) * (c.x - o.x)
+        };
+        assert!(side_of(&doc) > 0.);
+        let solution = Solver::build(&doc, &[(le, Point2::new(100., -120.))], &[]).solve();
+        assert!(solution.is_valid());
+        let mut moved = doc.clone();
+        apply_positions(&mut moved, &solution.positions);
+        assert!(side_of(&moved) > 0.);
+        assert!(solution.constraints_satisfied());
     }
 
     fn eighty() -> usize { 80 }

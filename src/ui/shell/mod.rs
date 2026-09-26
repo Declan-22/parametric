@@ -60,7 +60,6 @@ pub struct Shell {
     pub(crate) rename_focus: gpui::FocusHandle,
     pub(crate) canvas_focus: gpui::FocusHandle,
     pub(crate) caret_visible: bool,
-    pub(crate) new_design_opacity: f32,
     // Hover/active fade tweens: key -> 0..1 progress.
     pub(crate) fades: HashMap<String, f32>,
     pub(crate) fade_pending: HashMap<String, f32>,
@@ -118,7 +117,6 @@ impl Shell {
             rename_focus: cx.focus_handle(),
             canvas_focus: cx.focus_handle(),
             caret_visible: true,
-            new_design_opacity: 1.0,
             fades: HashMap::new(),
             fade_pending: HashMap::new(),
             fade_tween_active: std::collections::HashSet::new(),
@@ -602,26 +600,6 @@ impl Shell {
                     shell.fade_tween_active.remove(&key_owned);
                 });
                 break;
-            }
-        })
-        .detach();
-    }
-    pub(crate) fn animate_new_design(&mut self, target: f32, cx: &mut Context<Self>) {
-        let start = self.new_design_opacity;
-        if (start - target).abs() < f32::EPSILON {
-            return;
-        }
-        let this = cx.entity().downgrade();
-        cx.spawn(async move |this, cx| {
-            let steps = 6;
-            for i in 1..=steps {
-                cx.background_executor()
-                    .timer(Duration::from_millis(12))
-                    .await;
-                let _ = this.update(cx, |shell, cx| {
-                    shell.new_design_opacity = start + (target - start) * (i as f32 / steps as f32);
-                    cx.notify();
-                });
             }
         })
         .detach();
@@ -1744,7 +1722,6 @@ impl Render for Shell {
                         .child(HomeView {
                             shell: cx.entity().downgrade(),
                             designs,
-                            new_design_opacity: self.new_design_opacity,
                             renaming: self.renaming.clone(),
                             caret_visible: self.caret_visible,
                         });

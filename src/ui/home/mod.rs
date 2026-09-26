@@ -19,7 +19,6 @@ pub const THUMB_HEIGHT: f32 = 132.;
 pub struct HomeView {
     pub shell: WeakEntity<Shell>,
     pub designs: Vec<DesignMeta>,
-    pub new_design_opacity: f32,
     pub renaming: Option<crate::ui::shell::RenameState>,
     pub caret_visible: bool,
 }
@@ -40,28 +39,37 @@ impl RenderOnce for HomeView {
 
         let shell = self.shell.clone();
         let shell_hover = self.shell.clone();
-        let new_opacity = self.new_design_opacity;
+        // Quiet button: bg_primary + text_secondary at rest; bg_tertiary +
+        // text_primary + shadow_sm fade in on hover. Shadow fade is
+        // alpha-only (no dark flash mid-tween).
+        let k = self
+            .shell
+            .upgrade()
+            .map(|s| s.read(cx).fade("new-design"))
+            .unwrap_or(0.0);
+        let bg = crate::theme::lerp_rgb(t.bg_primary, t.bg_tertiary, k);
+        let fg = crate::theme::lerp_rgb(t.text_secondary, t.text_primary, k);
+        let mut shadow = t.shadow_sm();
+        shadow.color = gpui::rgba(crate::theme::fade_in(t.item_shadow_color, k)).into();
         let new_btn = div()
             .id("new-design")
             .flex()
             .items_center()
-            .gap(px(6.))
+            .gap(px(7.))
             .px(px(10.))
-            .h(px(32.))
-            .rounded(px(8.))
+            .h(px(36.))
+            .rounded(px(10.))
             .cursor_pointer()
-            .border_2()
-            .border_color(rgb(t.accent_border))
-            .shadow(vec![t.shadow_sm()])
-            // High-contrast action button; hover fades it to 80% opacity.
-            .bg(rgb(t.accent))
-            .text_sm()
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(rgb(0xffffff))
-            .opacity(new_opacity)
+            .border_1()
+            .border_color(rgb(t.component_border_color))
+            .shadow(vec![shadow])
+            .bg(rgb(bg))
+            .text_size(px(14.0))
+            .font_weight(gpui::FontWeight::NORMAL)
+            .text_color(rgb(fg))
             .on_hover(move |hovered, _, cx| {
                 let _ = shell_hover.update(cx, |shell, cx| {
-                    shell.animate_new_design(if *hovered { 0.8 } else { 1.0 }, cx);
+                    shell.animate_fade("new-design", if *hovered { 1.0 } else { 0.0 }, cx);
                 });
             })
             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
@@ -69,11 +77,11 @@ impl RenderOnce for HomeView {
             })
             .child(
                 svg()
-                    .data(br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24"><path d="M0 0h24v24H0z" fill="none" /><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" /></svg>"#)
-                    .w(px(14.))
-                    .h(px(14.))
-                    .mt(px(-1.))
-                    .text_color(rgb(0xffffff)),
+                    .data(br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24"><path d="M0 0h24v24H0z" fill="none" /><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 12v2.545c0 3.245 0 4.867.886 5.966a4 4 0 0 0 .603.603C6.59 22 8.211 22 11.456 22c.705 0 1.058 0 1.381-.113q.1-.037.197-.082c.31-.148.559-.398 1.058-.896l4.736-4.737c.579-.578.867-.867 1.02-1.235c.152-.367.152-.776.152-1.593V10c0-3.772 0-5.657-1.172-6.829c-1.059-1.06-2.701-1.16-5.793-1.17M13 21.5V21c0-2.829 0-4.243.879-5.122C14.757 15 16.172 15 19 15h.5M12 6H4m4-4v8" /></svg>"#)
+                    .w(px(15.))
+                    .h(px(15.))
+                    .mt(px(0.))
+                    .text_color(rgb(fg)),
             )
             .child("New design");
 
@@ -82,36 +90,28 @@ impl RenderOnce for HomeView {
             .size_full()
             .overflow_y_scroll()
             .child(div().flex().justify_end().p(px(16.)).child(new_btn))
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap(px(16.))
-                    .px(px(16.))
-                    .children(
-                        designs.into_iter().map(|meta| {
-                            let is_renaming =
-                                self.renaming.as_ref().map(|r| r.id) == Some(meta.id);
-                            let rename_value = if is_renaming {
-                                self.renaming
-                                    .as_ref()
-                                    .filter(|r| r.id == meta.id)
-                                    .map(|r| r.value.clone())
-                                    .unwrap_or_default()
-                            } else {
-                                String::new()
-                            };
-                            DesignCard {
-                                meta,
-                                shell: self.shell.clone(),
-                                is_renaming,
-                                caret_visible: self.caret_visible,
-                                rename_value,
-                                card_w,
-                            }
-                        }),
-                    ),
-            )
+            .child(div().flex().flex_wrap().gap(px(16.)).px(px(16.)).children(
+                designs.into_iter().map(|meta| {
+                    let is_renaming = self.renaming.as_ref().map(|r| r.id) == Some(meta.id);
+                    let rename_value = if is_renaming {
+                        self.renaming
+                            .as_ref()
+                            .filter(|r| r.id == meta.id)
+                            .map(|r| r.value.clone())
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    DesignCard {
+                        meta,
+                        shell: self.shell.clone(),
+                        is_renaming,
+                        caret_visible: self.caret_visible,
+                        rename_value,
+                        card_w,
+                    }
+                }),
+            ))
     }
 }
 
@@ -151,20 +151,20 @@ impl RenderOnce for DesignCard {
                         &camera,
                         bounds.size,
                         t,
-                        None, // pending
-                        &[],  // selection
-                        None, // hover
-                        &[],  // dims
-                        &[],  // angle dims
-                        &[],  // curve dims
-                        &[],  // snap guides
-                        None, // marquee
-                        None, // pending ruler
-                        None, // pending line
-                        &[],  // constraint markers
-                        None, // pending circle
-                        None, // pending pen
-                        None, // pending bezier
+                        None,  // pending
+                        &[],   // selection
+                        None,  // hover
+                        &[],   // dims
+                        &[],   // angle dims
+                        &[],   // curve dims
+                        &[],   // snap guides
+                        None,  // marquee
+                        None,  // pending ruler
+                        None,  // pending line
+                        &[],   // constraint markers
+                        None,  // pending circle
+                        None,  // pending pen
+                        None,  // pending bezier
                         false, // show_grid (thumbnails never show grid)
                         crate::editor::Tool::Move,
                         None, // cursor_doc (no midpoint reveal in thumbnails)
@@ -201,38 +201,105 @@ impl RenderOnce for DesignCard {
                         ));
                     }
                     paint::Primitive::Polygon { points, color } => {
-                        if points.len() < 3 { continue; }
-                        let to_px = |(x, y): (f32, f32)| Point { x: px(x) + ox, y: px(y) + oy };
+                        if points.len() < 3 {
+                            continue;
+                        }
+                        let to_px = |(x, y): (f32, f32)| Point {
+                            x: px(x) + ox,
+                            y: px(y) + oy,
+                        };
                         let mut path = gpui::Path::new(to_px(points[0]));
-                        for &point in &points[1..] { path.line_to(to_px(point)); }
+                        for &point in &points[1..] {
+                            path.line_to(to_px(point));
+                        }
                         path.line_to(to_px(points[0]));
                         window.paint_path(path, color);
                     }
-                    paint::Primitive::Line { ax, ay, bx, by, width, color } => {
+                    paint::Primitive::Line {
+                        ax,
+                        ay,
+                        bx,
+                        by,
+                        width,
+                        color,
+                    } => {
                         let (dx, dy) = (bx - ax, by - ay);
                         let len = (dx * dx + dy * dy).sqrt();
-                        if len < 1e-3 { continue; }
+                        if len < 1e-3 {
+                            continue;
+                        }
                         let (nx, ny) = (-dy / len * width / 2., dx / len * width / 2.);
-                        let mut path = gpui::Path::new(Point { x: px(ax + nx) + ox, y: px(ay + ny) + oy });
-                        path.line_to(Point { x: px(bx + nx) + ox, y: px(by + ny) + oy });
-                        path.line_to(Point { x: px(bx - nx) + ox, y: px(by - ny) + oy });
-                        path.line_to(Point { x: px(ax - nx) + ox, y: px(ay - ny) + oy });
-                        path.line_to(Point { x: px(ax + nx) + ox, y: px(ay + ny) + oy });
+                        let mut path = gpui::Path::new(Point {
+                            x: px(ax + nx) + ox,
+                            y: px(ay + ny) + oy,
+                        });
+                        path.line_to(Point {
+                            x: px(bx + nx) + ox,
+                            y: px(by + ny) + oy,
+                        });
+                        path.line_to(Point {
+                            x: px(bx - nx) + ox,
+                            y: px(by - ny) + oy,
+                        });
+                        path.line_to(Point {
+                            x: px(ax - nx) + ox,
+                            y: px(ay - ny) + oy,
+                        });
+                        path.line_to(Point {
+                            x: px(ax + nx) + ox,
+                            y: px(ay + ny) + oy,
+                        });
                         window.paint_path(path, color);
                     }
                     paint::Primitive::Circle { cx, cy, radius } => {
                         let r = px(radius);
-                        window.paint_quad(gpui::quad(Bounds { origin: Point { x: px(cx) - r + ox, y: px(cy) - r + oy }, size: Size { width: r * 2., height: r * 2. } }, px(3.), rgb(0xffffff), gpui::Edges::all(px(1.)), rgb(0x777777), gpui::BorderStyle::Solid));
+                        window.paint_quad(gpui::quad(
+                            Bounds {
+                                origin: Point {
+                                    x: px(cx) - r + ox,
+                                    y: px(cy) - r + oy,
+                                },
+                                size: Size {
+                                    width: r * 2.,
+                                    height: r * 2.,
+                                },
+                            },
+                            px(3.),
+                            rgb(0xffffff),
+                            gpui::Edges::all(px(1.)),
+                            rgb(0x777777),
+                            gpui::BorderStyle::Solid,
+                        ));
                     }
                     paint::Primitive::Diamond { cx, cy, radius } => {
-                        let mut path = gpui::Path::new(Point { x: px(cx) + ox, y: px(cy - radius) + oy });
-                        path.line_to(Point { x: px(cx + radius) + ox, y: px(cy) + oy });
-                        path.line_to(Point { x: px(cx) + ox, y: px(cy + radius) + oy });
-                        path.line_to(Point { x: px(cx - radius) + ox, y: px(cy) + oy });
-                        path.line_to(Point { x: px(cx) + ox, y: px(cy - radius) + oy });
+                        let mut path = gpui::Path::new(Point {
+                            x: px(cx) + ox,
+                            y: px(cy - radius) + oy,
+                        });
+                        path.line_to(Point {
+                            x: px(cx + radius) + ox,
+                            y: px(cy) + oy,
+                        });
+                        path.line_to(Point {
+                            x: px(cx) + ox,
+                            y: px(cy + radius) + oy,
+                        });
+                        path.line_to(Point {
+                            x: px(cx - radius) + ox,
+                            y: px(cy) + oy,
+                        });
+                        path.line_to(Point {
+                            x: px(cx) + ox,
+                            y: px(cy - radius) + oy,
+                        });
                         window.paint_path(path, rgb(0x777777));
                     }
-                    paint::Primitive::Disk { cx, cy, radius, color } => {
+                    paint::Primitive::Disk {
+                        cx,
+                        cy,
+                        radius,
+                        color,
+                    } => {
                         // Round join/cap dot: octagon approximation reads
                         // perfectly round at thumbnail scale.
                         let r = radius;
@@ -247,7 +314,10 @@ impl RenderOnce for DesignCard {
                                 y: px(cy + r * a.sin()) + oy,
                             });
                         }
-                        path.line_to(Point { x: px(cx + r) + ox, y: px(cy) + oy });
+                        path.line_to(Point {
+                            x: px(cx + r) + ox,
+                            y: px(cy) + oy,
+                        });
                         window.paint_path(path, color);
                     }
                     // Selection-only geometry is intentionally omitted from

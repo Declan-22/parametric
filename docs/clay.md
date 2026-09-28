@@ -53,11 +53,21 @@
 - **Transition semantics (Blender's, exactly):** the Object selection set
   carries into Edit — every selected object editable, ALL their components
   visible even with nothing selected inside Edit. Non-selected objects render
-  ~50% opacity, dead (clicks pass through; hint bar offers `Tab`). Exit
+  ~35% opacity, dead (clicks pass through; hint bar offers `Tab`). Exit
   (Tab) restores the identical Object selection; components vanish.
   Multi-object Edit is IN v1 (selected set = editable set). Creation ops
   (extrude, trace) target the ACTIVE object (last-selected in Object,
   lightest highlight). Tab with empty Object selection = nothing.
+- **Isolation (ONE object at a time):** entering Edit FREEZES the scope
+  (islands of the selection; empty selection = everything). Out-of-scope
+  strokes, fills, dims, and chips paint at 35% (`Background::opacity` —
+  no color surgery); points stay full-bright (affordances). Out-of-scope
+  dim/chip hit-testing is dead (hover, edit, drag, click — nothing
+  happens); out-of-scope dim/chip selections die on mode-enter. Out-of-scope
+  picks/hover/marquee/adopt dissolve. Clay creation always joins the scope
+  (your new geometry is editable). Scope clears on Object-enter. Tool-
+  specific pick flows (dimension/fillet/constraint tools) are exempt —
+  explicit ops, solver-honest results.
 - **Object Mode shows zero components, ever.** No joints on click, hover, or
   corners — hover highlights the whole object uniformly (+ quiet `Tab to
   edit` hint). Double-click enters Edit on that object. The wall has no
@@ -107,9 +117,10 @@
   exactly (menus teach, keys replace). `Esc`/click-away dismisses.
 - **Tab/Esc rules:** new-path gesture in Object → creates + enters Edit.
   Tab in Edit → Object + harden tentatives. Enter → harden, stay in Edit.
-  Esc with pending grab → cancel grab. Esc in Edit on an UNCOMMITTED path →
-  cancel path → Object. Esc in Edit on a committed path → exit to Object
-  (nothing destroyed).
+  Esc with pending grab/extrude → cancel it. Esc on an active Clay path →
+  END the path and keep geometry (implemented Phase 2.9: per-click commits
+  own their undo steps — undo explicitly to remove). Esc in Edit on a
+  committed path → exit to Object (nothing destroyed).
 2. **Active path.** Zero or one path held by the tool. Full skeleton visible
    (joints, centers, ticks); all draggable at any time. Extension at the
    active end; clicking near either end flips the active end.
@@ -252,11 +263,13 @@ Span = Line { a, b: JointId }
   `Ctrl` snap · hold `Shift` precision · type numbers anytime · `O`
   proportional (scroll = radius, falloff in redo strip) · `G,G` slide along
   neighbor span · `LMB`/`Enter` confirm · `RMB`/`Esc` cancel.
-- **Grow:** `E` extrude active end (full G-grammar: `E, X, 50, Enter`) ·
-  click = smooth joint (two joints = line; curves emerge) · click existing
-  point = connect (coincident) · `C` / click-start = close · `Enter` /
-  double-click-empty = commit · `Esc` = cancel path · `Backspace` = drop
-  last joint.
+- **Grow:** ghost preview ALWAYS live while a path is active (derived from
+  the active end + cursor — not a mode, never toggled). Click commits the
+  tip and CONTINUES · `Enter` commits the tip and FINISHES (that's the whole
+  difference) · `E` starts a path keyboard-only, otherwise no-op · `C`
+  closes · `Esc` ends-keeping · `Backspace` drops last. Click = smooth
+  joint (two joints = line; curves emerge) · click existing point = connect
+  (coincident) · click far end = flip active end.
 - **Grades:** `V` G0 · `H` G1 · `Shift+H` G2 · `Alt+click` joint = quick flip.
 - **Arcs:** `Ctrl+B` fillet (drag = radius → becomes dim, scroll = nudge
   radius, redo strip = exact number + `Arc | Chamfer` toggle — chamfer is the
@@ -278,17 +291,26 @@ Span = Line { a, b: JointId }
   op live. One deep; replaced on next gesture (old params persist in the
   Tool tab). Fast hands, exact home address.
 - **Combs:** `Shift+C` toggles curvature combs on the active path (default
-  ON in Edit). Teeth ⊥ curve, length ∝ curvature, drawn inside the bend.
+  ON in Edit). Teeth inside the bend + a tip ENVELOPE polyline per span.
+  Teeth are anti-crossing clamped (two-pass: no tooth exceeds its
+  neighbor's length by more than their spacing, so the envelope never
+  breaks). Color = curvature VARIATION (|Δk| between neighbors, normalized
+  per path): theme blue (fair) -> snap orange -> destructive red (worst).
+  True arcs/straights read blue, wiggles glow red — the goal is literal:
+  fair until the red dies. Length reads clean (clamped), color reads true
+  (pre-clamp). G1 shows a color step at joints, G2 flows, G0 collides.
   Scale in inspector/redo strip; density per span. Auto-show during relax
-  and grade flips even if toggled off. G1 shows a tooth-length step at the
-  joint; G2 flows continuously; G0 collides. Closed-form from derived
-  controls — cheap, active path only.
+  and grade flips even if toggled off. Closed-form frames + canvas clip —
+  cheap, active path only.
 - **Second topbar (NEW — decided):** sits below the main topbar, above the
   toolbar; spans left window edge → inspector left edge (canvas width only).
   Contents left→right: mode dropdown (`Object` | `Edit`, 2 options) ·
   redo-strip region (flex; populated after a gesture, empty state collapses
   so the bar stays slim) · conflict chip at the right end (visible only when
-  nonzero; click isolates the fighters).
+  nonzero; click isolates the fighters). Implemented Phase 2.9 as a
+  last-action readout (`label — key hints`, e.g. `Extrude — click / Enter
+  commit · Esc cancel`): narration teaches the grammar until Phase 3 puts
+  live editable op params here.
 - **Hint bar:** bottom edge, teaches keys mid-gesture (discoverability for a
   reinvented tool — REQUIRED).
 - **Three layers (keep crisp):** redo strip = fix the last gesture
@@ -333,6 +355,21 @@ Span = Line { a, b: JointId }
 - **Object Mode ops:** select/transform whole paths, join (`Ctrl+J`),
   duplicate, delete. Creation (extrude, stroke-fit, end growth) lives in
   Edit — a new path started in Object drops you straight into Edit on it.
+  Object selection renders ONE bounding box around the whole selection
+  (SOLID accent outline + display-only corner dots, drag-inside moves).
+  Selected edges stay highlighted under the box. Bbox scale / rotate
+  handles are explicitly LATER (resizing constrained sketches goes
+  through the solver as drag targets — design with SOL-02 hierarchy first).
+- **Groups (future object, flat v1 — no nesting):** `Group { id, name,
+  members }`, `Ctrl+G` / `Ctrl+Shift+G`. Object treats a group as ONE
+  thing: single bbox, move/duplicate/delete together. Edit with a group
+  selected dives inside: every member joint/edge editable (groups just join
+  the selected-set rule — no new mode logic). Fills already behave this
+  way (Object: loop as one; Edit: its segments/joints).
+- **Every committed Clay path auto-becomes a group** (`Path 12`, ...).
+  Path identity persists in the doc (not just editor bookkeeping) — this
+  is the model move the panel needs. Legacy ungrouped segments stay flat
+  under their layer until explicitly grouped.
 
 ## 11. Capability audit (from discussion; keep honest)
 
@@ -391,6 +428,16 @@ Span = Line { a, b: JointId }
   markers, tracing tolerance) · **Tool** (active tool settings + last-op
   params persist here after the redo strip dies).
 - Shared: **View** (grid, guides, snap registry + toggles) in both modes.
+- **Layer panel (far-left dock, left of the toolbar rail):** lists
+  `doc.layers` (name + element count); click = active layer (new Clay
+  geometry lands there — replaces the layers[0] assumption); eye = show /
+  hide (NEEDS doc support: `visible: bool` on Layer + paint skip +
+  persistence — schema touch, queued); double-click rename; `+` adds.
+  RMB: delete / rename. Queued after Clay creation (needs the schema +
+  active-layer plumbing first). The panel is a TREE, not a list: Layer >
+  Group/Path (expandable) > member segments (leaf rows, read-only). Canvas
+  sees one object (one bbox); the panel sees inside it. Selection syncs
+  both directions: panel row click = canvas select (and vice versa).
 - Rules: tabs never duplicate canvas gestures (panel edits numbers,
   canvas moves things); every panel field is typeable + solver-legible;
   hint bar + `Space` reach every tab action (nothing panel-only).

@@ -306,6 +306,7 @@ impl Editor {
                 }
                 Tool::Fillet => self.fillet_click(cursor),
                 Tool::Pen => self.pen_tool_click(cursor, shift),
+                Tool::Clay => self.clay_click(cursor, shift),
                 // Constraint tools are handled before this mode match so
                 // their clicks never enter shape/dimension creation. Keep an
                 // explicit arm for exhaustive enum matching.
@@ -339,7 +340,14 @@ impl Editor {
         // deferred pick resolves on mouse-up as a click if the band never
         // grew.
         let exact = pick::Picker::new(&self.doc, &self.camera, EXACT_TOL_PX).element(p);
-        match picker.element(p) {
+        // Clay: managed handles are not components in Edit — the hit
+        // dissolves so marquee/empty takes over. Isolation: out-of-scope
+        // hits dissolve the same way (nothing happens).
+        match picker
+            .element(p)
+            .and_then(|el| self.edit_pick(el))
+            .filter(|el| self.in_scope_element(*el))
+        {
             Some(mut el) => {
                 // Multi-selections grab on the TOLERANT hit: points are far
                 // harder to hit exactly than lines, and a missed exact grab
@@ -367,6 +375,24 @@ impl Editor {
                     } else {
                         self.selection = vec![el];
                     }
+                }
+                // Clay derive-on-touch finalize (EDIT only): pressing a
+                // bezier endpoint enrolls it (default G1) — the drag then
+                // flows through the solver with the post-solve derive hook
+                // maintaining the arms. Object presses never enroll.
+                if self.interaction_mode == super::InteractionMode::Edit
+                    && let ElementRef::Point(pid) = el
+                    && !self.is_managed(pid)
+                    && self.is_bezier_endpoint(pid)
+                {
+                    self.joint_data
+                        .insert(pid, super::joints::JointData::default());
+                }
+                // Object mode: the pick grows to its whole island (shared-
+                // endpoint components). Identity everywhere else.
+                {
+                    let sel = std::mem::take(&mut self.selection);
+                    self.selection = self.expand_to_islands(&sel);
                 }
 
                 // Grab semantics by what was pressed:
@@ -787,6 +813,20 @@ impl Editor {
             return true;
         }
 
+        // Clay ghost: derived preview — live whenever a path is active.
+        // Self-heals after tool switches (set_tool clears the shared slot)
+        // and after any op that drops it.
+        if self.tool == Tool::Clay && self.pending_line.is_none() {
+            if let Some(end) = self.clay_path.as_ref().and_then(|p| p.active_end()) {
+                if let Some(pos) = self.doc.point(end) {
+                    let (at, guides) = self.snap_creation_point(self.cursor_doc(cursor));
+                    self.snap_guides = guides;
+                    self.pending_line = Some(PendingLine { start: pos, cursor: at });
+                    self.pending_via_click = false;
+                }
+            }
+        }
+
         // Line rubber band.
         if self.pending_line.is_some() {
             let at = self.cursor_doc(cursor);
@@ -838,7 +878,7 @@ impl Editor {
             // clearing them wiped the crosshair highlight every move.
             // (update_creation_cursor refreshes them above; non-creation
             // tools still clear stale drag leftovers.)
-            if !matches!(self.tool, Tool::Line | Tool::Rectangle | Tool::Ruler | Tool::Circle | Tool::Pen) {
+            if !matches!(self.tool, Tool::Line | Tool::Rectangle | Tool::Ruler | Tool::Circle | Tool::Pen | Tool::Clay) {
                 self.snap_guides.clear();
             }
             return changed;
@@ -982,7 +1022,7 @@ impl Editor {
         // Creation tools: the crosshair itself snap-locks and highlights
         // targets BEFORE any button press.
         match self.tool {
-            Tool::Line | Tool::Rectangle | Tool::Ruler | Tool::Pen
+            Tool::Line | Tool::Rectangle | Tool::Ruler | Tool::Pen | Tool::Clay
                 if self.pending_shape.is_none()
                     && self.pending_line.is_none()
                     && self.pending_ruler.is_none()
@@ -1047,7 +1087,10 @@ impl Editor {
         let mut changed = self.update_chip_hover(cursor);
         let p = self.cursor_doc(cursor);
         let picker = pick::Picker::new(&self.doc, &self.camera, HANDLE_TOL_PX);
-        let info = picker.element(p);
+        // Isolation: out-of-scope geometry has no hover.
+        let info = picker
+            .element(p)
+            .filter(|el| self.in_scope_element(*el));
         if self.hover != info {
             self.hover = info;
             changed = true;
@@ -1122,7 +1165,7 @@ impl Editor {
         const HALF: f32 = crate::ui::canvas::CHIP_SIZE / 2.;
         self.constraint_markers
             .iter()
-            .filter(|m| m.visible)
+            .filter(|m| m.visible && self.marker_in_scope(&m.constraint))
             .find(|m| (m.cx_out - x).abs() <= HALF && (m.cy_out - y).abs() <= HALF)
             .map(|m| m.constraint)
     }
@@ -1149,7 +1192,7 @@ impl Editor {
     fn update_creation_cursor(&mut self, cursor: gpui::Point<gpui::Pixels>) -> bool {
         let is_creation = matches!(
             self.tool,
-            Tool::Rectangle | Tool::Line | Tool::Ruler | Tool::Circle | Tool::Pen
+            Tool::Rectangle | Tool::Line | Tool::Ruler | Tool::Circle | Tool::Pen | Tool::Clay
         );
         if !is_creation || self.pan_start.is_some() {
             if self.creation_cursor.is_some() {
@@ -1306,12 +1349,18 @@ impl Editor {
         // the generation bump) instead of waiting for the next gesture.
         self.flush_pending_history();
 
-        // Marquee finalize.
+        // Marquee finalize (Clay: managed handles never join the
+        // selection. Isolation: out-of-scope stays out).
         if let Some((a, b)) = self.marquee.take() {
             let band = Rect::from_points(a, b);
             if band.size.w > 1e-9 || band.size.h > 1e-9 {
                 let picker = pick::Picker::new(&self.doc, &self.camera, HANDLE_TOL_PX);
-                let picked = picker.marquee(band);
+                let picked: Vec<ElementRef> = picker
+                    .marquee(band)
+                    .into_iter()
+                    .filter_map(|el| self.edit_pick(el))
+                    .filter(|el| self.in_scope_element(*el))
+                    .collect();
                 if self.marquee_add {
                     for el in picked {
                         if !self.selection.contains(&el) {
@@ -1321,18 +1370,33 @@ impl Editor {
                 } else {
                     self.selection = picked;
                 }
+                // Object mode: hits grow to whole islands.
+                {
+                    let sel = std::mem::take(&mut self.selection);
+                    self.selection = self.expand_to_islands(&sel);
+                }
                 self.marquee_add = false;
                 self.deferred_pick = None;
                 return true;
             }
             // Band never grew: a click on tolerant-only geometry.
-            if let Some(el) = self.deferred_pick.take() {
+            if let Some(el) = self
+                .deferred_pick
+                .take()
+                .and_then(|el| self.edit_pick(el))
+                .filter(|el| self.in_scope_element(*el))
+            {
                 if self.marquee_add {
                     if !self.selection.contains(&el) {
                         self.selection.push(el);
                     }
                 } else {
                     self.selection = vec![el];
+                }
+                // Object mode: the pick grows to its whole island.
+                {
+                    let sel = std::mem::take(&mut self.selection);
+                    self.selection = self.expand_to_islands(&sel);
                 }
                 self.marquee_add = false;
                 return true;

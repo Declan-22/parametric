@@ -4,6 +4,17 @@ use crate::core::ids::{PointId, SegmentId};
 // Tool definitions and per-tool pending drag state. Each tool owns a small
 // pending-geometry struct; the commit logic lives on Editor.
 
+// Clay interaction mode (Phase 0): Object = wholes (select, transform,
+// join, duplicate, delete — never touches components); Edit = inside the
+// active object (components, creation, refinement — never touches other
+// objects). `Tab` flips. Selection carries across the flip untouched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum InteractionMode {
+    #[default]
+    Object,
+    Edit,
+}
+
 // Active canvas tool. Move/Pan are modes; shape tools emit element
 // composites (the document has no "rectangle" object).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17,6 +28,9 @@ pub enum Tool {
     Dimension,
     Fillet,
     Pen,
+    // Clay (Phase 2.9): the unified draw tool. Toolbar entry only, no
+    // shortcut key (every letter is taken by the in-tool grammar).
+    Clay,
     ConstraintHorizontalVertical,
     ConstraintTangent,
     ConstraintCoincident,
@@ -24,7 +38,49 @@ pub enum Tool {
     ConstraintPerpendicular,
 }
 
-/// Pen sub-mode: one tool draws lines, arcs, and beziers.
+/// Clay active path (Phase 2.9): ordered joints + committed spans. The
+// active end is last (first when flipped). `owned` = auto-created joints
+// (safe to GC on drop-last); adopted existing points are never deleted.
+#[derive(Clone, Debug, Default)]
+pub struct ClayPath {
+    pub joints: Vec<PointId>,
+    pub spans: Vec<SegmentId>,
+    pub flipped: bool,
+    pub owned: Vec<PointId>,
+    /// Joints whose sidecar entry Clay created (owned + adopted-enrolled).
+    /// Only these are swept on drop; pre-existing entries survive.
+    pub enrolled: Vec<PointId>,
+}
+
+impl ClayPath {
+    pub fn active_end(&self) -> Option<PointId> {
+        if self.flipped {
+            self.joints.first().copied()
+        } else {
+            self.joints.last().copied()
+        }
+    }
+
+    pub fn other_end(&self) -> Option<PointId> {
+        if self.flipped {
+            self.joints.last().copied()
+        } else {
+            self.joints.first().copied()
+        }
+    }
+}
+
+// Edit isolation scope (Blender-like): the segments (+ lone points)
+// editable in this Edit session. None = everything (entered with empty
+// selection). Frozen at Tab-enter; Clay creation extends it (new spans
+// join the edited object); cleared on Object-enter.
+#[derive(Clone, Debug, Default)]
+pub struct EditScope {
+    pub segments: Vec<SegmentId>,
+    pub points: Vec<PointId>,
+}
+
+// Pen sub-mode: one tool draws lines, arcs, and beziers.
 /// Explicit switch only (menu or L/B/A) — drag never changes mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum PenMode {

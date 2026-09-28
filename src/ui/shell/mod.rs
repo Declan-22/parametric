@@ -54,6 +54,7 @@ pub struct Shell {
     // Thumb cache: design id -> (updated_at it was loaded at, thumb).
     pub(crate) thumbs: HashMap<i64, (i64, Thumb)>,
     pub(crate) context_menu: Option<DesignContextMenu>,
+    pub(crate) canvas_menu: Option<crate::ui::ctxmenu::CanvasMenuState>,
     pub(crate) renaming: Option<RenameState>,
     pub(crate) pending_delete: Option<i64>,
     // Focus handle used to capture keystrokes while renaming.
@@ -65,6 +66,7 @@ pub struct Shell {
     pub(crate) fade_pending: HashMap<String, f32>,
     pub(crate) fade_tween_active: std::collections::HashSet<String>,
     pub(crate) menu_open: bool,
+    pub(crate) mode_dropdown_open: bool,
     pub(crate) active_menu: Option<usize>,
     pub(crate) menu_animation: f32,
     pub(crate) icon_animation: f32,
@@ -112,6 +114,7 @@ impl Shell {
             design_name: String::new(),
             thumbs: HashMap::new(),
             context_menu: None,
+            canvas_menu: None,
             renaming: None,
             pending_delete: None,
             rename_focus: cx.focus_handle(),
@@ -121,6 +124,7 @@ impl Shell {
             fade_pending: HashMap::new(),
             fade_tween_active: std::collections::HashSet::new(),
             menu_open: false,
+            mode_dropdown_open: false,
             active_menu: None,
             menu_animation: 0.0,
             icon_animation: 0.0,
@@ -326,6 +330,42 @@ impl Shell {
     }
 
     // -- gallery context menu + rename --
+
+    pub(crate) fn open_canvas_menu(&mut self, position: Point<gpui::Pixels>) {
+        // Overlay lives in the design column (below the title bar):
+        // window coords minus title height, hugging the cursor.
+        let pos = Point::new(
+            px(f32::from(position.x) + 2.),
+            px(f32::from(position.y) + 2.),
+        );
+        self.canvas_menu = Some(crate::ui::ctxmenu::CanvasMenuState {
+            position: pos,
+            open_sub: None,
+        });
+        // Fresh hover state: stale row fades would reopen pre-hovered.
+        self.fades.retain(|k, _| !k.starts_with("ctxmenu-"));
+        self.fade_pending.retain(|k, _| !k.starts_with("ctxmenu-"));
+        self.fade_tween_active.retain(|k| !k.starts_with("ctxmenu-"));
+    }
+
+    pub(crate) fn close_canvas_menu(&mut self, cx: &mut Context<Self>) {
+        if self.canvas_menu.take().is_some() {
+            // Clear hover fades so the menu doesn't reopen pre-hovered.
+            self.fades.retain(|k, _| !k.starts_with("ctxmenu-"));
+            self.fade_pending.retain(|k, _| !k.starts_with("ctxmenu-"));
+            self.fade_tween_active.retain(|k| !k.starts_with("ctxmenu-"));
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn canvas_menu_sub(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(menu) = self.canvas_menu.as_mut() {
+            if menu.open_sub != Some(index) {
+                menu.open_sub = Some(index);
+                cx.notify();
+            }
+        }
+    }
 
     pub(crate) fn open_context_menu(&mut self, id: i64, position: Point<gpui::Pixels>) -> bool {
         // The menu is positioned relative to the home container, which sits
@@ -1078,6 +1118,20 @@ impl Render for Shell {
                             ed.set_tool(crate::editor::Tool::Move);
                             return true;
                         }
+                        // Clay path ends from ANY tool (path is global
+                        // state; the keydown arm only fires under Clay).
+                        // Pending clears only under Clay (a foreign tool's
+                        // ghost may live there). Never commits.
+                        if ed.clay_path.is_some() {
+                            if ed.tool == crate::editor::Tool::Clay {
+                                ed.pending_line = None;
+                                ed.pending_via_click = false;
+                                ed.perpendicular_preview = None;
+                                ed.snap_guides.clear();
+                            }
+                            ed.clay_finish();
+                            return true;
+                        }
                         if ed.tool != crate::editor::Tool::Move {
                             ed.set_tool(crate::editor::Tool::Move);
                             return true;
@@ -1427,6 +1481,163 @@ impl Render for Shell {
                         return;
                     }
                 }
+                // Clay creation keys (Clay tool ONLY, never while typing):
+                // E extrudes, C closes an open path, Backspace drops the
+                // last joint, Enter ends the path (commits a live extrude
+                // at its cursor). Each falls through when it doesn't apply
+                // so Object-mode letters keep their existing behavior.
+                if !e.keystroke.modifiers.modified()
+                    && matches!(key.as_str(), "e" | "c" | "backspace" | "enter")
+                {
+                    let mut consumed = false;
+                    let _ = shell_keys.update(cx, |shell, cx| {
+                        if shell.renaming.is_some() {
+                            return;
+                        }
+                        let Some(ed) = shell.editor.as_ref() else {
+                            return;
+                        };
+                        if ed.read(cx).dim_input.is_some() {
+                            return;
+                        }
+                        if ed.read(cx).tool != crate::editor::Tool::Clay {
+                            return;
+                        }
+                        let done = ed.update(cx, |ed, _| match key.as_str() {
+                            "e" => ed.clay_extrude(),
+                            "c" => {
+                                ed.interaction_mode
+                                    == crate::editor::InteractionMode::Edit
+                                    && ed.clay_close()
+                            }
+                            "backspace" => {
+                                ed.interaction_mode
+                                    == crate::editor::InteractionMode::Edit
+                                    && ed.clay_drop_last()
+                            }
+                            _ => {
+                                ed.interaction_mode
+                                    == crate::editor::InteractionMode::Edit
+                                    && ed.clay_end()
+                            }
+                        });
+                        if done {
+                            shell.invalidate_thumbs_all();
+                            cx.notify();
+                            consumed = true;
+                        }
+                    });
+                    if consumed {
+                        cx.stop_propagation();
+                        return;
+                    }
+                }
+                // Clay combs (Edit mode ONLY): Shift+C toggles curvature
+                // teeth on managed spans. Plain C falls through (dimension
+                // locks / Coincident live there).
+                if key.as_str() == "c"
+                    && e.keystroke.modifiers.shift
+                    && !e.keystroke.modifiers.control
+                    && !e.keystroke.modifiers.alt
+                    && !e.keystroke.modifiers.platform
+                {
+                    let _ = shell_keys.update(cx, |shell, cx| {
+                        if shell.renaming.is_some() {
+                            return;
+                        }
+                        let Some(ed) = shell.editor.as_ref() else {
+                            return;
+                        };
+                        if ed.read(cx).dim_input.is_some() {
+                            return;
+                        }
+                        if ed.read(cx).interaction_mode
+                            != crate::editor::InteractionMode::Edit
+                        {
+                            return;
+                        }
+                        ed.update(cx, |ed, cx| {
+                            ed.show_combs = !ed.show_combs;
+                            cx.notify();
+                        });
+                    });
+                    cx.stop_propagation();
+                    return;
+                }
+                // Clay grades (Edit mode ONLY): V = corner, H = smooth,
+                // Shift+H = curvature. Flips selected points and enrolls
+                // them (derive-on-touch), then re-derives. Consumed even
+                // with nothing gradeable so V never yanks to the Move tool
+                // mid-edit; H-constraint stays reachable via menu click /
+                // RMB while in Edit. In Object the keys fall through to
+                // their existing behavior.
+                {
+                    let m = &e.keystroke.modifiers;
+                    let grade = if key.as_str() == "v" && !m.modified() {
+                        Some(crate::editor::joints::Grade::G0)
+                    } else if key.as_str() == "h" && !m.control && !m.alt && !m.platform
+                    {
+                        Some(if m.shift {
+                            crate::editor::joints::Grade::G2
+                        } else {
+                            crate::editor::joints::Grade::G1
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(grade) = grade {
+                        let mut consumed = false;
+                        let _ = shell_keys.update(cx, |shell, cx| {
+                            if shell.renaming.is_some() {
+                                return;
+                            }
+                            let Some(ed) = shell.editor.as_ref() else {
+                                return;
+                            };
+                            if ed.read(cx).dim_input.is_some() {
+                                return;
+                            }
+                            if ed.read(cx).interaction_mode
+                                != crate::editor::InteractionMode::Edit
+                            {
+                                return;
+                            }
+                            let n = ed.update(cx, |ed, _| {
+                                let pts: Vec<_> = ed
+                                    .selection
+                                    .iter()
+                                    .filter_map(|el| el.as_point())
+                                    .collect();
+                                if pts.is_empty() {
+                                    return 0;
+                                }
+                                for p in &pts {
+                                    ed.set_grade(*p, grade);
+                                }
+                                ed.derive_handles();
+                                let name = match grade {
+                                    crate::editor::joints::Grade::G0 => "Corner",
+                                    crate::editor::joints::Grade::G1 => "Smooth",
+                                    crate::editor::joints::Grade::G2 => "Curvature",
+                                };
+                                ed.clay_status = Some((
+                                    format!("Grade → {name} ×{}", pts.len()),
+                                    "V corner · H smooth · ⇧H curvature".into(),
+                                ));
+                                pts.len()
+                            });
+                            if n > 0 {
+                                shell.invalidate_thumbs_all();
+                                cx.notify();
+                            }
+                            consumed = true;
+                        });
+                        if consumed {
+                            cx.stop_propagation();
+                            return;
+                        }
+                    }
+                }
                 // Floating-menu action hotkeys (live while the menu is
                 // visible): H/T/P/E apply the offered constraint.
                 // (X/Y/C/D belong to the dimension-lock actions; C doubles
@@ -1623,12 +1834,82 @@ impl Render for Shell {
                         }
                     }
                 }
+                // Object/Edit mode toggle: Tab flips the interaction mode.
+                // Never fires while typing (rename input or dimension value)
+                // so it can't yank mid-text.
+                if key == "tab" {
+                    let mut consumed = false;
+                    let _ = shell_keys.update(cx, |shell, cx| {
+                        if shell.renaming.is_some() {
+                            return;
+                        }
+                        let Some(ed) = shell.editor.as_ref() else {
+                            return;
+                        };
+                        if ed.read(cx).dim_input.is_some() {
+                            return;
+                        }
+                        ed.update(cx, |ed, cx| {
+                            let next = match ed.interaction_mode {
+                                crate::editor::InteractionMode::Object => {
+                                    crate::editor::InteractionMode::Edit
+                                }
+                                crate::editor::InteractionMode::Edit => {
+                                    crate::editor::InteractionMode::Object
+                                }
+                            };
+                            if ed.set_interaction_mode(next) {
+                                cx.notify();
+                            }
+                        });
+                        shell.mode_dropdown_open = false;
+                        shell.canvas_menu = None;
+                        consumed = true;
+                        cx.notify();
+                    });
+                    if consumed {
+                        cx.stop_propagation();
+                        return;
+                    }
+                }
                 // Dimension tool idle: Esc walks the cancel stack — value
                 // input, picks, then the tool itself (back to Move).
                 // Pen: Esc cancels the live preview first, then the tool.
                 if key == "escape" {
                     let mut consumed = false;
                     let _ = shell_keys.update(cx, |shell, cx| {
+                        if shell.canvas_menu.is_some() {
+                            shell.close_canvas_menu(cx);
+                            consumed = true;
+                            return;
+                        }
+                        // Clay: Esc cancels a live extrude first, else ends
+                        // the path and KEEPS geometry (per-click commits own
+                        // their undo steps — undo explicitly to remove).
+                        if let Some(ed) = shell.editor.as_ref()
+                            && ed.read(cx).tool == crate::editor::Tool::Clay
+                        {
+                            let cancelled = ed.update(cx, |ed, _| {
+                                if ed.clay_path.is_some() || ed.pending_line.is_some() {
+                                    // End WITHOUT committing: Esc kills the
+                                    // ghost (Enter is the committing twin).
+                                    // Pending belongs to Clay here (outer
+                                    // gate), so clearing is safe.
+                                    ed.pending_line = None;
+                                    ed.pending_via_click = false;
+                                    ed.perpendicular_preview = None;
+                                    ed.snap_guides.clear();
+                                    ed.clay_finish()
+                                } else {
+                                    false
+                                }
+                            });
+                            if cancelled {
+                                consumed = true;
+                                cx.notify();
+                                return;
+                            }
+                        }
                         if let Some(ed) = shell.editor.as_ref() {
                             let is_pen = ed.read(cx).tool == crate::editor::Tool::Pen;
                             if is_pen
@@ -1766,6 +2047,10 @@ impl Render for Shell {
                         .flex()
                         .flex_col()
                         .relative()
+                        .child(crate::ui::modebar::ModeBar {
+                            editor: editor.downgrade(),
+                            shell: cx.entity().downgrade(),
+                        })
                         .child(CanvasView {
                             editor: editor.downgrade(),
                             shell: cx.entity().downgrade(),
@@ -1784,6 +2069,14 @@ impl Render for Shell {
                             shell: cx.entity().downgrade(),
                         })
                         .child(crate::ui::toasts::Toasts {
+                            shell: cx.entity().downgrade(),
+                        })
+                        .child(crate::ui::modebar::ModeBarPopup {
+                            editor: editor.downgrade(),
+                            shell: cx.entity().downgrade(),
+                        })
+                        .child(crate::ui::ctxmenu::CanvasMenu {
+                            editor: editor.downgrade(),
                             shell: cx.entity().downgrade(),
                         })
                         .into_any_element()

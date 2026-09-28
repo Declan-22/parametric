@@ -87,7 +87,7 @@ impl AppMenu {
             .map(|s| s.read(cx).fade(&format!("menu-entry-{index}")))
             .unwrap_or(0.0);
         let k = hov.max(if is_active { 1.0 } else { 0.0 });
-        let bg = lerp_rgb(t.bg_darker, t.bg_tertiary, k);
+        let bg = lerp_rgb(t.bg_darker, t.menu_hover_bg, k);
         // Alpha-only fade: lerping RGB from black causes a dark flash.
         let border = fade_in((t.border_color << 8) | 0xFF, k);
         let mut shadow = t.shadow_sm();
@@ -245,7 +245,7 @@ fn render_item(
                 .upgrade()
                 .map(|s| s.read(cx).fade(&format!("submenu-{index}")))
                 .unwrap_or(0.0);
-            let bg = lerp_rgb(t.bg_darker, t.bg_tertiary, k);
+            let bg = lerp_rgb(t.bg_darker, t.menu_hover_bg, k);
             let border = fade_in((t.border_color << 8) | 0xFF, k);
             let mut shadow = t.shadow_sm();
             shadow.color = rgba(fade_in(t.item_shadow_color, k)).into();
@@ -259,7 +259,7 @@ fn render_item(
                 .h(px(ENTRY_HEIGHT))
                 .pl(px(8.))
                 .pr(px(4.))
-                .py(px(10.))
+                .py(px(6.))
                 .rounded(px(10.))
                 .text_sm()
                 .text_color(rgb(t.text_primary))
@@ -297,10 +297,15 @@ fn render_item(
 }
 
 /// Floating-menu keycap styling, with a flexible width for shortcuts such as
-/// "Ctrl+Z" and "Shift+Alt+P" while retaining the compact square shape for
-/// one-character shortcuts.
+/// "Ctrl + Z" and "Shift + Alt + P" while retaining the compact square
+/// shape for one-character shortcuts. Chords render spaced.
 fn shortcut_hint(shortcut: SharedString, t: Theme) -> gpui::AnyElement {
-    let width = (18. + shortcut.to_string().len() as f32 * 5.).max(18.);
+    let pretty: String = shortcut
+        .to_string()
+        .split('+')
+        .collect::<Vec<_>>()
+        .join(" + ");
+    let width = (18. + pretty.len() as f32 * 5.).max(18.);
     div()
         .min_w(px(18.))
         .w(px(width))
@@ -318,7 +323,7 @@ fn shortcut_hint(shortcut: SharedString, t: Theme) -> gpui::AnyElement {
                 .text_xs()
                 .font_family(crate::theme::FONT_UI)
                 .text_color(rgb(t.empty_text_primary))
-                .child(shortcut),
+                .child(pretty),
         )
         .into_any_element()
 }

@@ -10,9 +10,12 @@ pub(crate) mod pen;
 pub mod fillet;
 pub(crate) mod gates;
 pub mod grid;
+pub mod joints;
+mod clay;
 pub mod overconstraint;
 pub mod pick;
 pub mod ruler;
+pub mod spans;
 mod snapping;
 mod tools;
 
@@ -21,7 +24,7 @@ use std::cell::RefCell;
 pub use camera::Camera;
 
 pub use snapping::SnapGuide;
-pub use tools::{DimInput, DimPick, PenMode, PendingBezier, PendingCircle, PendingLine, PendingPen, PendingRuler, PendingShape, Tool};
+pub use tools::{ClayPath, DimInput, DimPick, EditScope, InteractionMode, PenMode, PendingBezier, PendingCircle, PendingLine, PendingPen, PendingRuler, PendingShape, Tool};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InspectorField { X, Y, Width, Height, Opacity, StrokeHex, FillHex, Dimension(usize) }
@@ -138,6 +141,22 @@ pub struct Editor {
     pub(crate) render_cache: RefCell<crate::ui::canvas::paint::RenderCache>,
     pub camera: Camera,
     pub tool: Tool,
+    pub interaction_mode: InteractionMode,
+    // Clay joint sidecar (Phase 1): grade/fullness/angles per point.
+    // Presence = managed (derived handles); absence = legacy.
+    pub joint_data: std::collections::HashMap<crate::core::ids::PointId, joints::JointData>,
+    // Clay active path (Phase 2.9). Persists across tool switches so a
+    // path can be resumed; ended explicitly (Enter/Esc/close).
+    pub clay_path: Option<ClayPath>,
+    // Edit isolation scope (None = everything editable).
+    pub edit_scope: Option<EditScope>,
+    // Last Clay action readout for the modebar redo region:
+    // (what happened, key hints). Narration teaches the grammar.
+    pub clay_status: Option<(String, String)>,
+    // Clay view flags: combs default ON in Edit (spec §8).
+    pub show_combs: bool,
+    pub comb_scale: f32,
+    pub comb_density: usize,
     pub pending_shape: Option<PendingShape>,
     pub pending_ruler: Option<PendingRuler>,
     pub pending_line: Option<PendingLine>,
@@ -300,6 +319,15 @@ impl Editor {
             render_cache: RefCell::new(Default::default()),
             camera: Camera::new(),
             tool: Tool::Move,
+            interaction_mode: InteractionMode::Object,
+            joint_data: std::collections::HashMap::new(),
+            clay_path: None,
+            edit_scope: None,
+            clay_status: None,
+            // Combs disabled for now (kept as code; Shift+C re-enables).
+            show_combs: false,
+            comb_scale: 400.0,
+            comb_density: 12,
             pending_shape: None,
             pending_ruler: None,
             pending_line: None,
@@ -359,6 +387,166 @@ impl Editor {
             dim_caret_visible: true,
             toast_requests: Vec::new(),
             arc_center_reveal: Vec::new(),
+        }
+    }
+
+    /// Flip Object/Edit. Entering Edit strips managed-handle point refs
+    /// (they don't exist there) and FREEZES the isolation scope (islands
+    /// of the selection; empty selection = everything). Entering Object
+    /// clears the scope and expands the selection to whole islands
+    /// (components → wholes carry rule).
+    pub fn set_interaction_mode(&mut self, mode: InteractionMode) -> bool {
+        if self.interaction_mode == mode {
+            return false;
+        }
+        self.interaction_mode = mode;
+        if mode == InteractionMode::Edit {
+            let dead = self.managed_handles();
+            self.selection.retain(|el| match el {
+                ElementRef::Point(pid) => !dead.contains(pid),
+                _ => true,
+            });
+            self.edit_scope = self.freeze_scope();
+            // Out-of-scope annotations die with the transition (hover
+            // recomputes on next move; an open value input is left alone).
+            if let Some(sel) = self.selected_dim {
+                if !self.dim_in_scope(sel) {
+                    self.selected_dim = None;
+                }
+            }
+            self.hovered_dim = self.hovered_dim.filter(|&i| self.dim_in_scope(i));
+            let sel = std::mem::take(&mut self.selected_constraints);
+            self.selected_constraints = sel
+                .into_iter()
+                .filter(|c| self.marker_in_scope(c))
+                .collect();
+        } else {
+            self.edit_scope = None;
+            // Expand AFTER the flip so the Object gate inside passes.
+            let sel = std::mem::take(&mut self.selection);
+            self.selection = self.expand_to_islands(&sel);
+        }
+        true
+    }
+
+    /// Snapshot the isolation scope from the current selection. None =
+    /// everything (empty selection, or selection yielding nothing scoped).
+    fn freeze_scope(&self) -> Option<EditScope> {
+        if self.selection.is_empty() {
+            return None;
+        }
+        let islands = self.doc.islands();
+        let mut scope = EditScope::default();
+        for el in &self.selection {
+            match *el {
+                ElementRef::Segment(sid) => {
+                    if let Some(isl) = islands.iter().find(|v| v.contains(&sid)) {
+                        for s in isl {
+                            if !scope.segments.contains(s) {
+                                scope.segments.push(*s);
+                            }
+                        }
+                    }
+                }
+                ElementRef::Point(pid) => {
+                    let mut touched = false;
+                    for isl in &islands {
+                        let hits = isl.iter().any(|s| {
+                            self.doc.segment(*s).is_some_and(|g| {
+                                g.start == pid || g.end == pid
+                            })
+                        });
+                        if hits {
+                            touched = true;
+                            for s in isl {
+                                if !scope.segments.contains(s) {
+                                    scope.segments.push(*s);
+                                }
+                            }
+                        }
+                    }
+                    if !touched && !scope.points.contains(&pid) {
+                        scope.points.push(pid);
+                    }
+                }
+                ElementRef::Fill(fid) => {
+                    if let Some(f) = self.doc.fill(fid) {
+                        for sid in &f.segments.clone() {
+                            if let Some(isl) = islands.iter().find(|v| v.contains(sid)) {
+                                for s in isl {
+                                    if !scope.segments.contains(s) {
+                                        scope.segments.push(*s);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if scope.segments.is_empty() && scope.points.is_empty() {
+            None
+        } else {
+            Some(scope)
+        }
+    }
+
+    pub fn in_scope_segment(&self, sid: crate::core::ids::SegmentId) -> bool {
+        self.edit_scope
+            .as_ref()
+            .map_or(true, |s| s.segments.contains(&sid))
+    }
+
+    pub fn in_scope_point(&self, pid: crate::core::ids::PointId) -> bool {
+        match &self.edit_scope {
+            None => true,
+            Some(s) => {
+                s.points.contains(&pid)
+                    || s.segments.iter().any(|id| {
+                        self.doc.segment(*id).is_some_and(|g| {
+                            g.start == pid || g.end == pid
+                        })
+                    })
+            }
+        }
+    }
+
+    pub fn in_scope_element(&self, el: ElementRef) -> bool {
+        match el {
+            ElementRef::Point(pid) => self.in_scope_point(pid),
+            ElementRef::Segment(sid) => self.in_scope_segment(sid),
+            ElementRef::Fill(fid) => self.doc.fill(fid).is_some_and(|f| {
+                f.segments.iter().all(|sid| self.in_scope_segment(*sid))
+            }),
+        }
+    }
+
+    /// In-scope point set for hit-testing and dim/chip life (None =
+    /// everything — no isolation).
+    pub fn scoped_points(&self) -> Option<std::collections::HashSet<crate::core::ids::PointId>> {
+        crate::editor::joints::scope_point_set(&self.doc, self.edit_scope.as_ref())
+    }
+
+    /// A dimension lives iff every referenced point is in scope.
+    pub fn dim_in_scope(&self, idx: usize) -> bool {
+        match self.doc.dimensions.get(idx) {
+            Some(d) => match self.scoped_points() {
+                None => true,
+                Some(set) => crate::editor::joints::dim_target_points(&self.doc, &d.target)
+                    .iter()
+                    .all(|p| set.contains(p)),
+            },
+            None => false,
+        }
+    }
+
+    /// A constraint chip lives iff every touched point is in scope.
+    pub fn marker_in_scope(&self, c: &crate::core::constraints::Constraint) -> bool {
+        match self.scoped_points() {
+            None => true,
+            Some(set) => crate::editor::joints::constraint_points(&self.doc, c)
+                .iter()
+                .all(|p| set.contains(p)),
         }
     }
 
@@ -1597,8 +1785,8 @@ impl Editor {
         self.dim_hitboxes
             .iter()
             .rev()
-            .find(|(_, [rx, ry, rw, rh])| {
-                x >= *rx && x <= *rx + *rw && y >= *ry && y <= *ry + *rh
+            .find(|(idx, [rx, ry, rw, rh])| {
+                x >= *rx && x <= *rx + *rw && y >= *ry && y <= *ry + *rh && self.dim_in_scope(*idx)
             })
             .map(|(idx, _)| *idx)
     }
@@ -2243,12 +2431,13 @@ impl Editor {
     }
 
     // Zooms keeping the document point under the cursor anchored.
+    // Wheel-forward reads positive delta: forward zooms IN.
     pub fn zoom_at(&mut self, cursor: gpui::Point<gpui::Pixels>, delta: f32) {
         let cursor_doc = |cam: &Camera, c: gpui::Point<gpui::Pixels>| {
             cam.screen_to_unit(Point2::new(f64::from(c.x), f64::from(c.y)))
         };
         let before = cursor_doc(&self.camera, cursor);
-        let factor = f64::from((-delta / 400.).exp());
+        let factor = f64::from((delta / 400.).exp());
         self.camera.set_zoom(self.camera.zoom * factor);
         let after = cursor_doc(&self.camera, cursor);
         self.camera.pan = Point2::new(
@@ -2440,5 +2629,24 @@ mod angle_tests {
             !ed.curve_dim_renders.is_empty(),
             "no curve replica render data after commit"
         );
+    }
+}
+
+#[cfg(test)]
+mod zoom_tests {
+    use super::*;
+
+    #[test]
+    fn wheel_forward_zooms_in() {
+        let mut ed = Editor::new();
+        let z0 = ed.camera.zoom;
+        let c = gpui::Point {
+            x: gpui::px(100.),
+            y: gpui::px(100.),
+        };
+        ed.zoom_at(c, 120.);
+        assert!(ed.camera.zoom > z0, "forward must zoom in");
+        ed.zoom_at(c, -240.);
+        assert!(ed.camera.zoom < z0, "backward must zoom out");
     }
 }

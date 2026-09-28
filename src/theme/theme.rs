@@ -45,6 +45,8 @@ pub struct Theme {
 
     pub border_color: u32,
     pub menu_border_color: u32,
+    pub menu_bg: u32,
+    pub menu_hover_bg: u32,
     pub component_border_color: u32,
 
     pub text_primary: u32,
@@ -104,6 +106,8 @@ impl Theme {
 
             border_color: LIGHT_BORDER_COLOR,
             menu_border_color: LIGHT_MENU_BORDER_COLOR,
+            menu_bg: LIGHT_MENU_BG,
+            menu_hover_bg: LIGHT_MENU_HOVER_BG,
             component_border_color: LIGHT_COMPONENT_BORDER_COLOR,
 
             text_primary: LIGHT_TEXT_PRIMARY,
@@ -133,6 +137,8 @@ impl Theme {
 
             border_color: DARK_BORDER_COLOR,
             menu_border_color: DARK_MENU_BORDER_COLOR,
+            menu_bg: DARK_MENU_BG,
+            menu_hover_bg: DARK_MENU_HOVER_BG,
             component_border_color: DARK_COMPONENT_BORDER_COLOR,
 
             text_primary: DARK_TEXT_PRIMARY,

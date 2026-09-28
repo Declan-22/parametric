@@ -504,6 +504,9 @@ impl Editor {
             moved.insert(id);
             self.doc.move_point(id, pos);
         }
+        // Clay: re-derive managed bezier handles post-solve (free handles
+        // only; constrained ones are skipped inside).
+        self.derive_handles();
         self.enforce_arc_coincident_joints(&dragged);
         self.enforce_tangencies();
         // Arc consistency is enforced by solver equations; no post-solve

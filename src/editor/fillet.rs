@@ -677,6 +677,8 @@ impl Editor {
         for (id, pos) in solution.positions {
             self.doc.move_point(id, pos);
         }
+        // Clay: re-derive managed bezier handles post-solve.
+        self.derive_handles();
         // Exactness pass: snaps the derived points (and curve-source
         // corners the solver only approximates) onto the evaluated arc.
         self.refresh_fillets();
@@ -994,6 +996,8 @@ impl Editor {
         for (id, pos) in solution.positions {
             self.doc.move_point(id, pos);
         }
+        // Clay: re-derive managed bezier handles post-solve.
+        self.derive_handles();
         self.refresh_fillets();
         // No revalue: strict commits keep flat dims satisfied as-is, so
         // values stay exactly as the user set them.

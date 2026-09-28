@@ -394,6 +394,9 @@ impl Editor {
             moved.insert(id);
             self.doc.move_point(id, pos);
         }
+        // Clay: re-derive managed bezier handles post-solve (free handles
+        // only; constrained ones are skipped inside).
+        self.derive_handles();
         // Arc consistency is part of the solve graph now.
         if direct_distance {
             self.enforce_point_distance_exact(target);
@@ -671,6 +674,8 @@ impl Editor {
             for (id, pos) in solution.positions {
                 self.doc.move_point(id, pos);
             }
+            // Clay: re-derive managed bezier handles post-solve.
+            self.derive_handles();
             self.enforce_tangencies();
             self.doc_gen += 1;
             true

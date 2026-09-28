@@ -170,6 +170,7 @@ impl RenderOnce for DesignCard {
                         None, // cursor_doc (no midpoint reveal in thumbnails)
                         None, // transient render cache
                         None, // fillet preview
+                        None, // clay view (thumbnails show committed truth)
                     ),
                     None => Vec::new(),
                 }
@@ -500,7 +501,7 @@ pub fn render_context_menu(
      -> gpui::AnyElement {
         let shell_weak = shell_entity.clone();
         let k = fade_of(index);
-        let bg = lerp_rgb(t.bg_darker, t.bg_tertiary, k);
+        let bg = lerp_rgb(t.bg_darker, t.menu_hover_bg, k);
         // Border is transparent at rest and fades in with the hover.
         // Alpha-only fade: lerping RGB from black causes a dark flash.
         let border = fade_in((t.border_color << 8) | 0xFF, k);

@@ -14,11 +14,9 @@ pub(crate) const ICON_CONSTRAINT_PERPENDICULAR: &[u8] = br#"<svg width="12" heig
 
 const ICON_MOVE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
 	<path d="M0 0h24v24H0z" fill="none" />
-	<g fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.5">
-		<path d="m12.669 8.358l5.028 1.968c2.9 1.134 4.35 1.702 4.302 2.602s-1.561 1.313-4.588 2.138c-.901.246-1.352.369-1.664.68c-.312.313-.435.764-.681 1.665c-.825 3.026-1.238 4.54-2.138 4.588s-1.468-1.402-2.602-4.302l-1.968-5.028C7.17 9.633 6.576 8.115 7.345 7.345s2.288-.175 5.324 1.013Z" />
-		<path stroke-linecap="round" d="M9 4V2M5 5L3.5 3.5M4 9H2m3 4l-1.5 1.5m11-11L13 5" />
-	</g>
+	<path fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.5" d="m9.803 4.63l6.033 2.36c3.48 1.362 5.22 2.043 5.163 3.123c-.058 1.08-1.874 1.576-5.506 2.566c-1.081.295-1.622.442-1.997.817s-.522.916-.817 1.997c-.99 3.632-1.486 5.448-2.566 5.506s-1.76-1.683-3.122-5.163L4.63 9.803C3.204 6.159 2.49 4.338 3.414 3.414c.924-.923 2.745-.21 6.389 1.216Z" />
 </svg>
+
 
 
 
@@ -110,6 +108,14 @@ const ICON_RULER: &[u8] =
 
 const ICON_PEN: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24"><path d="M0 0h24v24H0z" fill="none" /><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"><path d="m9.5 14.5l-7 7m8-7a1 1 0 1 1-2 0a1 1 0 0 1 2 0" /><path d="m18.5 12l-1.762 4.028c-.85 1.944-1.276 2.915-2.076 3.538c-.8.624-1.846.798-3.938 1.147L3 22a1 1 0 0 1-1-1l1.287-7.724c.349-2.092.523-3.138 1.147-3.938c.623-.8 1.594-1.225 3.538-2.076L12 5.5" /><path d="M18.379 11.879L12.12 5.62a2.121 2.121 0 0 1 3-3l6.26 6.26a2.121 2.121 0 0 1-3 3" /></g></svg>"#;
 
+// Clay: fit-point curve — one flowing stroke through two joints. No
+// shortcut key (every letter belongs to the in-tool grammar).
+const ICON_CLAY: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M7 7.5v-2c0-.943 0-1.414.293-1.707S8.057 3.5 9 3.5h12a1 1 0 0 1 1 1a7 7 0 0 1-7 7h-4c-1.886 0-2.828 0-3.414-.586S7 9.386 7 7.5m0-3H3a1 1 0 0 0-1 1a4 4 0 0 0 4 4h1m9 2v2a3 3 0 0 0 3 3c.465 0 .698 0 .888.051a1.5 1.5 0 0 1 1.06 1.06c.052.191.052.424.052.889s0 .698-.051.888a1.5 1.5 0 0 1-1.06 1.06c-.191.052-.424.052-.889.052h-3c-.373 0-.56 0-.678-.07s-.267-.343-.566-.889a2 2 0 0 0-3.511 0c-.3.546-.449.82-.567.89c-.118.069-.305.069-.678.069H7c-.465 0-.697 0-.888-.051a1.5 1.5 0 0 1-1.06-1.06C5 19.197 5 18.964 5 18.5s0-.698.051-.888a1.5 1.5 0 0 1 1.06-1.06c.192-.052.424-.052.889-.052a3 3 0 0 0 3-3v-2" />
+</svg>
+"#;
+
 #[derive(IntoElement)]
 pub struct Toolbar {
     pub editor: gpui::WeakEntity<crate::editor::Editor>,
@@ -126,11 +132,11 @@ impl RenderOnce for Toolbar {
             .unwrap_or(Tool::Move);
 
         div()
-            // Single column, flush against the far-left edge, full height
-            // of the canvas area.
+            // Single column, flush against the far-left edge, from below
+            // the second topbar to the bottom of the canvas area.
             .absolute()
             .left_0()
-            .top_0()
+            .top(px(crate::ui::modebar::MODEBAR_HEIGHT))
             .bottom_0()
             .flex()
             .flex_col()
@@ -149,6 +155,7 @@ impl RenderOnce for Toolbar {
             .child(self.tool_button(Tool::Ruler, ICON_RULER, active_tool, t, cx))
             .child(divider(t))
             .child(self.tool_button(Tool::Pen, ICON_PEN, active_tool, t, cx))
+            .child(self.tool_button(Tool::Clay, ICON_CLAY, active_tool, t, cx))
             .child(self.tool_button(Tool::Rectangle, ICON_RECTANGLE, active_tool, t, cx))
             .child(divider(t))
             .child(self.tool_button(Tool::Fillet, ICON_CIRCLE, active_tool, t, cx))
@@ -288,6 +295,7 @@ fn tool_debug_name(tool: Tool) -> &'static str {
         Tool::Dimension => "tool-dimension",
         Tool::Fillet => "tool-fillet",
         Tool::Pen => "tool-pen",
+        Tool::Clay => "tool-clay",
         Tool::ConstraintHorizontalVertical => "tool-constraint-hv",
         Tool::ConstraintTangent => "tool-constraint-tangent",
         Tool::ConstraintCoincident => "tool-constraint-coincident",
@@ -307,6 +315,7 @@ fn tool_tooltip(tool: Tool) -> (&'static str, &'static str) {
         Tool::Dimension => ("Dimension", "D"),
         Tool::Fillet => ("Fillet", "F"),
         Tool::Pen => ("Pen", "P"),
+        Tool::Clay => ("Clay", ""),
         Tool::ConstraintHorizontalVertical => ("Horizontal / Vertical constraint", ""),
         Tool::ConstraintTangent => ("Tangent constraint", ""),
         Tool::ConstraintCoincident => ("Coincident constraint", ""),

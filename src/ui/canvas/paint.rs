@@ -42,6 +42,10 @@ fn zoom_key(zoom: f64) -> u64 {
     (zoom * 64.0).round().max(1.0).to_bits()
 }
 
+/// Isolation dim factor: out-of-scope strokes/dims/chips paint here.
+/// Points/dots stay full-bright (affordances, not geometry).
+pub(crate) const SCOPE_DIM: f32 = 0.35;
+
 fn bbox_of(pts: &[Point2]) -> [f64; 4] {
     let mut bb = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
     for p in pts {
@@ -269,6 +273,7 @@ pub fn build_draw_list(
     cursor_doc: Option<Point2>,
     cache: Option<&mut RenderCache>,
     fillet_preview: Option<crate::editor::fillet::FilletPreview>,
+    clay: Option<crate::editor::joints::ClayView<'_>>,
 ) -> Vec<Primitive> {
     let min = camera.screen_to_unit(Point2::new(0., 0.));
     let max = camera.screen_to_unit(Point2::new(
@@ -289,6 +294,37 @@ pub fn build_draw_list(
         .flat_map(|(_, s)| [s.ctrl, s.center].into_iter().flatten())
         .collect();
     let mut list = Vec::with_capacity(element_count.saturating_mul(2).saturating_add(64));
+    // Edit isolation: out-of-scope strokes paint at 50% via the public
+    // Background::opacity multiplier. Points/dots stay full-bright
+    // (affordances, not geometry).
+    let scoped = clay.and_then(|c| c.scope);
+    let in_scope_seg = |sid: crate::core::ids::SegmentId| {
+        scoped.map_or(true, |s| s.segments.contains(&sid))
+    };
+    // In-scope point set (segment endpoints/handles + lone points) for
+    // dim/chip life tests. None-scope ⇒ everything lives.
+    let scope_pts: std::collections::HashSet<crate::core::ids::PointId> = match scoped {
+        Some(s) => {
+            let mut set: std::collections::HashSet<crate::core::ids::PointId> =
+                s.points.iter().copied().collect();
+            for id in &s.segments {
+                if let Some(g) = doc.segment(*id) {
+                    set.insert(g.start);
+                    set.insert(g.end);
+                    set.extend(g.ctrl);
+                    set.extend(g.center);
+                }
+            }
+            set
+        }
+        None => std::collections::HashSet::new(),
+    };
+    let target_live = |target: &crate::core::constraints::DimTarget| -> bool {
+        scoped.is_none()
+            || crate::editor::joints::dim_target_points(doc, target)
+                .iter()
+                .all(|p| scope_pts.contains(p))
+    };
     // Reused screen-space workspaces for curve flattening: every curve in
     // the frame shares these instead of allocating a Vec per curve per
     // frame (the allocator churn showed up as heap growth while dragging).
@@ -348,7 +384,14 @@ pub fn build_draw_list(
                     }
                     list.push(Primitive::Polygon {
                         points: pts.iter().map(|&p| scr(p)).collect(),
-                        color: rgb(fill.fill_color).into(),
+                        color: {
+                            let base: gpui::Background = rgb(fill.fill_color).into();
+                            let all_in = fill
+                                .segments
+                                .iter()
+                                .all(|sid| in_scope_seg(*sid));
+                            if all_in { base } else { base.opacity(SCOPE_DIM) }
+                        },
                     });
                 }
                 ElementRef::Segment(sid) => {
@@ -357,7 +400,7 @@ pub fn build_draw_list(
                     };
                     if seg.kind == SegmentKind::Ruler
                         && let Some((a, b)) = doc.segment_geom(sid)
-                        && (visible.contains(a) || visible.contains(b))
+                        && segment_visible(a, b, visible)
                     {
                         push_ruler(&mut list, a, b, camera, t);
                     }
@@ -366,17 +409,22 @@ pub fn build_draw_list(
                         && seg.stroke_width > 0.
                         && let Some((a, b)) = fillet_trimmed_line(doc, sid)
                             .or_else(|| doc.segment_geom(sid))
-                        && (visible.contains(a) || visible.contains(b))
+                        && segment_visible(a, b, visible)
                     {
                         let (ax, ay) = scr(a);
                         let (bx, by) = scr(b);
+                        let base: gpui::Background = rgba((seg.stroke_color << 8) | ((seg.opacity.clamp(0., 1.) * 255.) as u32)).into();
                         list.push(Primitive::Line {
                             ax,
                             ay,
                             bx,
                             by,
                             width: seg.stroke_width as f32,
-                            color: rgba((seg.stroke_color << 8) | ((seg.opacity.clamp(0., 1.) * 255.) as u32)).into(),
+                            color: if in_scope_seg(sid) {
+                                base
+                            } else {
+                                base.opacity(SCOPE_DIM)
+                            },
                         });
                     }
                     // Arc segments: sampled polyline of the arc through
@@ -420,12 +468,13 @@ pub fn build_draw_list(
                         let Some(samples) = cache.arc_samples(doc, sid, camera.zoom) else {
                             continue;
                         };
-                        if samples.iter().any(|p| visible.contains(*p)) {
+                        if polyline_visible(samples, visible) {
                             let live = trimmed_samples(doc, sid, samples);
                             let (w, col) = fillet_style.flatten().unwrap_or((
                                 1.5,
                                 rgba((seg.stroke_color << 8) | ((seg.opacity.clamp(0., 1.) * 255.) as u32)).into(),
                             ));
+                            let col = if in_scope_seg(sid) { col } else { col.opacity(SCOPE_DIM) };
                             push_simplified_polyline(
                                 &mut list,
                                 &mut scr_buf,
@@ -514,7 +563,11 @@ pub fn build_draw_list(
                                     live,
                                     &scr,
                                     seg.stroke_width.max(1.) as f32,
-                                    color,
+                                    if in_scope_seg(sid) {
+                                        color
+                                    } else {
+                                        color.opacity(SCOPE_DIM)
+                                    },
                                 );
                             }
                         }
@@ -615,7 +668,7 @@ pub fn build_draw_list(
     for d in dim_renders {
         // Hover lifts the whole dimension (lines included) to
         // text_secondary; constraint dims idle in the muted ink.
-        let ink = if d.constraint {
+        let base_ink: gpui::Background = if d.constraint {
             if d.hovered {
                 rgb(t.text_secondary).into()
             } else {
@@ -623,6 +676,16 @@ pub fn build_draw_list(
             }
         } else {
             accent
+        };
+        let dimmed = d.dim_index.is_some_and(|i| {
+            doc.dimensions
+                .get(i)
+                .is_some_and(|dd| !target_live(&dd.target))
+        });
+        let ink = if dimmed {
+            base_ink.opacity(SCOPE_DIM)
+        } else {
+            base_ink
         };
         dashed_line(&mut list, d.ax, d.ay, d.lax, d.lay, 1., ink);
         dashed_line(&mut list, d.bx, d.by, d.lbx, d.lby, 1., ink);
@@ -638,10 +701,20 @@ pub fn build_draw_list(
     // 2a) Angle dimensions: a dashed arc between the two lines, with the
     // value container riding on it (label painted by the DOM layer).
     for a in angle_dim_renders {
-        let ink = if a.constraint {
+        let base_ink: gpui::Background = if a.constraint {
             rgb(t.empty_text_secondary).into()
         } else {
             accent
+        };
+        let dimmed = a.dim_index.is_some_and(|i| {
+            doc.dimensions
+                .get(i)
+                .is_some_and(|dd| !target_live(&dd.target))
+        });
+        let ink = if dimmed {
+            base_ink.opacity(SCOPE_DIM)
+        } else {
+            base_ink
         };
         const N: usize = 48;
         let mut pts = Vec::with_capacity(N + 1);
@@ -656,7 +729,7 @@ pub fn build_draw_list(
     // a dashed offset replica of the bezier path (never the chord), with
     // the value container riding on it (label painted by the DOM layer).
     for c in curve_dim_renders {
-        let ink = if c.constraint {
+        let base_ink: gpui::Background = if c.constraint {
             if c.hovered {
                 rgb(t.text_secondary).into()
             } else {
@@ -664,6 +737,16 @@ pub fn build_draw_list(
             }
         } else {
             accent
+        };
+        let dimmed = c.dim_index.is_some_and(|i| {
+            doc.dimensions
+                .get(i)
+                .is_some_and(|dd| !target_live(&dd.target))
+        });
+        let ink = if dimmed {
+            base_ink.opacity(SCOPE_DIM)
+        } else {
+            base_ink
         };
         let pts: Vec<(f32, f32)> = c.pts.iter().map(|p| (p[0], p[1])).collect();
         dashed_polyline(&mut list, &pts, ink);
@@ -685,7 +768,16 @@ pub fn build_draw_list(
     let guide_color: gpui::Background = rgb(t.empty_text_secondary).into();
     for m in constraint_markers {
         if m.visible && let Some(g) = m.guide {
-            dashed_line(&mut list, g[0], g[1], g[2], g[3], 1., guide_color);
+            let live = scoped.is_none()
+                || crate::editor::joints::constraint_points(doc, &m.constraint)
+                    .iter()
+                    .all(|p| scope_pts.contains(p));
+            let gc = if live {
+                guide_color
+            } else {
+                guide_color.opacity(SCOPE_DIM)
+            };
+            dashed_line(&mut list, g[0], g[1], g[2], g[3], 1., gc);
         }
     }
 
@@ -748,24 +840,68 @@ pub fn build_draw_list(
         }
     }
 
-    // 4) Hover affordance: accent outline of the hovered element.
+    // Object world (Move tool, committed mode): islands + bbox replace ALL
+    // component affordances. Zero joints ever — hover lights whole islands,
+    // click boxes them. Every other tool/mode keeps element feedback.
+    let object_world =
+        !clay.is_some_and(|c| c.edit) && matches!(tool, crate::editor::Tool::Move);
+
+    // 4) Hover affordance: accent outline of the hovered element (Object:
+    // the whole island — never a joint).
     if let Some(h) = hover
         && !selection.contains(&h)
     {
-        element_outline(doc, h, &scr, accent, &mut list, camera.zoom, cache, &bezier_handles, &mut scr_buf, &mut sim_buf);
+        if object_world {
+            for el in hover_island(doc, h) {
+                element_outline(doc, el, &scr, accent, &mut list, camera.zoom, cache, &bezier_handles, &mut scr_buf, &mut sim_buf);
+            }
+        } else {
+            element_outline(doc, h, &scr, accent, &mut list, camera.zoom, cache, &bezier_handles, &mut scr_buf, &mut sim_buf);
+        }
     }
 
     // 5) Selection highlights + point handles drawn after everything —
     // points are the topmost affordance in the entire stack.
-    for &sel in selection {
-        element_outline(doc, sel, &scr, accent, &mut list, camera.zoom, cache, &bezier_handles, &mut scr_buf, &mut sim_buf);
+    // Clay (Edit only): managed handles are derived, never rendered as
+    // diamonds/dots — grabbing them would fight the derivation.
+    let clay_edit = clay.is_some_and(|c| c.edit);
+    let managed_handles: std::collections::HashSet<crate::core::ids::PointId> = if clay_edit {
+        clay
+            .and_then(|c| {
+                Some(
+                    crate::editor::spans::managed_segments(doc, c.joints)
+                        .into_iter()
+                        .filter_map(|sid| doc.segment(sid))
+                        .flat_map(|s| [s.ctrl, s.center].into_iter().flatten())
+                        .collect(),
+                )
+            })
+            .unwrap_or_default()
+    } else {
+        std::collections::HashSet::new()
+    };
+    if !object_world {
+        for &sel in selection {
+            element_outline(doc, sel, &scr, accent, &mut list, camera.zoom, cache, &bezier_handles, &mut scr_buf, &mut sim_buf);
+        }
+    } else {
+        // Object world: selected edges stay highlighted under the bbox.
+        for &sel in selection {
+            if matches!(sel, ElementRef::Segment(_)) {
+                element_outline(doc, sel, &scr, accent, &mut list, camera.zoom, cache, &bezier_handles, &mut scr_buf, &mut sim_buf);
+            }
+        }
     }
-    for &sel in selection {
-        for pid in doc.element_points(sel) {
+    if !object_world {
+        for &sel in selection {
+            for pid in doc.element_points(sel) {
             if let Some(p) = doc.point(pid) {
                 let (x, y) = scr(p);
                 // Bezier handle points render as diamonds, never dots.
                 if bezier_handles.contains(&pid) {
+                    if managed_handles.contains(&pid) {
+                        continue;
+                    }
                     list.push(Primitive::Diamond {
                         cx: x,
                         cy: y,
@@ -784,6 +920,171 @@ pub fn build_draw_list(
                         radius: 4.,
                     });
                 }
+            }
+        }
+    }
+    }
+    // 5b2) Object-world selection: ONE solid accent box + corner dots
+    // around everything selected (display-only corners, drag-inside moves).
+    if object_world && !selection.is_empty() {
+        let pts = doc.selection_points(selection);
+        if let Some(bb) = doc.bounds_of_points(&pts) {
+            let (x0, y0) = scr(bb.origin);
+            let (x1, y1) = scr(Point2::new(
+                bb.origin.x + bb.size.w,
+                bb.origin.y + bb.size.h,
+            ));
+            list.push(Primitive::Outline {
+                x: x0,
+                y: y0,
+                w: x1 - x0,
+                h: y1 - y0,
+            });
+            for (cx, cy) in [(x0, y0), (x1, y0), (x1, y1), (x0, y1)] {
+                list.push(Primitive::Circle { cx, cy, radius: 4. });
+            }
+        }
+    }
+    // 5b) Clay skeleton (Edit + ACTIVE path only): grade glyphs on the
+    // path's joints — square = G0, circle = G1, ringed dot = G2. The
+    // active end renders filled selected. End the path and everything
+    // goes clean (committed truth, no half-states lingering).
+    // Selected joints use the direct-pick accent disk (existing convention).
+    if let Some(cv) = clay.filter(|c| c.edit && c.path_joints.is_some_and(|j| !j.is_empty())) {
+        use crate::editor::joints::Grade;
+        let white: gpui::Background = rgb(0xffffff).into();
+        let mut joints: Vec<(crate::core::ids::PointId, Grade)> = Vec::new();
+        if let Some(path) = cv.path_joints {
+            for &pid in path {
+                if joints.iter().all(|(id, _)| *id != pid) {
+                    joints.push((
+                        pid,
+                        cv.joints.get(&pid).copied().unwrap_or_default().grade,
+                    ));
+                }
+            }
+        }
+        for (pid, grade) in joints {
+            let Some(p) = doc.point(pid) else {
+                continue;
+            };
+            let (x, y) = scr(p);
+            if selection.contains(&ElementRef::Point(pid)) || Some(pid) == cv.path_end {
+                list.push(Primitive::Disk { cx: x, cy: y, radius: 4., color: accent });
+                continue;
+            }
+            match grade {
+                Grade::G0 => list.push(Primitive::Rect {
+                    x: x - 3.5,
+                    y: y - 3.5,
+                    w: 7.,
+                    h: 7.,
+                    color: white,
+                }),
+                Grade::G1 => list.push(Primitive::Circle { cx: x, cy: y, radius: 4. }),
+                Grade::G2 => {
+                    list.push(Primitive::Circle { cx: x, cy: y, radius: 5. });
+                    list.push(Primitive::Disk { cx: x, cy: y, radius: 1.5, color: accent });
+                }
+            }
+        }
+    }
+    // 5c) Curvature combs (Edit + toggled): per managed span, heat-colored
+    // teeth inside the bend + a tip envelope polyline. Teeth are
+    // anti-crossing clamped (spans.rs) so the envelope never breaks.
+    // Color = curvature VARIATION (|Δk| between neighbors, normalized per
+    // path): true arcs and straights read cool blue, wiggles/bumps glow
+    // red. The goal is literal: fair the path until the red dies. G1 shows
+    // a color step at the joint, G2 flows, G0 collides. Clipped by canvas.
+    // Same active-path rule as the skeleton (no path, no combs).
+    if let Some(cv) = clay.filter(|c| {
+        c.edit && c.combs && c.path_joints.is_some_and(|j| !j.is_empty())
+    }) {
+        use crate::editor::spans;
+        // Per span: clamped teeth with curvature.
+        let mut all: Vec<Vec<(Point2, Point2, f64)>> = Vec::new();
+        for sid in crate::editor::spans::managed_segments(doc, cv.joints) {
+            let Some(seg) = doc.segment(sid) else {
+                continue;
+            };
+            let (h1, h2) = seg.bezier_handles();
+            let (Some(a), Some(b), Some(c1), Some(c2)) = (
+                doc.point(seg.start),
+                doc.point(seg.end),
+                h1.and_then(|h| doc.point(h)),
+                h2.and_then(|h| doc.point(h)),
+            ) else {
+                continue;
+            };
+            let mut teeth = spans::comb_teeth_k(
+                a,
+                c1,
+                c2,
+                b,
+                cv.comb_density,
+                camera.zoom,
+                cv.comb_scale,
+                48.,
+            );
+            spans::clamp_comb_lengths(&mut teeth);
+            if !teeth.is_empty() {
+                all.push(teeth);
+            }
+        }
+        // Unfairness per tooth + global range (per path: red = YOUR worst).
+        let mut flat: Vec<(usize, usize, f64)> = Vec::new(); // (span, tooth, v)
+        let mut vmin = f64::INFINITY;
+        let mut vmax = f64::NEG_INFINITY;
+        for (si, teeth) in all.iter().enumerate() {
+            for (j, _) in teeth.iter().enumerate() {
+                let v = if teeth.len() < 2 {
+                    0.0
+                } else if j == 0 {
+                    (teeth[1].2 - teeth[0].2).abs()
+                } else if j + 1 == teeth.len() {
+                    (teeth[j].2 - teeth[j - 1].2).abs()
+                } else {
+                    (teeth[j + 1].2 - teeth[j - 1].2).abs() / 2.0
+                };
+                vmin = vmin.min(v);
+                vmax = vmax.max(v);
+                flat.push((si, j, v));
+            }
+        }
+        let heat = |v: f64| -> gpui::Background {
+            let s = if vmax <= vmin {
+                0.0
+            } else {
+                ((v - vmin) / (vmax - vmin)).clamp(0.0, 1.0) as f32
+            };
+            let (r, g, b) = spans::heat_rgb(s);
+            rgb(((r as u32) << 16) | ((g as u32) << 8) | (b as u32)).into()
+        };
+        for (si, j, v) in flat {
+            let (base, tip, _) = all[si][j];
+            let (ax, ay) = scr(base);
+            let (bx, by) = scr(tip);
+            let color = heat(v);
+            list.push(Primitive::Line {
+                ax,
+                ay,
+                bx,
+                by,
+                width: 1.,
+                color,
+            });
+            // Envelope: tip-to-tip segment inside the span.
+            if j + 1 < all[si].len() {
+                let (_, next_tip, _) = all[si][j + 1];
+                let (cx2, cy2) = scr(next_tip);
+                list.push(Primitive::Line {
+                    ax: bx,
+                    ay: by,
+                    bx: cx2,
+                    by: cy2,
+                    width: 1.,
+                    color,
+                });
             }
         }
     }
@@ -1375,8 +1676,86 @@ fn element_outline(
     }
 }
 
-fn overlaps(a: Rect, b: Rect) -> bool {
-    a.origin.x <= b.origin.x + b.size.w
+/// True when the segment touches the rect: endpoints inside OR crossing
+/// through. The old endpoint-only test culled long lines crossing the
+/// viewport with both ends off-screen (vanishing vectors on zoom-out).
+/// Liang–Barsky: a non-empty clipped interval means crossing.
+fn segment_visible(a: Point2, b: Point2, r: Rect) -> bool {
+    if r.contains(a) || r.contains(b) {
+        return true;
+    }
+    let (dx, dy) = (b.x - a.x, b.y - a.y);
+    let (rx0, ry0) = (r.origin.x, r.origin.y);
+    let (rx1, ry1) = (rx0 + r.size.w, ry0 + r.size.h);
+    let (mut t0, mut t1) = (0.0f64, 1.0f64);
+    for (p, q) in [
+        (-dx, a.x - rx0),
+        (dx, rx1 - a.x),
+        (-dy, a.y - ry0),
+        (dy, ry1 - a.y),
+    ] {
+        if p.abs() < 1e-12 {
+            if q < 0.0 {
+                return false;
+            }
+        } else {
+            let t = q / p;
+            if p < 0.0 {
+                t0 = t0.max(t);
+            } else {
+                t1 = t1.min(t);
+            }
+            if t0 > t1 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// True when a sample chain touches the rect: any sample inside or any
+/// link crossing (covers viewport-sized gaps between sparse samples).
+fn polyline_visible(pts: &[Point2], r: Rect) -> bool {
+    if pts.iter().any(|p| r.contains(*p)) {
+        return true;
+    }
+    pts.windows(2)
+        .any(|w| segment_visible(w[0], w[1], r))
+}
+
+/// Object-mode hover targets: the whole island (shared-endpoint segments)
+/// for segment/point hits — never a joint. Lone points and fills pass
+/// through untouched.
+fn hover_island(doc: &Document, el: ElementRef) -> Vec<ElementRef> {
+    match el {
+        ElementRef::Segment(sid) => doc
+            .islands()
+            .into_iter()
+            .find(|v| v.contains(&sid))
+            .map(|v| v.into_iter().map(ElementRef::Segment).collect()),
+        ElementRef::Point(pid) => {
+            let mut out = Vec::new();
+            for isl in doc.islands() {
+                let touches = isl.iter().any(|s| {
+                    doc.segment(*s)
+                        .is_some_and(|seg| seg.start == pid || seg.end == pid)
+                });
+                if touches {
+                    out.extend(isl.into_iter().map(ElementRef::Segment));
+                }
+            }
+            if out.is_empty() {
+                None // lone point: hover itself (dots render per-tool rules)
+            } else {
+                Some(out)
+            }
+        }
+        _ => None,
+    }
+    .unwrap_or(vec![el])
+}
+
+fn overlaps(a: Rect, b: Rect) -> bool {    a.origin.x <= b.origin.x + b.size.w
         && b.origin.x <= a.origin.x + a.size.w
         && a.origin.y <= b.origin.y + b.size.h
         && b.origin.y <= a.origin.y + a.size.h
@@ -1651,4 +2030,68 @@ fn dim_arrowhead(
         width: 1.,
         color,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{polyline_visible, segment_visible};
+    use crate::core::geometry::{Point2, Rect};
+
+    fn view() -> Rect {
+        Rect::from_points(Point2::new(0., 0.), Point2::new(100., 100.))
+    }
+
+    #[test]
+    fn crossing_line_stays_visible() {
+        // The vanishing-vectors bug: both ends off-screen, crossing through.
+        let v = view();
+        assert!(segment_visible(
+            Point2::new(-50., 50.),
+            Point2::new(150., 50.),
+            v
+        ));
+        assert!(segment_visible(
+            Point2::new(50., -50.),
+            Point2::new(50., 150.),
+            v
+        ));
+        assert!(segment_visible(
+            Point2::new(-50., -50.),
+            Point2::new(150., 150.),
+            v
+        ));
+        // Inside / touching count.
+        assert!(segment_visible(Point2::new(10., 10.), Point2::new(20., 20.), v));
+        assert!(segment_visible(Point2::new(-50., 50.), Point2::new(10., 10.), v));
+        // Fully outside stays culled (parallel + diagonal).
+        assert!(!segment_visible(
+            Point2::new(-50., 50.),
+            Point2::new(-10., 50.),
+            v
+        ));
+        assert!(!segment_visible(
+            Point2::new(-50., -50.),
+            Point2::new(-10., -10.),
+            v
+        ));
+        assert!(!segment_visible(
+            Point2::new(110., 110.),
+            Point2::new(200., 200.),
+            v
+        ));
+    }
+
+    #[test]
+    fn sparse_chain_crossing_counts() {
+        let v = view();
+        // Two samples straddling the viewport with a gap wider than it.
+        assert!(polyline_visible(
+            &[Point2::new(-100., 50.), Point2::new(200., 50.)],
+            v
+        ));
+        assert!(!polyline_visible(
+            &[Point2::new(-100., 50.), Point2::new(-50., 50.)],
+            v
+        ));
+    }
 }

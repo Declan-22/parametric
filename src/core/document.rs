@@ -433,6 +433,43 @@ impl Document {
         self.segments.iter().map(|(idx, generation, s)| (SegmentId { idx, generation: generation }, *s))
     }
 
+    /// Object islands (Object-mode contract): connected components of
+    /// segments joined by SHARED ENDPOINT ids (start/end only). Handles
+    /// (ctrl/center slots) and coincident constraints NEVER fuse — a
+    /// shared pivot across parts stays two objects. Each island is one
+    /// Object-mode object: hover highlights all its edges, click boxes it.
+    pub fn islands(&self) -> Vec<Vec<SegmentId>> {
+        use std::collections::HashMap;
+        let segs: Vec<(SegmentId, Segment)> = self.all_segments().collect();
+        let n = segs.len();
+        let mut parent: Vec<usize> = (0..n).collect();
+        fn find(parent: &mut [usize], mut x: usize) -> usize {
+            while parent[x] != x {
+                parent[x] = parent[parent[x]];
+                x = parent[x];
+            }
+            x
+        }
+        let mut owner: HashMap<PointId, usize> = HashMap::new();
+        for (i, (_, s)) in segs.iter().enumerate() {
+            for end in [s.start, s.end] {
+                if let Some(&j) = owner.get(&end) {
+                    let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                    if ri != rj {
+                        parent[ri] = rj;
+                    }
+                } else {
+                    owner.insert(end, i);
+                }
+            }
+        }
+        let mut groups: HashMap<usize, Vec<SegmentId>> = HashMap::new();
+        for (i, (id, _)) in segs.iter().enumerate() {
+            groups.entry(find(&mut parent, i)).or_default().push(*id);
+        }
+        groups.into_values().collect()
+    }
+
     /// All points in the document (id + position).
     pub fn all_points(&self) -> impl Iterator<Item = (PointId, Point2)> + '_ {
         self.points.iter().map(|(idx, generation, p)| (PointId { idx, generation: generation }, *p))
@@ -821,5 +858,41 @@ impl Document {
             arena.slots.push(Slot { generation: 0, value: None });
         }
         arena.slots[idx as usize].generation = generation;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn islands_fuse_shared_endpoints_only() {
+        let mut doc = Document::new();
+        // Chain A-B-C (shared ids) + lone segment + coincident pair.
+        let a = doc.add_point(Point2::new(0., 0.));
+        let b = doc.add_point(Point2::new(10., 0.));
+        let c = doc.add_point(Point2::new(20., 0.));
+        let d = doc.add_point(Point2::new(100., 100.));
+        let e = doc.add_point(Point2::new(110., 100.));
+        let p = doc.add_point(Point2::new(200., 0.));
+        let q = doc.add_point(Point2::new(210., 0.));
+        let r = doc.add_point(Point2::new(200., 0.));
+        let s = doc.add_point(Point2::new(210., 0.));
+        let s1 = doc.add_segment(a, b);
+        let s2 = doc.add_segment(b, c);
+        let lone = doc.add_segment(d, e);
+        let c1 = doc.add_segment(p, q);
+        let c2 = doc.add_segment(r, s);
+        doc.add_constraint(ConstraintKind::Coincident, p, r);
+        let mut islands = doc.islands();
+        for isl in islands.iter_mut() {
+            isl.sort_by_key(|id| (id.idx, id.generation));
+        }
+        islands.sort_by_key(|isl| (isl.len(), isl[0].idx));
+        assert_eq!(islands.len(), 4, "chain + lone + 2 coincident singles");
+        assert!(islands.iter().any(|isl| isl == &vec![s1, s2]));
+        assert!(islands.iter().any(|isl| isl == &vec![lone]));
+        assert!(islands.iter().any(|isl| isl == &vec![c1]));
+        assert!(islands.iter().any(|isl| isl == &vec![c2]));
     }
 }

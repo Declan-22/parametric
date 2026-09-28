@@ -31,7 +31,7 @@ pub(crate) struct FloatingSnap {
     pub pen_mode: PenMode,
     pub selection: Vec<ElementRef>,
     pub dim_lock: Option<String>,
-    pub kinds: Vec<(MenuAction, &'static [u8], &'static str, &'static str)>,
+    pub kinds: Vec<(MenuAction, Option<&'static [u8]>, &'static str, &'static str)>,
     /// Self-typing armed target with no lock row (arc radius, point-line):
     /// shown as a muted "Auto" indicator.
     pub dim_auto: Option<&'static str>,
@@ -70,8 +70,14 @@ pub struct FloatingMenu {
     pub shell: gpui::WeakEntity<crate::ui::shell::Shell>,
 }
 
+// Hidden for now (code stays): the canvas ctx menu owns constraints.
+const VISIBLE: bool = false;
+
 impl RenderOnce for FloatingMenu {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        if !VISIBLE {
+            return div().absolute().into_any_element();
+        }
         let t = *crate::theme::active(cx);
         let live: Option<FloatingSnap> = self.editor.upgrade().map(|e| {
             let ed = e.read(cx);
@@ -242,7 +248,7 @@ impl RenderOnce for FloatingMenu {
                     &self.shell,
                     t,
                     &format!("constraint-{}", apply_key(action)),
-                    Some(icon),
+                    icon,
                     label,
                     shortcut,
                     false,
@@ -427,8 +433,46 @@ fn apply_key(action: MenuAction) -> &'static str {
     }
 }
 
+/// Row chrome for one constraint action (icon, label, hotkey). Single
+/// source for the floating menu AND the canvas ctx menu — same rows, same
+/// keybinds, same gates.
+pub(crate) fn constraint_row_parts(
+    action: MenuAction,
+) -> (Option<&'static [u8]>, &'static str, &'static str) {
+    use crate::ui::canvas;
+    use crate::ui::toolbar;
+    match action {
+        MenuAction::Constraint(
+            ConstraintKind::Horizontal | ConstraintKind::Vertical,
+        ) => (
+            Some(toolbar::ICON_CONSTRAINT_HV),
+            "Horizontal / Vertical",
+            "H",
+        ),
+        MenuAction::Constraint(ConstraintKind::Coincident) => (
+            Some(canvas::ICON_CHIP_COINCIDENT),
+            "Coincident",
+            "C",
+        ),
+        MenuAction::Constraint(ConstraintKind::Tangent) => {
+            (Some(canvas::ICON_CHIP_TANGENT), "Tangent", "T")
+        }
+        MenuAction::Constraint(ConstraintKind::Parallel) => (
+            Some(toolbar::ICON_CONSTRAINT_PARALLEL),
+            "Parallel",
+            "P",
+        ),
+        MenuAction::Constraint(ConstraintKind::Perpendicular) => (
+            Some(toolbar::ICON_CONSTRAINT_PERPENDICULAR),
+            "Perpendicular",
+            "E",
+        ),
+        MenuAction::MergePoints => (Some(ICON_MERGE), "Merge points", ""),
+    }
+}
+
 // Merge mark: two points joining into one.
-const ICON_MERGE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24">
+pub(crate) const ICON_MERGE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24">
 	<path d="M0 0h24v24H0z" fill="none" />
 	<path fill="currentColor" d="M16.72 7.33v-.04h-.05A7.54 7.54 0 0 0 9.5 2.01C5.36 2.01 2 5.37 2 9.51c0 3.29 2.19 6.21 5.28 7.17v.04h.05c.96 3.1 3.88 5.28 7.17 5.28c4.14 0 7.5-3.36 7.5-7.5c0-3.29-2.19-6.21-5.28-7.17M4 9.5C4 6.47 6.47 4 9.5 4c2.09 0 3.97 1.2 4.9 3c-.13 0-.25.02-.37.02c-.11 0-.22 0-.34.02c-.14.01-.28.04-.41.06c-.11.02-.22.03-.33.05c-.13.03-.26.07-.4.1c-.11.03-.21.05-.32.08c-.13.04-.25.09-.38.14c-.1.04-.2.07-.3.11c-.13.05-.25.12-.37.18c-.09.05-.19.09-.28.14c-.12.07-.24.14-.36.22c-.08.05-.17.1-.25.16c-.12.08-.24.18-.36.27l-.22.16c-.14.12-.28.25-.41.37c-.08.08-.16.16-.23.24c-.12.13-.25.26-.36.4l-.18.24c-.08.11-.17.22-.25.33c-.06.09-.11.19-.17.28c-.07.11-.14.22-.2.33c-.06.1-.1.21-.15.31c-.05.11-.11.22-.16.34c-.05.11-.08.22-.12.33c-.04.12-.09.23-.13.35c-.04.11-.06.23-.09.35s-.07.24-.09.36c-.03.12-.04.24-.06.36l-.06.37c-.01.12-.02.25-.02.38c0 .11-.02.22-.02.33c-1.8-.93-3-2.81-3-4.9ZM14.5 20c-2.09 0-3.97-1.2-4.9-3c.11 0 .22-.01.33-.02c.13 0 .25-.01.38-.02s.25-.04.37-.06s.24-.03.36-.06l.36-.09l.35-.09c.12-.04.24-.09.35-.13l.33-.12c.12-.05.23-.11.35-.17c.1-.05.2-.09.3-.15c.12-.06.23-.14.34-.21c.09-.06.18-.11.27-.17c.12-.08.23-.17.34-.25c.08-.06.16-.11.23-.18c.14-.12.27-.24.4-.36l.24-.24c.12-.13.25-.26.36-.4c.06-.07.12-.16.17-.23c.09-.11.18-.22.25-.34c.06-.09.11-.18.16-.26c.07-.12.15-.23.21-.35c.05-.09.1-.2.14-.29c.06-.12.12-.23.17-.36c.04-.1.08-.21.12-.32c.05-.12.09-.24.13-.37c.03-.11.06-.22.09-.34s.07-.25.1-.37l.06-.36l.06-.38c.01-.12.02-.25.02-.38c0-.11.02-.22.02-.34c1.8.93 3 2.81 3 4.9c0 3.03-2.47 5.5-5.5 5.5Z" />
 </svg>
@@ -660,33 +704,43 @@ pub(crate) fn constraints_for_selection(
     selection: &[ElementRef],
     cx: &App,
     editor: &gpui::WeakEntity<crate::editor::Editor>,
-) -> Vec<(MenuAction, &'static [u8], &'static str, &'static str)> {
+) -> Vec<(MenuAction, Option<&'static [u8]>, &'static str, &'static str)> {
     use crate::editor::Editor;
-    use crate::ui::canvas;
-    use crate::ui::toolbar;
     let hv = || {
+        let (icon, label, shortcut) = constraint_row_parts(MenuAction::Constraint(
+            ConstraintKind::Horizontal,
+        ));
         (
             MenuAction::Constraint(ConstraintKind::Horizontal),
-            toolbar::ICON_CONSTRAINT_HV,
-            "Horizontal / Vertical",
-            "H",
+            icon,
+            label,
+            shortcut,
         )
     };
     let coincident = || {
+        let (icon, label, shortcut) = constraint_row_parts(MenuAction::Constraint(
+            ConstraintKind::Coincident,
+        ));
         (
             MenuAction::Constraint(ConstraintKind::Coincident),
-            canvas::ICON_CHIP_COINCIDENT,
-            "Coincident",
-            "C",
+            icon,
+            label,
+            shortcut,
         )
     };
-    let merge = || (MenuAction::MergePoints, ICON_MERGE, "Merge points", "");
+    let merge = || {
+        let (icon, label, shortcut) = constraint_row_parts(MenuAction::MergePoints);
+        (MenuAction::MergePoints, icon, label, shortcut)
+    };
     let tangent_row = || {
+        let (icon, label, shortcut) = constraint_row_parts(MenuAction::Constraint(
+            ConstraintKind::Tangent,
+        ));
         (
             MenuAction::Constraint(ConstraintKind::Tangent),
-            canvas::ICON_CHIP_TANGENT,
-            "Tangent",
-            "T",
+            icon,
+            label,
+            shortcut,
         )
     };
     let Some(ed) = editor.upgrade() else {
@@ -703,19 +757,25 @@ pub(crate) fn constraints_for_selection(
     // route through coincident/tangent instead of sprouting rows).
     if let Some((a, b)) = Editor::line_pair(doc, selection) {
         if Editor::line_pair_feasible(doc, a, b, true) {
+            let (icon, label, shortcut) = constraint_row_parts(MenuAction::Constraint(
+                ConstraintKind::Parallel,
+            ));
             out.push((
                 MenuAction::Constraint(ConstraintKind::Parallel),
-                toolbar::ICON_CONSTRAINT_PARALLEL,
-                "Parallel",
-                "P",
+                icon,
+                label,
+                shortcut,
             ));
         }
         if Editor::line_pair_feasible(doc, a, b, false) {
+            let (icon, label, shortcut) = constraint_row_parts(MenuAction::Constraint(
+                ConstraintKind::Perpendicular,
+            ));
             out.push((
                 MenuAction::Constraint(ConstraintKind::Perpendicular),
-                toolbar::ICON_CONSTRAINT_PERPENDICULAR,
-                "Perpendicular",
-                "E",
+                icon,
+                label,
+                shortcut,
             ));
         }
     }

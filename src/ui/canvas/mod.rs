@@ -4,7 +4,7 @@ use gpui::{
     div, fill, prelude::*, px, rgb, rgba, svg,
 };
 
-use crate::editor::{Editor, Tool};
+use crate::editor::{Editor, InteractionMode, Tool};
 use crate::ui::shell::title_bar::TITLE_BAR_HEIGHT;
 
 pub mod paint;
@@ -30,12 +30,16 @@ impl RenderOnce for CanvasView {
         let editor_move = self.editor.clone();
         let editor_down_l = self.editor.clone();
         let editor_down_m = self.editor.clone();
+        let shell_menu_l = self.shell.clone();
+        let shell_menu_m = self.shell.clone();
+        let shell_menu_r = self.shell.clone();
         let editor_up_l = self.editor.clone();
         let editor_up_m = self.editor.clone();
         let editor_scroll = self.editor.clone();
         let editor_hover_out = self.editor.clone();
         let focus_l = self.focus.clone();
         let focus_m = self.focus.clone();
+        let focus_r = self.focus.clone();
 
         div()
             .id("canvas")
@@ -44,6 +48,10 @@ impl RenderOnce for CanvasView {
             .flex_1()
             .w_full()
             .h_full()
+            // Clip ALL painted geometry/labels/chips to the canvas box:
+            // unclipped paint calls would bleed over the title/mode bars
+            // (earlier siblings paint underneath).
+            .overflow_hidden()
             // Hold focus while interacting so modifier changes reach the
             // canvas even when the mouse is still.
             .track_focus(&self.focus)
@@ -62,6 +70,7 @@ impl RenderOnce for CanvasView {
             })
             .on_mouse_down(MouseButton::Left, move |e: &MouseDownEvent, window, cx| {
                 window.focus(&focus_l, cx);
+                let _ = shell_menu_l.update(cx, |shell, cx| shell.close_canvas_menu(cx));
                 let _ = editor_down_l.update(cx, |ed, cx| {
                     if ed.canvas_down(
                         MouseButton::Left,
@@ -77,6 +86,7 @@ impl RenderOnce for CanvasView {
                 MouseButton::Middle,
                 move |e: &MouseDownEvent, window, cx| {
                     window.focus(&focus_m, cx);
+                    let _ = shell_menu_m.update(cx, |shell, cx| shell.close_canvas_menu(cx));
                     let _ = editor_down_m.update(cx, |ed, cx| {
                         if ed.canvas_down(MouseButton::Middle, canvas_pos(e.position), false, 1) {
                             cx.notify();
@@ -84,6 +94,17 @@ impl RenderOnce for CanvasView {
                     });
                 },
             )
+            .on_mouse_down(MouseButton::Right, move |e: &MouseDownEvent, window, cx| {
+                window.focus(&focus_r, cx);
+                // Phase 0 target = current selection (no components exist
+                // yet); the cursor only positions the menu. Component-precise
+                // targeting lands with components in Phase 1.
+                let pos = e.position;
+                let _ = shell_menu_r.update(cx, |shell, cx| {
+                    shell.open_canvas_menu(pos);
+                    cx.notify();
+                });
+            })
             .on_hover(move |hovered, _, cx| {
                 if !*hovered {
                     let _ = editor_hover_out.update(cx, |ed, cx| {
@@ -169,7 +190,24 @@ pub(crate) const CHIP_SIZE: f32 = 18.;
 // editor, the paint callbacks (which add bounds.origin) and the DOM overlay
 // layers all share one space and painted geometry lines up with the cursor.
 fn canvas_pos(p: gpui::Point<gpui::Pixels>) -> gpui::Point<gpui::Pixels> {
-    gpui::point(p.x, p.y - px(TITLE_BAR_HEIGHT))
+    gpui::point(
+        p.x,
+        p.y - px(TITLE_BAR_HEIGHT + crate::ui::modebar::MODEBAR_HEIGHT),
+    )
+}
+
+/// Snap a stroke centerline honoring width parity in DEVICE px: odd widths
+/// sit on pixel centers, even on boundaries. Logical-px snapping still
+/// straddles physical pixels at 125/150% display scales — the common
+/// Windows case — so the factor comes from the window each frame.
+fn snap_center(c: f32, width: f32, sf: f32) -> f32 {
+    if sf <= 0.0 {
+        return c;
+    }
+    let (dc, dw) = (c * sf, width * sf);
+    let odd = (dw.round() as i32).abs() % 2 == 1;
+    let off = if odd { 0.5 } else { 0.0 };
+    ((dc - off).round() + off) / sf
 }
 
 // Constraint chip glyphs (12x12 source SVGs, rendered at the full chip
@@ -271,14 +309,15 @@ impl CanvasView {
                         d.text.clone(),
                         d.label_cx,
                         d.label_cy,
-                        rgb(t.bg_primary).into(),
-                        ink(d.constraint, d.hovered, d.editing),
-                        border(d.constraint, d.hovered, d.editing),
-                        d.dim_index,
-                        d.editing,
-                    )
-                })
-                .collect();
+                    rgb(t.bg_primary).into(),
+                    ink(d.constraint, d.hovered, d.editing),
+                    border(d.constraint, d.hovered, d.editing),
+                    d.dim_index,
+                    d.editing,
+                    d.dim_index.is_some_and(|i| !ed.dim_in_scope(i)),
+                )
+            })
+            .collect();
             labels.extend(ed.angle_dim_renders.iter().map(|a| {
                 make_label(
                     window,
@@ -290,6 +329,7 @@ impl CanvasView {
                     border(a.constraint, a.hovered, a.editing),
                     a.dim_index,
                     a.editing,
+                    a.dim_index.is_some_and(|i| !ed.dim_in_scope(i)),
                 )
             }));
             labels.extend(ed.curve_dim_renders.iter().map(|c| {
@@ -303,6 +343,7 @@ impl CanvasView {
                     border(c.constraint, c.hovered, c.editing),
                     c.dim_index,
                     c.editing,
+                    c.dim_index.is_some_and(|i| !ed.dim_in_scope(i)),
                 )
             }));
             labels
@@ -376,7 +417,7 @@ impl CanvasView {
                     px(6.),
                     l.bg,
                     gpui::Edges::all(px(2.)),
-                    rgb(l.border),
+                    l.border,
                     gpui::BorderStyle::Solid,
                 ));
                 if l.editing {
@@ -442,17 +483,25 @@ impl CanvasView {
         use crate::core::constraints::ConstraintKind;
 
         let t = *crate::theme::active(cx);
-        let markers = self
+        let (markers, dimmed) = self
             .editor
             .upgrade()
-            .map(|e| e.read(cx).constraint_markers.clone())
+            .map(|e| {
+                let ed = e.read(cx);
+                let marks = ed.constraint_markers.clone();
+                let flags: Vec<bool> = marks
+                    .iter()
+                    .map(|m| !ed.marker_in_scope(&m.constraint))
+                    .collect();
+                (marks, flags)
+            })
             .unwrap_or_default();
 
         div()
             .absolute()
             .inset_0()
             .size_full()
-            .children(markers.iter().filter(|m| m.visible).map(|m| {
+            .children(markers.iter().zip(dimmed.iter().copied()).filter(|(m, _)| m.visible).map(|(m, dimmed)| {
                 const S: f32 = CHIP_SIZE;
                 let icon = match m.constraint.kind {
                     ConstraintKind::Coincident => ICON_CHIP_COINCIDENT,
@@ -462,14 +511,20 @@ impl CanvasView {
                     ConstraintKind::Parallel => ICON_CHIP_PARALLEL,
                     ConstraintKind::Perpendicular => ICON_CHIP_PERPENDICULAR,
                 };
-                let border = if m.clicked { t.accent_border } else { t.accent };
-                let bg = if m.emphasized { t.accent } else { t.bg_primary };
-                let icon_color = if m.emphasized {
+                // Isolation: dead chips render base styling at 35% and
+                // never show hover — hit-testing is already dead
+                // (constraint_chip_at filters by scope).
+                let emphasized = m.emphasized && !dimmed;
+                let hovered = m.hovered && !dimmed;
+                let clicked = m.clicked && !dimmed;
+                let border = if clicked { t.accent_border } else { t.accent };
+                let bg = if emphasized { t.accent } else { t.bg_primary };
+                let icon_color = if emphasized {
                     rgb(0xFFFFFF)
                 } else {
                     // 70% so the glyph stays readable over bg_primary;
                     // full opacity once the chip itself is hovered.
-                    rgba((t.accent_border << 8) | if m.hovered { 0xFF } else { 0xB3 })
+                    rgba((t.accent_border << 8) | if hovered { 0xFF } else { 0xB3 })
                 };
                 div()
                     .absolute()
@@ -484,6 +539,7 @@ impl CanvasView {
                     .flex()
                     .items_center()
                     .justify_center()
+                    .when(dimmed, |d| d.opacity(paint::SCOPE_DIM))
                     .child(svg().data(icon).w(px(S)).h(px(S)).text_color(icon_color))
             }))
     }
@@ -494,7 +550,7 @@ struct LabelPrim {
     center_x: f32,
     center_y: f32,
     bg: gpui::Background,
-    border: u32,
+    border: gpui::Rgba,
     dim_index: Option<usize>,
     editing: bool,
 }
@@ -509,12 +565,18 @@ fn make_label(
     border: u32,
     dim_index: Option<usize>,
     editing: bool,
+    dimmed: bool,
 ) -> LabelPrim {
     let font_size = px(11.);
+    let text_color = if dimmed {
+        accent.opacity(crate::ui::canvas::paint::SCOPE_DIM)
+    } else {
+        accent
+    };
     let runs = [gpui::TextRun {
         len: text.len(),
         font: label_font(),
-        color: accent,
+        color: text_color,
         background_color: None,
         underline: None,
         strikethrough: None,
@@ -522,12 +584,21 @@ fn make_label(
     let line = window
         .text_system()
         .shape_line(text.into(), font_size, &runs, None);
+    let border_rgba = rgb(border);
     LabelPrim {
         line,
         center_x,
         center_y,
-        bg,
-        border,
+        bg: if dimmed {
+            bg.opacity(crate::ui::canvas::paint::SCOPE_DIM)
+        } else {
+            bg
+        },
+        border: if dimmed {
+            border_rgba.opacity(crate::ui::canvas::paint::SCOPE_DIM)
+        } else {
+            border_rgba
+        },
         dim_index,
         editing,
     }
@@ -617,6 +688,16 @@ impl CanvasView {
                 cursor_doc,
                 Some(&mut *ed.render_cache.borrow_mut()),
                 ed.fillet_preview,
+                Some(crate::editor::joints::ClayView {
+                    edit: ed.interaction_mode == InteractionMode::Edit,
+                    joints: &ed.joint_data,
+                    combs: ed.show_combs,
+                    comb_scale: ed.comb_scale,
+                    comb_density: ed.comb_density,
+                    path_joints: ed.clay_path.as_ref().map(|p| p.joints.as_slice()),
+                    path_end: ed.clay_path.as_ref().and_then(|p| p.active_end()),
+                    scope: ed.edit_scope.as_ref(),
+                }),
             );
             (list, hitbox)
         };
@@ -632,6 +713,9 @@ impl CanvasView {
                 let style = editor.read(cx).cursor_style();
                 window.set_cursor_style(style, &hitbox);
             }
+            // Device scale for pixel snapping (logical snapping blurs at
+            // fractional display scales).
+            let scale_factor = window.scale_factor();
             for prim in list {
                 match prim {
                     paint::Primitive::Rect { x, y, w, h, color } => {
@@ -672,7 +756,28 @@ impl CanvasView {
                         width,
                         color,
                     } => {
-                        // Thin filled quad along the segment.
+                        // Thin filled quad along the segment, in WINDOW px
+                        // (prim coords + canvas origin) so snapping below
+                        // accounts for a fractional canvas offset.
+                        let oxf = f32::from(ox);
+                        let oyf = f32::from(oy);
+                        let (mut ax, mut ay, mut bx, mut by) =
+                            (ax + oxf, ay + oyf, bx + oxf, by + oyf);
+                        // Pixel-snap axis-aligned strokes: an unsnapped 1px
+                        // flat quad straddles two pixel rows at 50% coverage
+                        // (thin gray) while slanted quads cover fully — the
+                        // "flat lines look thinner" bug. Odd widths center
+                        // on pixel centers, even on boundaries. Eps is tight
+                        // so curve tessellation never quantizes visibly.
+                        if (by - ay).abs() < 1e-4 && (bx - ax).abs() > 1e-3 {
+                            let y = snap_center(ay, width, scale_factor);
+                            ay = y;
+                            by = y;
+                        } else if (bx - ax).abs() < 1e-4 && (by - ay).abs() > 1e-3 {
+                            let x = snap_center(ax, width, scale_factor);
+                            ax = x;
+                            bx = x;
+                        }
                         let dx = bx - ax;
                         let dy = by - ay;
                         let len = (dx * dx + dy * dy).sqrt();
@@ -682,24 +787,24 @@ impl CanvasView {
                         let nx = -dy / len * width / 2.;
                         let ny = dx / len * width / 2.;
                         let mut path = gpui::Path::new(Point {
-                            x: px(ax + nx) + ox,
-                            y: px(ay + ny) + oy,
+                            x: px(ax + nx),
+                            y: px(ay + ny),
                         });
                         path.line_to(Point {
-                            x: px(bx + nx) + ox,
-                            y: px(by + ny) + oy,
+                            x: px(bx + nx),
+                            y: px(by + ny),
                         });
                         path.line_to(Point {
-                            x: px(bx - nx) + ox,
-                            y: px(by - ny) + oy,
+                            x: px(bx - nx),
+                            y: px(by - ny),
                         });
                         path.line_to(Point {
-                            x: px(ax - nx) + ox,
-                            y: px(ay - ny) + oy,
+                            x: px(ax - nx),
+                            y: px(ay - ny),
                         });
                         path.line_to(Point {
-                            x: px(ax + nx) + ox,
-                            y: px(ay + ny) + oy,
+                            x: px(ax + nx),
+                            y: px(ay + ny),
                         });
                         window.paint_path(path, color);
                     }
@@ -726,11 +831,16 @@ impl CanvasView {
                         ));
                     }
                     paint::Primitive::Outline { x, y, w, h } => {
+                        // Snap the origin in device px: 1px accent borders
+                        // straddling boundaries paint gray/thin.
+                        let oxf = f32::from(ox);
+                        let oyf = f32::from(oy);
+                        let sf = scale_factor.max(1e-6);
                         window.paint_quad(gpui::quad(
                             Bounds {
                                 origin: Point {
-                                    x: px(x) + ox,
-                                    y: px(y) + oy,
+                                    x: px(((x + oxf) * sf).round() / sf),
+                                    y: px(((y + oyf) * sf).round() / sf),
                                 },
                                 size: Size {
                                     width: px(w),
@@ -929,3 +1039,25 @@ impl CanvasView {
 // badge comes from the layer above it when a snap is engaged.
 const ICON_CROSSHAIR: &[u8] =
     br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24"><path d="M0 0h24v24H0z" fill="none" /><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 4v16m8-8H4" /></svg>"#;
+
+#[cfg(test)]
+mod tests {
+    use super::snap_center;
+
+    #[test]
+    fn snap_parity() {
+        // Odd widths -> pixel centers; even -> boundaries (sf = 1).
+        assert_eq!(snap_center(10.2, 1.0, 1.0), 10.5);
+        assert_eq!(snap_center(10.7, 1.0, 1.0), 10.5);
+        assert_eq!(snap_center(10.2, 2.0, 1.0), 10.0);
+        assert_eq!(snap_center(10.7, 3.0, 1.0), 10.5);
+        // Already snapped: stable.
+        assert_eq!(snap_center(10.5, 1.0, 1.0), 10.5);
+        assert_eq!(snap_center(10.0, 2.0, 1.0), 10.0);
+        // Retina (sf = 2): 1px logical = 2 device px (even) -> boundary.
+        assert_eq!(snap_center(10.2, 1.0, 2.0), 10.0);
+        assert_eq!(snap_center(10.75, 1.0, 2.0), 11.0);
+        // Degenerate factor: passthrough.
+        assert_eq!(snap_center(10.2, 1.0, 0.0), 10.2);
+    }
+}

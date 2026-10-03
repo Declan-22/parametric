@@ -50,6 +50,21 @@
   drag, 100 random cursor targets) never moves any point > `STEP_CAP` and
   `max_lin_residual` stays ≤1e-3 on satisfiable systems.
 
+  Status (OPEN — two approaches tried and REVERTED Sep 2026, solver is
+  byte-clean vs HEAD):
+  (a) staged LM (hard unit-weight, then soft + projection) — broke
+  SOL-03 barriers: stage-B acceptance compared soft cost only, so it
+  walked across branches the joint cost had held. Flip-harness proved it.
+  (b) anchors-out-of-JtJ + Euler relaxation — changed follower dynamics;
+  triangles with angle dims glitched vs the joint solve, flip tests broke
+  (solver build auto-generates aux followers, so nothing is aux-empty).
+  Lesson: the joint LM + per-trial projection + full-cost acceptance is
+  load-bearing DYNAMICS, not just conditioning. A future fix must preserve
+  it exactly — candidates: Jacobi preconditioning inside assembly (no rows
+  removed), or anchor subspace handled in acceptance. `*_FACTOR`s stay:
+  intra-level relatives, preserve tuned feel. Drag-layer chase clamp +
+  adaptive shrink (drag.rs, solver-untouched) kept as the freeze safety net.
+
 ### SOL-03 — Unsigned equations allow 180° branch flips
 - `LOC`: `solver.rs` `Eq::Distance`, `Parallel` (`cross/m`), `Perpendicular`
   (`dot/m`), `Tangent` (`dot/m`), `Angle` wrap; barriers `DistanceBranch`,
@@ -197,6 +212,20 @@
   Depends on ED-01 (lives in `drag.rs`). `DONE WHEN:` post-pass deleted or
   assert-only; arc-line-tangent drag harness passes without pins special-case.
 
+  Status (PARTIAL — fillet slice DONE Sep 2026, full rule still needs
+  SOL-02 hierarchy): fillet scope already follows single authority —
+  `plan_arc_drag` never leads fillet arcs, `tangent_arc_pins` skips fillet
+  contacts, `strip_fillet_equations` keeps Radius while refresh owns the
+  rest, `enforce_tangencies` skips fillet-adjacent. Locked by 2 tests in
+  `editor/fillet.rs`: `fillet_edge_drag_keeps_both_contacts` (edge drag on
+  filleted rect moves without freezing, H/V hold live, refresh re-seats
+  both contacts with radius intact, no far-side leak, branch kept) and
+  `fillet_tangency_postpass_is_readonly` (post-pass moves zero points in
+  fillet scope even with tangency broken; refresh re-seats exactness).
+  Removing `tangent_arc_pins` / making the general post-pass assert-only
+  needs the SOL-02 hierarchy (reverted twice — pins are the current
+  mechanism that stops tangent bounces), so the full DONE WHEN stays open.
+
 ## Track BEZ — bezier-specific perf
 
 ### BEZ-01 — `BezierLength` eq runs ~540×/frame/dim
@@ -248,6 +277,9 @@
   (12 then refine ±1 step at 48 resolution); (c) `arc_length` → stack-buffer
   16-sample approx for UI, exact 64 only on commit. `DONE WHEN:` 100-bezier
   mousemove (no drag) p95 < 4 ms.
+
+  Status (SHELVED Sep 2026 — beziers abandoned for now, fillets are the
+  curve story; revisit only if pen-chaining perf bites).
 
 ### BEZ-04 — Drag retessellates every bezier every frame
 - `LOC`: `paint.rs:101-135` (fingerprint = full coord bits → miss on any move),

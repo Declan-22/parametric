@@ -24,6 +24,10 @@ pub(crate) struct DragState {
     // Arc body grab: the whole arc translates rigidly (see plan_arc_drag).
     // None for every other gesture (solver path).
     pub arc_body_scale: Option<SegmentId>,
+    // Adaptive chase scale (1.0 = full target): shrinks on rejected frames
+    // so the point keeps creeping toward feasibility instead of freezing;
+    // recovers on accepts. Never-drop drags.
+    pub chase: f64,
 }
 
 /// Kinematic arc drag outcome: exact targets plus points to hard-pin for
@@ -228,6 +232,33 @@ impl Editor {
                 (pid, Point2::new(start.x + snapped_delta.x, start.y + snapped_delta.y))
             })
             .collect();
+
+        // Never-drop drags: clamp each target to a per-frame chase radius
+        // around the point's CURRENT position. A cursor that sprints past
+        // feasibility used to hard-freeze the point (hold-last-valid every
+        // frame) until re-click; now the point chases every frame and only
+        // genuinely locked directions resist. Shift adjustments below can
+        // still override (arc kinematics are exact-feasible by design).
+        // The adaptive `chase` scale (see reject/accept below) then shrinks
+        // the clamped target toward feasibility whenever frames reject.
+        const CHASE_RADIUS: f64 = 150.0;
+        let chase = drag.chase;
+        for (pid, target) in targets.iter_mut() {
+            if let Some(cur) = self.doc.point(*pid) {
+                let dx = target.x - cur.x;
+                let dy = target.y - cur.y;
+                let d = (dx * dx + dy * dy).sqrt();
+                if d > CHASE_RADIUS {
+                    let s = CHASE_RADIUS / d;
+                    target.x = cur.x + dx * s;
+                    target.y = cur.y + dy * s;
+                }
+                if chase < 1.0 {
+                    target.x = cur.x + (target.x - cur.x) * chase;
+                    target.y = cur.y + (target.y - cur.y) * chase;
+                }
+            }
+        }
 
         // Shift on a single-endpoint drag: ARC points get arc-specific
         // constraints (rotate on circle / sweep snap); everything else snaps
@@ -493,10 +524,15 @@ impl Editor {
         solver.strip_curve_length();
         let solution = solver.solve();
         // A live drag may request an impossible step, but applying a partial
-        // LM iterate would visibly break a locked constraint. Keep the last
-        // valid geometry until a later cursor position becomes solvable.
+        // LM iterate would visibly break a locked constraint. Shrink the
+        // chase instead of freezing: the next frame tries closer to the
+        // current position, so feasible micro-steps still get through and
+        // only truly locked directions hold.
         if !solution.constraints_satisfied() {
             self.snap_guides.clear();
+            if let Some(d) = self.dragging.as_mut() {
+                d.chase = (d.chase * 0.5).max(1.0 / 32.0);
+            }
             return true;
         }
         let mut moved: std::collections::HashSet<PointId> = std::collections::HashSet::new();
@@ -535,6 +571,10 @@ impl Editor {
                     g
                 })
                 .collect();
+        }
+        // Feasible frame: relax the chase back toward full targets.
+        if let Some(d) = self.dragging.as_mut() {
+            d.chase = (d.chase * 2.0).min(1.0);
         }
         true
     }
@@ -1092,9 +1132,86 @@ fn snap_target_direction(doc: &Document, targets: &mut [(PointId, Point2)]) {
         return;
     }
     let (_, snapped_b) = tools::snap_direction(anchor, target);
-    targets[0].1 = if bare_line {
-        tools::snap_angle(anchor, target)
-    } else {
-        snapped_b
-    };
+        targets[0].1 = if bare_line {
+            tools::snap_angle(anchor, target)
+        } else {
+            snapped_b
+        };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn far_cursor_chases_instead_of_freezing() {
+        // Never-drop drags: a cursor that sprints past feasibility must
+        // move the point every frame (bounded chase), never hold-last-valid
+        // until re-click.
+        let mut ed = Editor::new();
+        ed.snap_to_grid = false;
+        ed.snap_to_objects = false;
+        ed.alt_down = true; // skip snap proposals entirely
+        let start = Point2::new(0., 0.);
+        let b = ed.doc.add_point(start);
+        ed.dragging = Some(DragState {
+            points: vec![(b, start)],
+            aux: Vec::new(),
+            start_cursor: start,
+            arc_body_scale: None,
+            chase: 1.0,
+        });
+        ed.last_cursor = Some(gpui::point(gpui::px(1000.), gpui::px(0.)));
+        assert!(ed.solve_drag(false));
+        assert!(ed.dragging.is_some(), "grab survives the frame");
+        let p = ed.doc.point(b).unwrap();
+        let moved = (p.x - start.x).hypot(p.y - start.y);
+        assert!(moved > 1.0, "point chased, moved={moved}");
+        assert!(
+            moved <= 150.0 + 1e-6,
+            "chase bounded per frame, moved={moved}"
+        );
+    }
+
+    #[test]
+    fn rejected_frames_shrink_chase_and_hold() {
+        // Genuinely stuck (conflicting locks): hold position, halve the
+        // chase per rejected frame, never drop the grab.
+        use crate::core::constraints::{DimMode, DimTarget, Dimension};
+        let mut ed = Editor::new();
+        ed.snap_to_grid = false;
+        ed.snap_to_objects = false;
+        ed.alt_down = true;
+        let a = ed.doc.add_point(Point2::new(0., 0.));
+        let b = ed.doc.add_point(Point2::new(100., 0.));
+        for value in [100., 200.] {
+            ed.doc.dimensions.push(Dimension {
+                target: DimTarget::Points { a, b, mode: DimMode::Aligned },
+                value,
+                offset: 0.,
+                slide: 0.,
+                sweep: 0.,
+            });
+        }
+        ed.dragging = Some(DragState {
+            points: vec![(b, Point2::new(100., 0.))],
+            aux: Vec::new(),
+            start_cursor: Point2::new(100., 0.),
+            arc_body_scale: None,
+            chase: 1.0,
+        });
+        ed.last_cursor = Some(gpui::point(gpui::px(500.), gpui::px(0.)));
+        assert!(ed.solve_drag(false));
+        assert!(ed.dragging.is_some(), "grab survives reject");
+        let p = ed.doc.point(b).unwrap();
+        assert!(
+            (p.x - 100.).abs() < 1e-6 && p.y.abs() < 1e-6,
+            "truly stuck holds position"
+        );
+        let chase = ed.dragging.as_ref().unwrap().chase;
+        assert!((chase - 0.5).abs() < 1e-9, "chase halved, got={chase}");
+        assert!(ed.solve_drag(false));
+        let chase = ed.dragging.as_ref().unwrap().chase;
+        assert!((chase - 0.25).abs() < 1e-9, "chase keeps decaying, got={chase}");
+    }
 }

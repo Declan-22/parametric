@@ -48,6 +48,11 @@ impl<'a> Picker<'a> {
             if internal.contains(&id) {
                 continue;
             }
+            // Hidden layers never pick (eye = gone from canvas AND
+            // cursor alike).
+            if !self.doc.element_visible(ElementRef::Point(id)) {
+                continue;
+            }
             let d = distance(p, at);
             if d <= self.tol && best.map_or(true, |(bd, _)| d < bd) {
                 best = Some((d, id));
@@ -59,6 +64,9 @@ impl<'a> Picker<'a> {
     pub fn segment(&self, at: Point2) -> Option<SegmentId> {
         let mut best: Option<(f64, SegmentId)> = None;
         for (id, seg) in self.doc.all_segments() {
+            if !self.doc.element_visible(ElementRef::Segment(id)) {
+                continue;
+            }
             if seg.kind != SegmentKind::Line && seg.kind != SegmentKind::Ruler {
                 // Arcs + beziers hit-test against their sampled polyline.
                 // Cheap bbox reject first: most curves are far from the
@@ -126,6 +134,9 @@ impl<'a> Picker<'a> {
     pub fn fill(&self, at: Point2) -> Option<FillId> {
         let mut best: Option<(f64, FillId)> = None;
         for (id, _) in self.doc.all_fills() {
+            if !self.doc.element_visible(ElementRef::Fill(id)) {
+                continue;
+            }
             let Some(points) = self.loop_points(id) else {
                 continue;
             };
@@ -164,6 +175,9 @@ impl<'a> Picker<'a> {
             }))
         };
         for layer in &self.doc.layers {
+            if !self.doc.layer_effective_visible(layer.id) {
+                continue;
+            }
             for &el in &layer.elements {
                 match el {
                     ElementRef::Point(pid) => {

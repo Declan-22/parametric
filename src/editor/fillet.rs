@@ -540,7 +540,8 @@ impl Editor {
         // 5. Layer the new endpoints with the arc; consume the corner with
         // a non-cascading removal (everything referencing it was migrated
         // or dropped above — remove_point would eat the rewired edges).
-        if let Some(layer) = self.doc.layers.first().map(|l| l.id) {
+        {
+            let layer = self.active_layer_id();
             self.doc.push_to_layer(layer, ElementRef::Point(t1));
             self.doc.push_to_layer(layer, ElementRef::Point(t2));
         }
@@ -1238,7 +1239,7 @@ impl Editor {
                 ));
             }
         }
-        if let Some(layer)=self.doc.layers.first().map(|l|l.id) { self.doc.push_to_layer(layer, ElementRef::Segment(arc)); }
+        { let layer = self.active_layer_id(); self.doc.push_to_layer(layer, ElementRef::Segment(arc)); }
         let dim_index=self.doc.dimensions.len();
         self.doc.dimensions.push(crate::core::constraints::Dimension { target: DimTarget::Radius { seg: arc }, value: modifier.radius, offset: 18., slide: 0.5, sweep: 0. });
         self.selection = vec![ElementRef::Segment(arc)];
@@ -1504,5 +1505,246 @@ mod tests {
             d.target,
             crate::core::constraints::DimTarget::Radius { seg } if seg == arc
         )));
+    }
+
+    /// ED-02 fillet slice, drag harness: an edge drag touching filleted
+    /// geometry must move (no freeze), keep H/V (solver-owned), keep both
+    /// fillet contacts valid with the radius intact (no one-sided
+    /// stretch), and never flip the arc branch. Live solves strip fillet
+    /// internals; refresh re-seats them exactly on commit.
+    #[test]
+    fn fillet_edge_drag_keeps_both_contacts() {
+        use crate::editor::DragState;
+        let mut ed = Editor::new();
+        ed.snap_to_grid = false;
+        ed.snap_to_objects = false;
+        ed.alt_down = true;
+        ed.create_rectangle(1, Point2::new(0., 0.), Point2::new(100., 100.));
+        let tl = point_by_pos(&ed, 0., 0.);
+        let tr = point_by_pos(&ed, 100., 0.);
+        let br = point_by_pos(&ed, 100., 100.);
+        let top = segment_by_ends(&ed, 0., 0., 100., 0.);
+        let right = segment_by_ends(&ed, 100., 0., 100., 100.);
+        ed.fillet_picks = vec![top, right];
+        assert!(ed.create_selected_fillet(tr));
+        let m = ed.doc.modifiers[0];
+        let (t1, t2) = (m.first_tangent.unwrap(), m.second_tangent.unwrap());
+        let ctl = m.control.unwrap();
+        let side = |doc: &Document| {
+            let (a, b, c) = (
+                doc.point(t1).unwrap(),
+                doc.point(t2).unwrap(),
+                doc.point(ctl).unwrap(),
+            );
+            (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+        };
+        let s0 = side(&ed.doc);
+        assert!(s0.abs() > 1e-9);
+        let (t2_0, br_0) = (ed.doc.point(t2).unwrap(), ed.doc.point(br).unwrap());
+        // Drag the far top-left corner +20 in x (same edge as t1's flat).
+        let tl_0 = ed.doc.point(tl).unwrap();
+        ed.dragging = Some(DragState {
+            points: vec![(tl, tl_0)],
+            aux: Vec::new(),
+            start_cursor: tl_0,
+            arc_body_scale: None,
+            chase: 1.0,
+        });
+        ed.last_cursor = Some(gpui::point(gpui::px(20.), gpui::px(0.)));
+        assert!(ed.solve_drag(false), "fillet-adjacent drag must not freeze");
+        let tl_1 = ed.doc.point(tl).unwrap();
+        assert!(tl_1.x - tl_0.x > 1.0, "dragged corner follows, got={tl_1:?}");
+        // Solver-owned locks hold through the live frame (no post-pass).
+        let (p1, p2, pb) = (
+            ed.doc.point(t1).unwrap(),
+            ed.doc.point(t2).unwrap(),
+            ed.doc.point(br).unwrap(),
+        );
+        assert!((p1.y - tl_1.y).abs() <= 1e-2, "H holds on top flat");
+        assert!((p2.x - pb.x).abs() <= 1e-2, "V holds on right flat");
+        // Commit-time refresh re-seats both contacts exactly; radius intact.
+        ed.refresh_fillets();
+        let g = m.evaluate(&ed.doc).expect("fillet stays evaluable");
+        let (c, q1, q2) = (
+            ed.doc.point(m.center.unwrap()).unwrap(),
+            ed.doc.point(t1).unwrap(),
+            ed.doc.point(t2).unwrap(),
+        );
+        assert!(((c.x - q1.x).hypot(c.y - q1.y) - 24.).abs() < 1e-6, "radius intact");
+        assert!((q1.x - g.first_tangent.x).hypot(q1.y - g.first_tangent.y) < 1e-9);
+        assert!((q2.x - g.second_tangent.x).hypot(q2.y - g.second_tangent.y) < 1e-9);
+        // No one-sided stretch: far side barely moved; branch kept.
+        assert!((q2.x - t2_0.x).hypot(q2.y - t2_0.y) <= 5.0, "far contact stays");
+        assert!((pb.x - br_0.x).hypot(pb.y - br_0.y) <= 5.0, "far corner stays");
+        assert!(s0 * side(&ed.doc) > 0., "arc branch never flips");
+    }
+
+    /// ED-02 fillet slice, post-pass lock: `enforce_tangencies` is
+    /// read-only inside fillet scope — even with the tangency visibly
+    /// broken, it must not rotate fillet-linked edges. That authority
+    /// belongs to the solver + refresh, never the post-pass.
+    #[test]
+    fn fillet_tangency_postpass_is_readonly() {
+        let mut ed = Editor::new();
+        ed.create_rectangle(1, Point2::new(0., 0.), Point2::new(100., 100.));
+        let tr = point_by_pos(&ed, 100., 0.);
+        let top = segment_by_ends(&ed, 0., 0., 100., 0.);
+        let right = segment_by_ends(&ed, 100., 0., 100., 100.);
+        ed.fillet_picks = vec![top, right];
+        assert!(ed.create_selected_fillet(tr));
+        // Precondition: derived line↔arc tangency exists, so the
+        // fillet-skip branch below is actually exercised.
+        assert!(ed.doc.constraints.iter().any(|c| {
+            c.kind == ConstraintKind::Tangent
+                && c.tangent_segments.is_some_and(|(x, y)| {
+                    (x == top || x == right)
+                        && ed.doc.modifiers.iter().any(|mm| mm.arc == Some(y))
+                })
+        }));
+        // Break the tangency on purpose: slant the top edge off the arc.
+        let tl = point_by_pos(&ed, 0., 0.);
+        let p = ed.doc.point(tl).unwrap();
+        ed.doc.move_point(tl, Point2::new(p.x, p.y + 2.));
+        let before: Vec<(crate::core::ids::PointId, Point2)> =
+            ed.doc.all_points().map(|(id, q)| (id, q)).collect();
+        ed.enforce_tangencies();
+        for (id, q) in &before {
+            let r = ed.doc.point(*id).unwrap();
+            assert!(r.x == q.x && r.y == q.y, "post-pass moved fillet-scope point");
+        }
+        // Refresh (the single authority) re-seats exact tangency instead.
+        ed.refresh_fillets();
+        let m = ed.doc.modifiers[0];
+        let (c0, q1, ql) = (
+            ed.doc.point(m.center.unwrap()).unwrap(),
+            ed.doc.point(m.first_tangent.unwrap()).unwrap(),
+            ed.doc.point(tl).unwrap(),
+        );
+        let (rx, ry) = (q1.x - c0.x, q1.y - c0.y);
+        let rl = (rx * rx + ry * ry).sqrt();
+        let (tx, ty) = (-ry / rl, rx / rl);
+        let (lx, ly) = (ql.x - q1.x, ql.y - q1.y);
+        let ll = (lx * lx + ly * ly).sqrt();
+        assert!(((lx * ty - ly * tx) / ll).abs() < 1e-9, "refresh owns exactness");
+    }
+
+    /// Object-box lock: filleting a corner must not shrink the object's
+    /// bounds or leave the arc body outside them — the box before and
+    /// after is the same rect, containing the arc ctrl.
+    #[test]
+    fn fillet_keeps_object_box() {
+        let mut ed = Editor::new();
+        ed.create_rectangle(1, Point2::new(0., 0.), Point2::new(100., 100.));
+        let all: Vec<ElementRef> = ed
+            .doc
+            .all_segments()
+            .map(|(id, _)| ElementRef::Segment(id))
+            .collect();
+        let before = ed.doc.elements_bounds(&all).expect("rect has bounds");
+        let tr = point_by_pos(&ed, 100., 0.);
+        let top = segment_by_ends(&ed, 0., 0., 100., 0.);
+        let right = segment_by_ends(&ed, 100., 0., 100., 100.);
+        ed.fillet_picks = vec![top, right];
+        assert!(ed.create_selected_fillet(tr));
+        // Object-mode expansion from any member (defaults are Object+Move).
+        let expanded = ed.expand_to_islands(&[ElementRef::Segment(top)]);
+        assert!(expanded.len() > 1, "fillet stays one object");
+        let after = ed.doc.elements_bounds(&expanded).expect("island has bounds");
+        for (x, y) in [
+            (before.origin.x, after.origin.x),
+            (before.origin.y, after.origin.y),
+            (before.size.w, after.size.w),
+            (before.size.h, after.size.h),
+        ] {
+            assert!((x - y).abs() < 1e-9, "box unchanged by fillet");
+        }
+        let ctrl = ed.doc.point(ed.doc.modifiers[0].control.unwrap()).unwrap();
+        assert!(
+            ctrl.x >= after.origin.x
+                && ctrl.x <= after.origin.x + after.size.w
+                && ctrl.y >= after.origin.y
+                && ctrl.y <= after.origin.y + after.size.h,
+            "arc body inside the box"
+        );
+    }
+
+    fn filleted_rect() -> Editor {
+        let mut ed = Editor::new();
+        ed.snap_to_grid = false;
+        ed.snap_to_objects = false;
+        ed.alt_down = true;
+        ed.create_rectangle(1, Point2::new(0., 0.), Point2::new(100., 100.));
+        let tr = point_by_pos(&ed, 100., 0.);
+        let top = segment_by_ends(&ed, 0., 0., 100., 0.);
+        let right = segment_by_ends(&ed, 100., 0., 100., 100.);
+        ed.fillet_picks = vec![top, right];
+        assert!(ed.create_selected_fillet(tr));
+        ed
+    }
+
+    fn px_at(p: Point2) -> gpui::Point<gpui::Pixels> {
+        gpui::point(gpui::px(p.x as f32), gpui::px(p.y as f32))
+    }
+
+    fn sorted_ids(ids: Vec<crate::core::ids::PointId>) -> Vec<crate::core::ids::PointId> {
+        let mut out = ids;
+        out.sort_by_key(|id| (id.idx, id.generation));
+        out
+    }
+
+    /// Object mode: pressing the fillet CENTER moves the whole island —
+    /// no press is staged, no resize gesture starts.
+    #[test]
+    fn object_mode_fillet_center_press_moves_island() {
+        let mut ed = filleted_rect();
+        let c = ed.doc.point(ed.doc.modifiers[0].center.unwrap()).unwrap();
+        assert!(ed.canvas_down(gpui::MouseButton::Left, px_at(c), false, 1));
+        assert!(ed.fillet_press.is_none(), "no fillet press staged in Object mode");
+        let got = sorted_ids(
+            ed.dragging.as_ref().expect("drag started").points.iter().map(|&(id, _)| id).collect(),
+        );
+        let want = sorted_ids(ed.doc.selection_points(&ed.selection));
+        assert_eq!(got, want, "whole island chases, center included as mover");
+        assert!(ed.dragging.as_ref().unwrap().aux.is_empty());
+    }
+
+    /// Object mode: pressing a fillet TANGENT point moves the whole
+    /// island — never a corner/radius resize.
+    #[test]
+    fn object_mode_fillet_tangent_press_moves_island() {
+        let mut ed = filleted_rect();
+        let t = ed.doc.point(ed.doc.modifiers[0].first_tangent.unwrap()).unwrap();
+        assert!(ed.canvas_down(gpui::MouseButton::Left, px_at(t), false, 1));
+        assert!(ed.fillet_press.is_none(), "no fillet press staged in Object mode");
+        let got = sorted_ids(
+            ed.dragging.as_ref().expect("drag started").points.iter().map(|&(id, _)| id).collect(),
+        );
+        let want = sorted_ids(ed.doc.selection_points(&ed.selection));
+        assert_eq!(got, want, "whole island chases, tangent included as mover");
+    }
+
+    /// Edit mode keeps handle behavior: a center press stages the fillet
+    /// press (control case for the two tests above).
+    #[test]
+    fn edit_mode_fillet_center_press_stages() {
+        let mut ed = filleted_rect();
+        ed.interaction_mode = crate::editor::InteractionMode::Edit;
+        let c = ed.doc.point(ed.doc.modifiers[0].center.unwrap()).unwrap();
+        assert!(ed.canvas_down(gpui::MouseButton::Left, px_at(c), false, 1));
+        assert!(ed.fillet_press.is_some(), "Edit still stages the handle press");
+        assert!(ed.dragging.is_none());
+    }
+
+    /// A press staged in Edit dies on the flip to Object (never converts
+    /// mid-flight into a resize).
+    #[test]
+    fn fillet_press_dies_on_object_flip() {
+        let mut ed = filleted_rect();
+        ed.interaction_mode = crate::editor::InteractionMode::Edit;
+        let c = ed.doc.point(ed.doc.modifiers[0].center.unwrap()).unwrap();
+        assert!(ed.canvas_down(gpui::MouseButton::Left, px_at(c), false, 1));
+        assert!(ed.fillet_press.is_some());
+        assert!(ed.set_interaction_mode(crate::editor::InteractionMode::Object));
+        assert!(ed.fillet_press.is_none());
     }
 }

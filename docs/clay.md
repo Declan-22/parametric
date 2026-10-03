@@ -355,8 +355,17 @@ Span = Line { a, b: JointId }
 - **Object Mode ops:** select/transform whole paths, join (`Ctrl+J`),
   duplicate, delete. Creation (extrude, stroke-fit, end growth) lives in
   Edit — a new path started in Object drops you straight into Edit on it.
+  Double-click enters Edit: empty interior (inside the box, on nothing)
+  keeps the selection; a hit on a multi-object selection narrows to that
+  island first, and a hit when the selection already is that island goes
+  to Edit. Single clicks never mode-flip.
   Object selection renders ONE bounding box around the whole selection
   (SOLID accent outline + display-only corner dots, drag-inside moves).
+  The box covers whole islands (point-point Coincident glue = one object;
+  slide attachments, dims, and locks never merge) with arcs bounded by
+  curve extent, so fillets sit inside it. Grabbing ANY part of an object
+  (corner, edge, arc) rigid-moves the whole island — point resize, edge
+  stretch, arc kinematics, and fillet gestures are Edit-mode-only.
   Selected edges stay highlighted under the box. Bbox scale / rotate
   handles are explicitly LATER (resizing constrained sketches goes
   through the solver as drag targets — design with SOL-02 hierarchy first).

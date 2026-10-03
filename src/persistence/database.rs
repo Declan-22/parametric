@@ -1,7 +1,7 @@
 use rusqlite::Connection;
 
 use crate::core::constraints::{ConstraintKind, Dimension, ElementRef};
-use crate::core::document::{DocSettings, Document, Layer, SegmentKind};
+use crate::core::document::{DocSettings, Document, Layer, LayerKind, SegmentKind};
 use crate::core::geometry::Point2;
 use crate::core::ids::{FillId, PointId, SegmentId};
 
@@ -51,7 +51,10 @@ impl Database {
             "CREATE TABLE IF NOT EXISTS layers (
                 id INTEGER PRIMARY KEY,
                 name TEXT NOT NULL,
-                order_index INTEGER NOT NULL
+                order_index INTEGER NOT NULL,
+                visible INTEGER NOT NULL DEFAULT 1,
+                parent INTEGER,
+                kind TEXT
             );
             CREATE TABLE IF NOT EXISTS layer_elements (
                 layer_id INTEGER NOT NULL REFERENCES layers(id),
@@ -157,6 +160,11 @@ impl Database {
             "ALTER TABLE fillets ADD COLUMN ctr_gen INTEGER",
             "ALTER TABLE fillets ADD COLUMN ctl_idx INTEGER",
             "ALTER TABLE fillets ADD COLUMN ctl_gen INTEGER",
+            // Layer tree: per-layer visibility plus group nesting.
+            "ALTER TABLE layers ADD COLUMN visible INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE layers ADD COLUMN parent INTEGER",
+            // Layer kinds: NULL = legacy flat layer (organized on load).
+            "ALTER TABLE layers ADD COLUMN kind TEXT",
         ] {
             let _ = self.conn.execute(sql, []);
         }
@@ -406,8 +414,15 @@ impl Database {
             }
             for (index, layer) in doc.layers.iter().enumerate() {
                 self.conn.execute(
-                    "INSERT INTO layers(id, name, order_index) VALUES(?1, ?2, ?3)",
-                    rusqlite::params![layer.id as i64, layer.name, index as i64],
+                    "INSERT INTO layers(id, name, order_index, visible, parent, kind) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![
+                        layer.id as i64,
+                        layer.name,
+                        index as i64,
+                        if layer.visible { 1 } else { 0 },
+                        layer.parent.map(|p| p as i64),
+                        layer.kind.map(|k| k.as_str())
+                    ],
                 )?;
                 for (i, el) in layer.elements.iter().enumerate() {
                     let (kind, idx, generation) = match el {
@@ -738,7 +753,7 @@ impl Database {
         drop(stmt);
 
         let mut stmt = self.conn.prepare(
-            "SELECT l.id, l.name, e.kind, e.elem_idx, e.elem_gen
+            "SELECT l.id, l.name, e.kind, e.elem_idx, e.elem_gen, l.visible, l.parent, l.kind
              FROM layers l LEFT JOIN layer_elements e ON e.layer_id = l.id
              ORDER BY l.order_index, e.order_index",
         )?;
@@ -751,6 +766,9 @@ impl Database {
                     id: layer_id,
                     name: row.get(1)?,
                     elements: Vec::new(),
+                    visible: row.get::<_, Option<i64>>(5)?.unwrap_or(1) != 0,
+                    parent: row.get::<_, Option<i64>>(6)?.map(|p| p as u64),
+                    kind: row.get::<_, Option<String>>(7).ok().flatten().and_then(|s| LayerKind::from_str(&s)),
                 });
                 last_layer = Some(layer_id);
             }

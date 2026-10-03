@@ -1,6 +1,7 @@
 use super::ruler;
 use crate::editor::pick;
 use super::Editor;
+use crate::core::constraints::ElementRef;
 use crate::core::document::Document;
 use crate::core::geometry::{Point2, Rect};
 use crate::core::ids::PointId;
@@ -366,6 +367,15 @@ pub fn update(ed: &mut Editor) {
     let ndims = ed.doc.dimensions.len();
     for i in 0..ndims {
         let d = ed.doc.dimensions[i];
+        // Hidden bodies take their dims with them (eye = gone): a dim
+        // dies the moment ANY measured point hides. Hitboxes build from
+        // these renders, so hidden dims stop picking too.
+        if !crate::editor::joints::dim_target_points(&ed.doc, &d.target)
+            .iter()
+            .all(|p| ed.doc.element_visible(ElementRef::Point(*p)))
+        {
+            continue;
+        }
         let editing = ed
             .dim_input.as_ref()
             .is_some_and(|input| input.existing == Some(i));
@@ -1202,6 +1212,13 @@ fn update_constraint_markers(ed: &mut Editor) {
         let (Some(a), Some(b)) = (ed.doc.point(c.a), ed.doc.point(c.b)) else {
             continue;
         };
+        // Chips with no visible anchor stay home: both endpoints hidden
+        // means the whole constraint lives under a closed eye.
+        if !ed.doc.element_visible(ElementRef::Point(c.a))
+            && !ed.doc.element_visible(ElementRef::Point(c.b))
+        {
+            continue;
+        }
         let ma = ed.camera.unit_to_screen(a);
         let mb = ed.camera.unit_to_screen(b);
         let coincident_pt = c.kind == crate::core::constraints::ConstraintKind::Coincident;

@@ -127,7 +127,8 @@ impl crate::editor::Editor {
     }
 
     /// Object-mode selection expansion (Move tool only): any picked element
-    /// grows to its whole island (shared-endpoint components). Fills never
+    /// grows to its whole island (shared endpoints + point-coincident glue;
+    /// endpoints and construction slots both match). Fills never
     /// expand (fill drag = translate interior; expansion would rewire it to
     /// edge-stretch). Lone points are their own unit. Everywhere else
     /// (Edit, other tools) is identity.
@@ -137,53 +138,7 @@ impl crate::editor::Editor {
         {
             return els.to_vec();
         }
-        let islands = self.doc.islands();
-        let mut out: Vec<ElementRef> = Vec::new();
-        let mut push = |el: ElementRef| {
-            if !out.contains(&el) {
-                out.push(el);
-            }
-        };
-        for el in els {
-            match *el {
-                ElementRef::Segment(sid) => {
-                    match islands.iter().find(|v| v.contains(&sid)) {
-                        Some(isl) => {
-                            for s in isl {
-                                push(ElementRef::Segment(*s));
-                            }
-                        }
-                        None => push(*el), // stale id: keep
-                    }
-                }
-                ElementRef::Point(pid) => {
-                    let mut found = false;
-                    for isl in &islands {
-                        let mut touches = false;
-                        for s in isl {
-                            if let Some(seg) = self.doc.segment(*s) {
-                                if seg.start == pid || seg.end == pid {
-                                    touches = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if touches {
-                            for s in isl {
-                                push(ElementRef::Segment(*s));
-                            }
-                            found = true;
-                            break;
-                        }
-                    }
-                    if !found {
-                        push(*el);
-                    }
-                }
-                _ => push(*el),
-            }
-        }
-        out
+        self.doc.island_elements(els)
     }
 
     /// Post-solve derivation (Clay layer rule): write derived positions into

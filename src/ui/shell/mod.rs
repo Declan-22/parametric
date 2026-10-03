@@ -95,6 +95,12 @@ pub struct Shell {
     // canvas; identical pushes re-arm instead of stacking.
     pub(crate) toasts: Vec<crate::ui::toasts::ToastEntry>,
     pub(crate) toast_seq: u64,
+    // Layers panel: open state (toggle lives in the ModeBar only),
+    // active tab, collapsed groups, hovered row.
+    pub(crate) layers_panel_open: bool,
+    pub(crate) layers_tab: crate::ui::layers::LayersTab,
+    pub(crate) layers_collapsed: std::collections::HashSet<u64>,
+    pub(crate) hovered_layer: Option<u64>,
 }
 
 fn now_secs() -> i64 {
@@ -108,7 +114,7 @@ impl Shell {
     pub fn new(cx: &mut Context<Self>) -> Self {
         cx.observe_global::<ThemeState>(|_, cx| cx.notify())
             .detach();
-        Self {
+        let mut shell = Self {
             view: View::Home,
             editor: None,
             design_name: String::new(),
@@ -141,7 +147,29 @@ impl Shell {
             dim_blink_active: false,
             toasts: Vec::new(),
             toast_seq: 0,
-        }
+            layers_panel_open: true,
+            layers_tab: crate::ui::layers::LayersTab::Layers,
+            layers_collapsed: std::collections::HashSet::new(),
+            hovered_layer: None,
+        };
+        // The layers panel opens WITH the app: seed the slide tween at
+        // 1 so the first frame renders it in place (no tween runs until
+        // the first toggle).
+        shell.fades.insert("layers-panel".to_string(), 1.0);
+        shell
+    }
+
+    /// Layers-panel toggle (the ONLY open/close control — ModeBar
+    /// sidebar button). Drives the slide tween target; render maps the
+    /// 0..1 progress to panel position.
+    pub(crate) fn toggle_layers_panel(&mut self, cx: &mut Context<Self>) {
+        self.layers_panel_open = !self.layers_panel_open;
+        self.animate_fade(
+            "layers-panel",
+            if self.layers_panel_open { 1.0 } else { 0.0 },
+            cx,
+        );
+        cx.notify();
     }
 
     /// Debounced autosave: whenever the open document's generation is ahead
@@ -257,6 +285,9 @@ impl Shell {
             id: 1,
             name: "Layer 1".into(),
             elements: Vec::new(),
+            visible: true,
+            parent: None,
+            kind: Some(crate::core::document::LayerKind::Body),
         });
         let _ = db.save_document(&doc);
         drop(db);
@@ -292,7 +323,17 @@ impl Shell {
                 id: 1,
                 name: "Layer 1".into(),
                 elements: Vec::new(),
+                visible: true,
+                parent: None,
+                kind: Some(crate::core::document::LayerKind::Body),
             });
+        }
+        // Legacy flat documents (pre-kind layers) partition into one
+        // body layer per island on open — the hierarchy seeds itself.
+        // Runs once: organize assigns every layer a kind.
+        if doc.needs_organize() {
+            let start = doc.layers.iter().map(|l| l.id + 1).max().unwrap_or(1);
+            doc.organize_bodies(start);
         }
         self.design_name = meta.name.clone();
         self.view = View::Design(id);
@@ -1565,6 +1606,51 @@ impl Render for Shell {
                     return;
                 }
                 // Clay grades (Edit mode ONLY): V = corner, H = smooth,
+                // Layers-panel reorder: Alt+Up/Down moves the active layer
+                // within its siblings, Alt+Left/Right outdents/indents.
+                // Guarded to text inputs (rename/dim own every keystroke).
+                {
+                    let m = &e.keystroke.modifiers;
+                    let layer_key = if m.alt && !m.control && !m.shift && !m.platform {
+                        match key.as_str() {
+                            "up" => Some(0),
+                            "down" => Some(1),
+                            "left" => Some(2),
+                            "right" => Some(3),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(which) = layer_key {
+                        let mut consumed = false;
+                        let _ = shell_keys.update(cx, |shell, cx| {
+                            if shell.renaming.is_some() {
+                                return;
+                            }
+                            let Some(ed) = shell.editor.as_ref() else {
+                                return;
+                            };
+                            if ed.read(cx).dim_input.is_some()
+                                || ed.read(cx).inspector_input.is_some()
+                            {
+                                return;
+                            }
+                            let id = ed.read(cx).active_layer;
+                            ed.update(cx, |ed, cx| match which {
+                                0 => ed.move_layer_sibling(id, -1, cx),
+                                1 => ed.move_layer_sibling(id, 1, cx),
+                                2 => ed.outdent_layer(id, cx),
+                                _ => ed.indent_layer(id, cx),
+                            });
+                            consumed = true;
+                        });
+                        if consumed {
+                            cx.stop_propagation();
+                            return;
+                        }
+                    }
+                }
                 // Shift+H = curvature. Flips selected points and enrolls
                 // them (derive-on-touch), then re-derives. Consumed even
                 // with nothing gradeable so V never yanks to the Move tool
@@ -2055,6 +2141,12 @@ impl Render for Shell {
                             editor: editor.downgrade(),
                             shell: cx.entity().downgrade(),
                             focus: self.canvas_focus.clone(),
+                        })
+                        // Layers panel: far-left dock. The tool rail reads
+                        // the same slide tween and rides the panel edge.
+                        .child(crate::ui::layers::LayerPanel {
+                            editor: editor.downgrade(),
+                            shell: cx.entity().downgrade(),
                         })
                         .child(Toolbar {
                             editor: editor.downgrade(),

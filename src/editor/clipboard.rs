@@ -204,7 +204,7 @@ impl Editor {
             return false;
         }
 
-        let layer_id = self.doc.layers[0].id;
+        let layer_id = self.active_layer_id();
         let ids: Vec<PointId> = pts
             .iter()
             .map(|p| self.doc.add_point(Point2::new(p.x + OFFSET, p.y + OFFSET)))

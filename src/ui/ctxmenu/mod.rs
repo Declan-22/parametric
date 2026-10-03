@@ -524,7 +524,7 @@ impl CanvasMenu {
                                     div().text_xs().text_color(rgb(t.text_secondary)).child("✓"),
                                 )
                             })
-                            .children(shortcut.iter().map(|s| keycap(s, t, !interactive))),
+                            .children(shortcut.iter().map(|s| keycap(s, t, !interactive, 1.0))),
                     )
                     .into_any_element()
             }
@@ -688,26 +688,34 @@ fn row_icon(icon: Option<&'static [u8]>, fg: u32, t: crate::theme::Theme) -> gpu
 
 /// Keycap hint (dropdown.rs contract): flexible width, compact square for
 /// single chars. Chords render spaced ("Ctrl + X"). Dead rows mute the ink
-/// and drop opacity.
-fn keycap(shortcut: &str, t: crate::theme::Theme, dimmed: bool) -> gpui::AnyElement {
+/// and drop opacity. Scale shrinks all px geometry (button pills reuse the
+/// design smaller); the font step stays put.
+pub(crate) fn keycap(
+    shortcut: &str,
+    t: crate::theme::Theme,
+    dimmed: bool,
+    scale: f32,
+) -> gpui::AnyElement {
     let pretty: String = shortcut.split('+').collect::<Vec<_>>().join(" + ");
-    let width = (18. + pretty.len() as f32 * 5.).max(18.);
+    let width = (18. + pretty.len() as f32 * 5.).max(18.) * scale;
     div()
-        .min_w(px(18.))
+        .min_w(px(18. * scale))
         .w(px(width))
-        .h(px(16.))
-        .px(px(4.))
+        .h(px(16. * scale))
+        .px(px(4. * scale))
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(5.))
+        .rounded(px(5. * scale))
         .bg(rgb(t.bg_primary))
         .border_1()
         .border_color(rgb(t.border_color))
         .opacity(if dimmed { 0.5 } else { 1.0 })
         .child(
             div()
-                .text_xs()
+                // Explicit size so scaled pills shrink their text too
+                // (12px == text_xs, so scale 1.0 renders identical).
+                .text_size(px(12. * scale))
                 .font_family(crate::theme::FONT_UI)
                 .text_color(rgb(if dimmed {
                     t.empty_text_secondary

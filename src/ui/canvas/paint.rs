@@ -209,12 +209,14 @@ pub enum Primitive {
         width: f32,
         color: gpui::Background,
     },
-    // 1px outline used for selection indicators.
+    // Outline used for selection indicators (snap badge, marquee,
+    // object bbox — each sets its own width).
     Outline {
         x: f32,
         y: f32,
         w: f32,
         h: f32,
+        width: f32,
     },
     // Solid color disk: round joins/caps for stroked polylines. Strokes
     // paint as butt-jointed quads, which crack open at every tessellation
@@ -353,6 +355,11 @@ pub fn build_draw_list(
     // line segments are invisible geometry; they only appear via
     // hover/selection overlays below.
     for layer in &doc.layers {
+        // The eye is a hard gate: hidden layers paint nothing (not even
+        // hover/selection overlays — overlays iterate the same loop).
+        if !doc.layer_effective_visible(layer.id) {
+            continue;
+        }
         for &el in &layer.elements {
             match el {
                 ElementRef::Fill(fid) => {
@@ -585,7 +592,7 @@ pub fn build_draw_list(
                             || h1.is_some_and(hot)
                             || h2.is_some_and(hot);
                         if touched {
-                            // Handle arms are solid 1px accent lines (never
+                            // Handle arms are solid 2px accent lines (never
                             // dashed) with diamond dots.
                             let (x0, y0) = scr(p0);
                             let (x1, y1) = scr(c1);
@@ -594,14 +601,14 @@ pub fn build_draw_list(
                             for (ax, ay, bx, by) in
                                 [(x0, y0, x1, y1), (x3, y3, x2, y2)]
                             {
-                                list.push(Primitive::Line {
-                                    ax,
-                                    ay,
-                                    bx,
-                                    by,
-                                    width: 1.,
-                                    color: accent,
-                                });
+                    list.push(Primitive::Line {
+                        ax,
+                        ay,
+                        bx,
+                        by,
+                        width: 2.,
+                        color: accent,
+                    });
                             }
                             list.push(Primitive::Diamond { cx: x1, cy: y1, radius: 5. });
                             list.push(Primitive::Diamond { cx: x2, cy: y2, radius: 5. });
@@ -636,10 +643,13 @@ pub fn build_draw_list(
     // Fillet drag affordances: committed fillet centers always show while
     // the Fillet tool is active, plus for any selected fillet arc (the
     // radius-drag grab targets). Otherwise they stay hidden, as before.
-    let show_centers = tool == crate::editor::Tool::Fillet;
+    // Object mode shows zero handles, ever: a visible dot would promise
+    // a resize grab that Edit-gated staging never starts.
+    let edit = clay.is_some_and(|c| c.edit);
+    let show_centers = tool == crate::editor::Tool::Fillet && edit;
     for m in &doc.modifiers {
         let selected = m.arc.is_some_and(|a| selection.contains(&ElementRef::Segment(a)));
-        if !(show_centers || selected) {
+        if !(show_centers || selected && edit) {
             continue;
         }
         if let Some(c) = m.center.and_then(|id| doc.point(id)) {
@@ -835,6 +845,7 @@ pub fn build_draw_list(
                     y: to.y as f32 - SQUARE / 2.0,
                     w: SQUARE,
                     h: SQUARE,
+                    width: 2.,
                 });
             }
         }
@@ -847,12 +858,18 @@ pub fn build_draw_list(
         !clay.is_some_and(|c| c.edit) && matches!(tool, crate::editor::Tool::Move);
 
     // 4) Hover affordance: accent outline of the hovered element (Object:
-    // the whole island — never a joint).
+    // the whole island — never a joint). Already-selected edges never
+    // redraw: hovering a selected rect's fill used to stack the loop
+    // outline over the highlighted edges (one thick border).
     if let Some(h) = hover
         && !selection.contains(&h)
+        && doc.element_visible(h)
     {
         if object_world {
-            for el in hover_island(doc, h) {
+            for el in hover_coverage(doc, h) {
+                if selection.contains(&el) {
+                    continue;
+                }
                 element_outline(doc, el, &scr, accent, &mut list, camera.zoom, cache, &bezier_handles, &mut scr_buf, &mut sim_buf);
             }
         } else {
@@ -882,11 +899,17 @@ pub fn build_draw_list(
     };
     if !object_world {
         for &sel in selection {
+            if !doc.element_visible(sel) {
+                continue;
+            }
             element_outline(doc, sel, &scr, accent, &mut list, camera.zoom, cache, &bezier_handles, &mut scr_buf, &mut sim_buf);
         }
     } else {
         // Object world: selected edges stay highlighted under the bbox.
         for &sel in selection {
+            if !doc.element_visible(sel) {
+                continue;
+            }
             if matches!(sel, ElementRef::Segment(_)) {
                 element_outline(doc, sel, &scr, accent, &mut list, camera.zoom, cache, &bezier_handles, &mut scr_buf, &mut sim_buf);
             }
@@ -894,6 +917,9 @@ pub fn build_draw_list(
     }
     if !object_world {
         for &sel in selection {
+            if !doc.element_visible(sel) {
+                continue;
+            }
             for pid in doc.element_points(sel) {
             if let Some(p) = doc.point(pid) {
                 let (x, y) = scr(p);
@@ -926,9 +952,12 @@ pub fn build_draw_list(
     }
     // 5b2) Object-world selection: ONE solid accent box + corner dots
     // around everything selected (display-only corners, drag-inside moves).
+    // One box per OBJECT, not per pick: partial selections (marquee, stale
+    // refs) still box their whole islands, arcs by curve extent.
     if object_world && !selection.is_empty() {
-        let pts = doc.selection_points(selection);
-        if let Some(bb) = doc.bounds_of_points(&pts) {
+        let shown: Vec<ElementRef> =
+            selection.iter().copied().filter(|&s| doc.element_visible(s)).collect();
+        if let Some(bb) = doc.elements_bounds(&doc.island_elements(&shown)) {
             let (x0, y0) = scr(bb.origin);
             let (x1, y1) = scr(Point2::new(
                 bb.origin.x + bb.size.w,
@@ -939,6 +968,7 @@ pub fn build_draw_list(
                 y: y0,
                 w: x1 - x0,
                 h: y1 - y0,
+                width: 2.,
             });
             for (cx, cy) in [(x0, y0), (x1, y0), (x1, y1), (x0, y1)] {
                 list.push(Primitive::Circle { cx, cy, radius: 4. });
@@ -1099,7 +1129,7 @@ pub fn build_draw_list(
             h,
             color: rgba((t.accent << 8) | 0x1A).into(),
         });
-        list.push(Primitive::Outline { x, y, w, h });
+        list.push(Primitive::Outline { x, y, w, h, width: 1. });
     }
 
     // 7) In-progress rectangle being dragged out + anchor crosshair.
@@ -1637,13 +1667,13 @@ fn element_outline(
                 && let Some(samples) = cache.arc_samples(doc, sid, zoom)
             {
                 let live = trimmed_samples(doc, sid, samples);
-                push_simplified_polyline(list, scr_buf, sim_buf, live, scr, 2.5, accent);
+                push_simplified_polyline(list, scr_buf, sim_buf, live, scr, 2., accent);
             } else if let Some(seg) = doc.segment(sid)
                 && seg.kind == SegmentKind::Bezier
                 && let Some(entry) = cache.bezier_samples(doc, sid, zoom)
             {
                 let live = trimmed_samples(doc, sid, &entry.pts);
-                push_simplified_polyline(list, scr_buf, sim_buf, live, scr, 2.5, accent);
+                push_simplified_polyline(list, scr_buf, sim_buf, live, scr, 2., accent);
             } else if let Some((a, b)) = fillet_trimmed_line(doc, sid).or_else(|| doc.segment_geom(sid)) {
                 let (ax, ay) = scr(a);
                 let (bx, by) = scr(b);
@@ -1652,7 +1682,7 @@ fn element_outline(
                     ay,
                     bx,
                     by,
-                    width: 2.5,
+                    width: 2.,
                     color: accent,
                 });
             }
@@ -1723,11 +1753,11 @@ fn polyline_visible(pts: &[Point2], r: Rect) -> bool {
         .any(|w| segment_visible(w[0], w[1], r))
 }
 
-/// Object-mode hover targets: the whole island (shared-endpoint segments)
-/// for segment/point hits — never a joint. Lone points and fills pass
-/// through untouched.
-fn hover_island(doc: &Document, el: ElementRef) -> Vec<ElementRef> {
-    match el {
+/// Object-mode hover targets: the whole island (shared endpoints +
+/// point-coincident glue) for segment/point hits — never a joint.
+/// Construction-slot presses count as island touches. Lone points and
+/// fills pass through untouched.
+fn hover_island(doc: &Document, el: ElementRef) -> Vec<ElementRef> {    match el {
         ElementRef::Segment(sid) => doc
             .islands()
             .into_iter()
@@ -1737,8 +1767,12 @@ fn hover_island(doc: &Document, el: ElementRef) -> Vec<ElementRef> {
             let mut out = Vec::new();
             for isl in doc.islands() {
                 let touches = isl.iter().any(|s| {
-                    doc.segment(*s)
-                        .is_some_and(|seg| seg.start == pid || seg.end == pid)
+                    doc.segment(*s).is_some_and(|seg| {
+                        seg.start == pid
+                            || seg.end == pid
+                            || seg.ctrl == Some(pid)
+                            || seg.center == Some(pid)
+                    })
                 });
                 if touches {
                     out.extend(isl.into_iter().map(ElementRef::Segment));
@@ -1753,6 +1787,18 @@ fn hover_island(doc: &Document, el: ElementRef) -> Vec<ElementRef> {
         _ => None,
     }
     .unwrap_or(vec![el])
+}
+
+/// Hover outline set: islands for segments/points, the loop's edges
+/// for fills — so fill hover and edge hover draw the SAME path (one
+/// width, never stacked).
+fn hover_coverage(doc: &Document, el: ElementRef) -> Vec<ElementRef> {
+    if let ElementRef::Fill(fid) = el
+        && let Some(fill) = doc.fill(fid)
+    {
+        return fill.segments.iter().map(|&s| ElementRef::Segment(s)).collect();
+    }
+    hover_island(doc, el)
 }
 
 fn overlaps(a: Rect, b: Rect) -> bool {    a.origin.x <= b.origin.x + b.size.w

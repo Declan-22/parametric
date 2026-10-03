@@ -16,7 +16,7 @@ use super::{HANDLE_TOL_PX, InteractionMode};
 
 impl crate::editor::Editor {
     fn clay_layer(&self) -> u64 {
-        self.doc.layers[0].id
+        self.active_layer_id()
     }
 
     /// Make a fresh joint: point + layer ref + default enrollment.

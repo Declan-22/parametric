@@ -153,7 +153,7 @@ impl Editor {
     fn commit_pen_line(&mut self, b: Point2, shift: bool) {
         let Some(anchor) = self.pen_anchor else { return };
         self.snap_guides.clear();
-        let layer_id = self.doc.layers[0].id;
+        let layer_id = self.active_layer_id();
         let seg = self.create_line(layer_id, anchor, b);
         // Merge FIRST: constraint creation below must reference the live
         // (post-merge) point ids, or the constraints dangle on a destroyed
@@ -230,7 +230,7 @@ impl Editor {
                     self.snap_guides.clear();
                     if let (Some(a), Some(b)) = (pc.a, pc.b) {
                         let c = pc.cursor;
-                        let layer_id = self.doc.layers[0].id;
+                        let layer_id = self.active_layer_id();
                         let seg = self.create_arc(layer_id, a, b, c);
                         // Merge before constraining (see commit_pen_line).
                         self.pen_chain_end(seg);
@@ -409,7 +409,7 @@ impl Editor {
             .map(|h| Point2::new(2. * end.x - h.x, 2. * end.y - h.y))
             .unwrap_or_else(|| lerp(2. / 3.));
         self.snap_guides.clear();
-        let layer_id = self.doc.layers[0].id;
+        let layer_id = self.active_layer_id();
         let seg = self.create_bezier(layer_id, pb.p0, c1, c2, end);
         // Merge before constraining (see commit_pen_line).
         self.pen_chain_end(seg);

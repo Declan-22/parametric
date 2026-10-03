@@ -5,6 +5,8 @@ use gpui::{
 };
 
 use crate::editor::{Editor, InteractionMode, Tool};
+use crate::theme::{fade_in, lerp_rgb};
+use crate::ui::inspector::INSPECTOR_WIDTH;
 use crate::ui::shell::title_bar::TITLE_BAR_HEIGHT;
 
 pub mod paint;
@@ -179,6 +181,7 @@ impl RenderOnce for CanvasView {
             .child(self.constraint_chip_layer(cx))
             .child(self.dimension_layer())
             .child(self.snap_cursor_layer(cx))
+            .child(self.edit_button_layer(cx))
     }
 }
 
@@ -830,7 +833,7 @@ impl CanvasView {
                             gpui::BorderStyle::Solid,
                         ));
                     }
-                    paint::Primitive::Outline { x, y, w, h } => {
+                    paint::Primitive::Outline { x, y, w, h, width } => {
                         // Snap the origin in device px: 1px accent borders
                         // straddling boundaries paint gray/thin.
                         let oxf = f32::from(ox);
@@ -849,7 +852,7 @@ impl CanvasView {
                             },
                             0.,
                             gpui::transparent_black(),
-                            gpui::Edges::all(px(1.)),
+                            gpui::Edges::all(px(width)),
                             rgb(crate::theme::active(cx).accent),
                             gpui::BorderStyle::Solid,
                         ));
@@ -1032,6 +1035,103 @@ impl CanvasView {
             );
         }
         layer
+    }
+
+    // Object-mode Edit shortcut: a modebar-styled "Edit" pill with a Tab
+    // keycap, floating just above the selection box's top-right corner
+    // (right-aligned to the box edge). Same action as Tab or double-click.
+    // Hidden in Edit mode, with no selection, or when the box is offscreen.
+    fn edit_button_layer(&self, cx: &App) -> gpui::AnyElement {
+        let t = *crate::theme::active(cx);
+        let Some(editor) = self.editor.upgrade() else {
+            return div().absolute().into_any_element();
+        };
+        let Some(shell) = self.shell.upgrade() else {
+            return div().absolute().into_any_element();
+        };
+        let (mode, bbox, viewport, camera) = {
+            let ed = editor.read(cx);
+            (ed.interaction_mode, ed.object_box(), ed.viewport_size, ed.camera)
+        };
+        if mode != InteractionMode::Object {
+            return div().absolute().into_any_element();
+        }
+        let Some(bb) = bbox else {
+            return div().absolute().into_any_element();
+        };
+        let (vw, vh) = viewport;
+        if vw < 1.0 || vh < 1.0 {
+            return div().absolute().into_any_element();
+        }
+        let p0 = camera.unit_to_screen(bb.origin);
+        let p1 = camera.unit_to_screen(crate::core::geometry::Point2::new(
+            bb.origin.x + bb.size.w,
+            bb.origin.y + bb.size.h,
+        ));
+        let (x0, x1) = (p0.x.min(p1.x), p0.x.max(p1.x));
+        let (y0, y1) = (p0.y.min(p1.y), p0.y.max(p1.y));
+        if x1 < 0. || x0 > vw || y1 < 0. || y0 > vh {
+            return div().absolute().into_any_element();
+        }
+        const BTN_H: f64 = 20.0;
+        const GAP: f64 = 4.0;
+        let dock = INSPECTOR_WIDTH as f64 + 8.0;
+        let right = (vw - x1).clamp(dock, (vw - 64.0).max(dock));
+        let top = (y0 - BTN_H - GAP).max(2.0).min((vh - BTN_H - 2.0).max(2.0));
+        // Home-button contract (modebar dropdown): constant geometry +
+        // border, bg + fg tween on hover; keycap follows ctxmenu design.
+        let k = shell.read(cx).fade("bbox-edit-button");
+        let bg = lerp_rgb(t.bg_primary, t.bg_tertiary, k);
+        let mut shadow = t.shadow_sm();
+        shadow.color = rgba(fade_in(t.item_shadow_color, k)).into();
+        let fg = lerp_rgb(t.text_secondary, t.text_primary, k);
+        let editor_click = self.editor.clone();
+        let shell_hov = self.shell.clone();
+        div()
+            .id("bbox-edit-button")
+            .absolute()
+            .right(px(right as f32))
+            .top(px(top as f32))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(5.))
+            .h(px(20.))
+            // Right pad stays tighter than left (keycap air gap, minus a
+            // pixel per request).
+            .pl(px(7.))
+            .pr(px(2.2))
+            .rounded(px(8.))
+            .cursor_pointer()
+            .border_1()
+            .border_color(rgb(t.border_color))
+            .bg(rgb(bg))
+            .text_xs()
+            .text_color(rgb(fg))
+            .shadow(vec![shadow])
+            .on_hover(move |hovered, _, cx| {
+                let _ = shell_hov.update(cx, |shell, cx| {
+                    shell.animate_fade("bbox-edit-button", if *hovered { 1.0 } else { 0.0 }, cx);
+                });
+            })
+            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                cx.stop_propagation();
+                let _ = editor_click.update(cx, |ed, cx| {
+                    if ed.set_interaction_mode(InteractionMode::Edit) {
+                        cx.notify();
+                    }
+                });
+            })
+            .child(
+                svg()
+                    .data(crate::ui::modebar::ICON_EDIT)
+                    .w(px(12.))
+                    .h(px(12.))
+                    .text_color(rgb(fg)),
+            )
+            .child("Edit")
+            .child(crate::ui::ctxmenu::keycap("Tab", t, false, 0.85))
+            .into_any_element()
     }
 }
 

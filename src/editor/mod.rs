@@ -27,13 +27,13 @@ pub use snapping::SnapGuide;
 pub use tools::{ClayPath, DimInput, DimPick, EditScope, InteractionMode, PenMode, PendingBezier, PendingCircle, PendingLine, PendingPen, PendingRuler, PendingShape, Tool};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InspectorField { X, Y, Width, Height, Opacity, StrokeHex, FillHex, Dimension(usize) }
+pub enum InspectorField { X, Y, Width, Height, Opacity, StrokeHex, FillHex, Dimension(usize), LayerName(u64) }
 
 #[derive(Clone, Debug)]
 pub struct InspectorInput { pub field: InspectorField, pub value: String }
 
 use crate::core::constraints::{ConstraintKind, DimTarget, ElementRef};
-use crate::core::document::{Document, Layer, StrokeDash};
+use crate::core::document::{Document, Layer, LayerKind, StrokeDash};
 use crate::core::geometry::{Point2, Rect};
 use crate::core::ids::{FillId, PointId, SegmentId};
 
@@ -226,6 +226,9 @@ pub struct Editor {
     pub alt_down: bool,
     pub(crate) dragging: Option<DragState>,
     next_layer_id: u64,
+    // New geometry lands here (panel selection). Falls back to the
+    // first layer when the id goes stale (deleted/loaded docs).
+    pub active_layer: u64,
     pan_start: Option<(gpui::Pixels, gpui::Pixels, Camera)>,
     // Canvas grid + snapping (phase 2). The grid size is FIXED
     // (grid::GRID_BASE — not a setting); only visibility and the snap
@@ -307,6 +310,9 @@ impl Editor {
             id: 1,
             name: "Layer 1".into(),
             elements: Vec::new(),
+            visible: true,
+            parent: None,
+            kind: Some(LayerKind::Body),
         });
         Self::from_document(doc)
     }
@@ -314,6 +320,7 @@ impl Editor {
     pub fn from_document(doc: Document) -> Self {
         let settings = doc.settings;
         let next_layer_id = doc.layers.iter().map(|l| l.id + 1).max().unwrap_or(1);
+        let active_layer = doc.layers.first().map(|l| l.id).unwrap_or(1);
         Self {
             doc,
             render_cache: RefCell::new(Default::default()),
@@ -368,6 +375,7 @@ impl Editor {
             alt_down: false,
             dragging: None,
             next_layer_id: next_layer_id.max(2),
+            active_layer,
             pan_start: None,
             show_grid: settings.show_grid,
             snap_to_grid: settings.snap_to_grid,
@@ -422,6 +430,9 @@ impl Editor {
                 .collect();
         } else {
             self.edit_scope = None;
+            // A fillet press staged in Edit must not convert after the
+            // flip (staging is Edit-gated; the flip drops it).
+            self.fillet_press = None;
             // Expand AFTER the flip so the Object gate inside passes.
             let sel = std::mem::take(&mut self.selection);
             self.selection = self.expand_to_islands(&sel);
@@ -1182,6 +1193,7 @@ impl Editor {
             InspectorField::X | InspectorField::Y => if let Ok(v)=raw.parse::<f64>() { let pts=self.doc.selection_points(&self.selection); if let Some(b)=self.doc.bounds_of_points(pts.iter()) { let delta=if field==InspectorField::X { Point2::new(v-b.origin.x,0.) } else { Point2::new(0.,v-b.origin.y) }; self.history_begin(); self.doc.move_points(&pts,delta); self.doc_gen+=1; self.flush_pending_history(); cx.notify(); } },
             InspectorField::Width => if let Ok(v)=raw.parse::<f64>() { self.inspector_scale_selection(Some(v),None,cx); },
             InspectorField::Height => if let Ok(v)=raw.parse::<f64>() { self.inspector_scale_selection(None,Some(v),cx); },
+            InspectorField::LayerName(id) => { let name = raw.trim(); if !name.is_empty() && self.doc.layer(id).is_some() { self.history_begin(); self.doc.rename_layer(id, name); self.doc_gen+=1; self.flush_pending_history(); } cx.notify(); },
         }
     }
 
@@ -2480,26 +2492,40 @@ impl Editor {
         true
     }
 
-    /// Bounding rect of the current selection, if any.
+    /// Bounding rect of the current selection, if any. Hidden elements
+    /// never anchor boxes, buttons, or drag math.
     pub fn selection_bounds(&self) -> Option<Rect> {
         if self.selection.is_empty() {
             return None;
         }
-        let pts = self.doc.selection_points(&self.selection);
-        self.doc.bounds_of_points(&pts)
+        let shown: Vec<ElementRef> =
+            self.selection.iter().copied().filter(|&s| self.doc.element_visible(s)).collect();
+        self.doc.elements_bounds(&shown)
+    }
+
+    /// Object-world box: the selection grown to whole islands, arcs by
+    /// curve extent. The box the canvas draws AND the Edit-button anchor —
+    /// one source so they can never disagree.
+    pub fn object_box(&self) -> Option<Rect> {
+        if self.selection.is_empty() {
+            return None;
+        }
+        let shown: Vec<ElementRef> =
+            self.selection.iter().copied().filter(|&s| self.doc.element_visible(s)).collect();
+        self.doc.elements_bounds(&self.doc.island_elements(&shown))
     }
 
     pub fn zoom_to_fit(&mut self) -> bool {
         let mut acc: Option<Rect> = None;
         for layer in &self.doc.layers {
-            for &el in &layer.elements {
-                let pts = self.doc.element_points(el);
-                if let Some(b) = self.doc.bounds_of_points(&pts) {
-                    acc = Some(match acc {
-                        Some(a) => a.union(&b),
-                        None => b,
-                    });
-                }
+            if !self.doc.layer_effective_visible(layer.id) {
+                continue;
+            }
+            if let Some(b) = self.doc.elements_bounds(&layer.elements) {
+                acc = Some(match acc {
+                    Some(a) => a.union(&b),
+                    None => b,
+                });
             }
         }
         match acc {
@@ -2516,14 +2542,151 @@ impl Editor {
     }
 
     pub fn add_layer(&mut self, name: &str) -> u64 {
+        self.add_layer_at(name, None, LayerKind::Body)
+    }
+
+    /// New layers nest under `parent` (groups are just layers with
+    /// children) and become the active layer for new geometry.
+    pub fn add_layer_at(&mut self, name: &str, parent: Option<u64>, kind: LayerKind) -> u64 {
         let id = self.next_layer_id;
         self.next_layer_id += 1;
         self.doc.layers.push(Layer {
             id,
             name: name.into(),
             elements: Vec::new(),
+            visible: true,
+            parent,
+            kind: Some(kind),
         });
+        self.active_layer = id;
         id
+    }
+
+    /// The layer new geometry lands in: active when it exists, else
+    /// the first layer. Callers must never index `layers[0]` directly
+    /// (deleted/loaded docs go stale).
+    pub fn active_layer_id(&self) -> u64 {
+        if self.doc.layer(self.active_layer).is_some() {
+            self.active_layer
+        } else {
+            self.doc.layers.first().map(|l| l.id).unwrap_or(1)
+        }
+    }
+
+    pub fn rename_layer(&mut self, id: u64, name: &str, cx: &mut gpui::Context<Self>) {
+        let name = name.trim();
+        if name.is_empty() || self.doc.layer(id).is_none() {
+            return;
+        }
+        self.history_begin();
+        self.doc.rename_layer(id, name);
+        self.doc_gen += 1;
+        self.flush_pending_history();
+        cx.notify();
+    }
+
+    pub fn toggle_layer_visible(&mut self, id: u64, cx: &mut gpui::Context<Self>) {
+        let Some(layer) = self.doc.layer(id) else { return };
+        let next = !layer.visible;
+        self.history_begin();
+        self.doc.set_layer_visible(id, next);
+        self.doc_gen += 1;
+        self.flush_pending_history();
+        cx.notify();
+    }
+
+    pub fn move_layer_sibling(&mut self, id: u64, dir: i8, cx: &mut gpui::Context<Self>) {
+        self.history_begin();
+        if self.doc.move_layer(id, dir) {
+            self.doc_gen += 1;
+        }
+        self.flush_pending_history();
+        cx.notify();
+    }
+
+    pub fn indent_layer(&mut self, id: u64, cx: &mut gpui::Context<Self>) {
+        self.history_begin();
+        if self.doc.indent_layer(id) {
+            self.doc_gen += 1;
+        }
+        self.flush_pending_history();
+        cx.notify();
+    }
+
+    pub fn outdent_layer(&mut self, id: u64, cx: &mut gpui::Context<Self>) {
+        self.history_begin();
+        if self.doc.outdent_layer(id) {
+            self.doc_gen += 1;
+        }
+        self.flush_pending_history();
+        cx.notify();
+    }
+
+    /// Splits flat/multi-island layers into one body layer per island
+    /// (shape-named). Geometry ids are stable — only layer records are
+    /// rewritten — so selection/constraints/dims survive untouched.
+    pub fn organize_layers(&mut self, cx: &mut gpui::Context<Self>) {
+        self.history_begin();
+        let next = self.doc.organize_bodies(self.next_layer_id);
+        self.next_layer_id = next.max(self.next_layer_id);
+        if self.doc.layer(self.active_layer).is_none() {
+            self.active_layer = self.doc.layers.first().map(|l| l.id).unwrap_or(1);
+        }
+        self.doc_gen += 1;
+        self.flush_pending_history();
+        cx.notify();
+    }
+
+    /// Deletes the layer subtree: every element dies through the
+    /// standard `delete_element` path (constraints/dims/fillets follow),
+    /// then the records go. The last layer standing refuses to die —
+    /// it is emptied instead so creation always has a home.
+    pub fn delete_layer(&mut self, id: u64, cx: &mut gpui::Context<Self>) {
+        if self.doc.layer(id).is_none() {
+            return;
+        }
+        self.history_begin();
+        if self.doc.layers.len() <= 1 {
+            let els: Vec<ElementRef> =
+                self.doc.layer(id).map(|l| l.elements.clone()).unwrap_or_default();
+            for el in els {
+                self.delete_element(el);
+            }
+            if let Some(layer) = self.doc.layer_mut(id) {
+                layer.elements.clear();
+            }
+        } else {
+            let subtree = self.doc.layer_subtree_ids(id);
+            let mut els = Vec::new();
+            for sid in &subtree {
+                if let Some(layer) = self.doc.layer(*sid) {
+                    els.extend(layer.elements.iter().copied());
+                }
+            }
+            for el in els {
+                self.delete_element(el);
+            }
+            self.doc.remove_layer_records(id);
+            if self.doc.layers.is_empty() {
+                let nid = self.next_layer_id;
+                self.next_layer_id += 1;
+                self.doc.layers.push(Layer {
+                    id: nid,
+                    name: "Layer 1".into(),
+                    elements: Vec::new(),
+                    visible: true,
+                    parent: None,
+                    kind: Some(LayerKind::Body),
+                });
+            }
+        }
+        self.selection.clear();
+        if self.doc.layer(self.active_layer).is_none() {
+            self.active_layer = self.doc.layers.first().map(|l| l.id).unwrap_or(1);
+        }
+        self.doc_gen += 1;
+        self.flush_pending_history();
+        cx.notify();
     }
 
     // Visible region in document units — used for culling before paint.

@@ -60,7 +60,13 @@ impl Editor {
                 // release emulates the consumed click instead. Staging
                 // (rather than grabbing immediately) keeps fill selects,
                 // edge selects, and marquees working near handles.
-                if matches!(self.tool, Tool::Move | Tool::Fillet) {
+                // Fillet handles (center + tangent dots) stage a press here
+                // — Edit-mode only. In Object mode the press falls through
+                // to the island move below: grabbing any fillet point moves
+                // the whole object, never resizes the fillet.
+                if matches!(self.tool, Tool::Move | Tool::Fillet)
+                    && self.interaction_mode != super::InteractionMode::Object
+                {
                     let at = self.cursor_doc(cursor);
                     if let Some(index) = self.fillet_handle_at(at) {
                         self.fillet_press =
@@ -85,7 +91,7 @@ impl Editor {
                         self.creation_cursor = None;
                         let b = pending.bounds();
                         if b.size.w > 0. && b.size.h > 0. {
-                            let layer_id = self.doc.layers[0].id;
+                            let layer_id = self.active_layer_id();
                             let fill = self.create_rectangle(layer_id, b.origin, Point2::new(
                                 b.origin.x + b.size.w,
                                 b.origin.y + b.size.h,
@@ -110,7 +116,7 @@ impl Editor {
                         self.creation_cursor = None;
                         let (_, b) = pending.snapped(shift);
                         if pick::distance(b, pending.start) > 1e-6 {
-                            let layer_id = self.doc.layers[0].id;
+                            let layer_id = self.active_layer_id();
                             let seg = self.create_ruler(layer_id, pending.start, b);
                             self.selection = vec![ElementRef::Segment(seg)];
                         }
@@ -134,7 +140,7 @@ impl Editor {
                         }
                         if pick::distance(b, pending.start) > 1e-6 {
                             self.snap_guides.clear();
-                            let layer_id = self.doc.layers[0].id;
+                            let layer_id = self.active_layer_id();
                             let seg = self.create_line(layer_id, pending.start, b);
                             if let Some((source, _, _)) = self.perpendicular_preview.take() {
                                 self.doc.add_perpendicular_constraint(source, seg);
@@ -168,7 +174,7 @@ impl Editor {
                             self.creation_cursor = None;
                             if let (Some(a), Some(b)) = (pending.a, pending.b) {
                                 let c = pending.cursor;
-                                let layer_id = self.doc.layers[0].id;
+                                let layer_id = self.active_layer_id();
                                 let seg = self.create_arc(layer_id, a, b, c);
                                 self.selection = vec![ElementRef::Segment(seg)];
                             }
@@ -333,6 +339,41 @@ impl Editor {
         let picker = pick::Picker::new(&self.doc, &self.camera, HANDLE_TOL_PX);
         // Shift extends the selection instead of replacing it.
         self.marquee_add = shift;
+
+        // Double-click in Object mode: empty interior enters Edit with the
+        // current selection; a hit narrows a multi-object selection to
+        // that island, or — when the selection already IS that island —
+        // enters Edit. Single clicks never reach here.
+        if click_count >= 2 && self.interaction_mode == super::InteractionMode::Object {
+            let same_elements = |a: &[ElementRef], b: &[ElementRef]| {
+                a.len() == b.len() && a.iter().all(|el| b.contains(el))
+            };
+            let hit = picker
+                .element(p)
+                .and_then(|el| self.edit_pick(el))
+                .filter(|el| self.in_scope_element(*el));
+            match hit {
+                Some(el) => {
+                    let probe = self.expand_to_islands(&[el]);
+                    let cur = self.expand_to_islands(&self.selection);
+                    if same_elements(&probe, &cur) {
+                        self.set_interaction_mode(super::InteractionMode::Edit);
+                    } else {
+                        self.selection = probe;
+                    }
+                    return true;
+                }
+                None => {
+                    if !self.selection.is_empty()
+                        && self.selection_bounds().is_some_and(|b| b.contains(p))
+                    {
+                        self.set_interaction_mode(super::InteractionMode::Edit);
+                        return true;
+                    }
+                    // Outside the box: fall through to normal empty handling.
+                }
+            }
+        }
 
         // Exact hit (tight tolerance) grabs immediately. A TOLERANT-only
         // hit near geometry stays a marquee — the grab zone around
@@ -507,7 +548,19 @@ impl Editor {
                     }
                     cluster
                 };
-                let (drag_pts, aux_pts) = if let Some(pid) = solo_point {
+                let (drag_pts, aux_pts) = if self.interaction_mode == super::InteractionMode::Object {
+                    // Object mode (this fn is Move-only, so the expand gate
+                    // passed): the WHOLE island translates rigidly. Point
+                    // resize, edge stretch, arc kinematics, and fillet
+                    // gestures are Edit-mode-only — grabbing a corner must
+                    // never reshape the object out from under its own box.
+                    let pts = self.doc.selection_points(&self.selection);
+                    let drag = pts
+                        .iter()
+                        .filter_map(|&pid| self.doc.point(pid).map(|pos| (pid, pos)))
+                        .collect();
+                    (drag, Vec::new())
+                } else if let Some(pid) = solo_point {
                     // Arc roles first — they override the generic cluster path:
                     //  - CENTER drag translates the ENTIRE arc rigidly (plus
                     //    any coincident partners glued to the center);
@@ -694,28 +747,58 @@ impl Editor {
                     self.dim_input = None;
                 }
                 // Arc body grabs scale about the fixed center (kinematic);
-                // everything else takes the solver path.
-                let arc_body_scale = match el {
-                    ElementRef::Segment(sid)
-                        if !(self.selection.len() > 1 && self.element_selected(el))
-                            && self
-                                .doc
-                                .segment(sid)
-                                .is_some_and(|s| s.kind == crate::core::document::SegmentKind::Arc) =>
-                    {
-                        Some(sid)
+                // everything else takes the solver path. Never in Object
+                // mode: the island above already moves rigidly by targets.
+                let arc_body_scale = if self.interaction_mode == super::InteractionMode::Object {
+                    None
+                } else {
+                    match el {
+                        ElementRef::Segment(sid)
+                            if !(self.selection.len() > 1 && self.element_selected(el))
+                                && self
+                                    .doc
+                                    .segment(sid)
+                                    .is_some_and(|s| s.kind == crate::core::document::SegmentKind::Arc) =>
+                        {
+                            Some(sid)
+                        }
+                        _ => None,
                     }
-                    _ => None,
                 };
                 self.dragging = Some(DragState {
                     points: drag_pts,
                     aux: aux_pts,
                     start_cursor: p,
                     arc_body_scale,
+                    chase: 1.0,
                 });
                 true
             }
             None => {
+                // Object mode, empty press inside the selection box: the
+                // box IS the object — grab the whole island (a click keeps
+                // the selection; a drag moves it). Band-select starts
+                // outside the box.
+                if self.interaction_mode == super::InteractionMode::Object
+                    && !self.selection.is_empty()
+                    && self.selection_bounds().is_some_and(|b| b.contains(p))
+                {
+                    let grown = self.expand_to_islands(&self.selection);
+                    let drag = self
+                        .doc
+                        .selection_points(&grown)
+                        .into_iter()
+                        .filter_map(|pid| self.doc.point(pid).map(|pos| (pid, pos)))
+                        .collect();
+                    self.dragging = Some(DragState {
+                        points: drag,
+                        aux: Vec::new(),
+                        start_cursor: p,
+                        arc_body_scale: None,
+                        chase: 1.0,
+                    });
+                    return true;
+                }
                 if !shift {
                     self.selection.clear();
                 }
@@ -1429,7 +1512,7 @@ impl Editor {
             self.pending_via_click = true;
             self.snap_guides.clear();
             if pick::distance(b, pending.start) > 1e-6 {
-                let layer_id = self.doc.layers[0].id;
+                let layer_id = self.active_layer_id();
                 let seg = self.create_line(layer_id, pending.start, b);
                 if let Some((source, _, _)) = self.perpendicular_preview.take() {
                     self.doc.add_perpendicular_constraint(source, seg);
@@ -1454,7 +1537,7 @@ impl Editor {
             self.tool = Tool::Move;
             self.creation_cursor = None;
             if pick::distance(b, pending.start) > 1e-6 {
-                let layer_id = self.doc.layers[0].id;
+                let layer_id = self.active_layer_id();
                 let seg = self.create_ruler(layer_id, pending.start, b);
                 self.selection = vec![ElementRef::Segment(seg)];
             }
@@ -1476,7 +1559,7 @@ impl Editor {
         self.tool = Tool::Move;
         self.creation_cursor = None;
         if b.size.w > 0. && b.size.h > 0. {
-            let layer_id = self.doc.layers[0].id;
+            let layer_id = self.active_layer_id();
             let fill = self.create_rectangle(
                 layer_id,
                 b.origin,
@@ -1485,5 +1568,80 @@ impl Editor {
             self.selection = vec![ElementRef::Fill(fill)];
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::editor::InteractionMode;
+
+    fn point_by_pos(ed: &Editor, x: f64, y: f64) -> PointId {
+        ed.doc
+            .all_points()
+            .find(|(_, p)| (p.x - x).abs() < 1e-6 && (p.y - y).abs() < 1e-6)
+            .map(|(id, _)| id)
+            .expect("point not found")
+    }
+
+    fn drag_ids(ed: &Editor) -> Vec<PointId> {
+        ed.dragging
+            .as_ref()
+            .expect("drag started")
+            .points
+            .iter()
+            .map(|&(id, _)| id)
+            .collect()
+    }
+
+    fn rect_corner_ids(ed: &Editor) -> Vec<PointId> {
+        [(0., 0.), (100., 0.), (100., 100.), (0., 100.)]
+            .into_iter()
+            .map(|(x, y)| point_by_pos(ed, x, y))
+            .collect()
+    }
+
+    /// Object mode: pressing a CORNER drags the whole island rigidly,
+    /// never a solo point resize.
+    #[test]
+    fn object_mode_point_press_moves_whole_island() {
+        let mut ed = Editor::new();
+        assert_eq!(ed.interaction_mode, InteractionMode::Object);
+        assert_eq!(ed.tool, Tool::Move);
+        ed.create_rectangle(1, Point2::new(0., 0.), Point2::new(100., 100.));
+        assert!(ed.move_tool_down(gpui::point(gpui::px(0.), gpui::px(0.)), false, 1));
+        let mut got = drag_ids(&ed);
+        let mut want = rect_corner_ids(&ed);
+        got.sort_by_key(|id| (id.idx, id.generation));
+        want.sort_by_key(|id| (id.idx, id.generation));
+        assert_eq!(got, want, "whole island, not the corner");
+        assert!(ed.dragging.as_ref().unwrap().aux.is_empty());
+    }
+
+    /// Object mode: pressing an EDGE drags the whole island rigidly,
+    /// never an edge stretch.
+    #[test]
+    fn object_mode_edge_press_moves_whole_island() {
+        let mut ed = Editor::new();
+        ed.create_rectangle(1, Point2::new(0., 0.), Point2::new(100., 100.));
+        assert!(ed.move_tool_down(gpui::point(gpui::px(50.), gpui::px(0.)), false, 1));
+        let mut got = drag_ids(&ed);
+        let mut want = rect_corner_ids(&ed);
+        got.sort_by_key(|id| (id.idx, id.generation));
+        want.sort_by_key(|id| (id.idx, id.generation));
+        assert_eq!(got, want, "whole island, not the edge");
+        assert!(ed.dragging.as_ref().unwrap().aux.is_empty());
+    }
+
+    /// Edit mode keeps the old grab semantics: a corner press resizes
+    /// just that corner (control case for the two tests above).
+    #[test]
+    fn edit_mode_point_press_resizes_corner() {
+        let mut ed = Editor::new();
+        ed.interaction_mode = InteractionMode::Edit;
+        ed.create_rectangle(1, Point2::new(0., 0.), Point2::new(100., 100.));
+        let tl = point_by_pos(&ed, 0., 0.);
+        assert!(ed.move_tool_down(gpui::point(gpui::px(0.), gpui::px(0.)), false, 1));
+        assert_eq!(drag_ids(&ed), vec![tl]);
     }
 }

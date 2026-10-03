@@ -898,7 +898,8 @@ impl Editor {
             // Fillet-adjacent tangency is owned end-to-end by the solver
             // equations plus refresh_fillets: rotating the line here would
             // fight H/V locks and read as slant on constrained sketches.
-            // (Either side being fillet-linked is enough to skip.)
+            // (Either side being fillet-linked is enough to skip.) Locked
+            // read-only by fillet_tangency_postpass_is_readonly.
             if self.doc.modifiers.iter().any(|m| {
                 m.arc == Some(arc_id) || m.first == line_id || m.second == line_id
             }) {

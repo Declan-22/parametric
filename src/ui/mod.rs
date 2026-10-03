@@ -5,6 +5,7 @@ pub mod ctxmenu;
 pub mod floating_menu;
 pub mod home;
 pub mod inspector;
+pub mod layers;
 pub mod menu;
 pub mod modebar;
 pub mod shell;

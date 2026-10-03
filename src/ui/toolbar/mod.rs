@@ -132,10 +132,12 @@ impl RenderOnce for Toolbar {
             .unwrap_or(Tool::Move);
 
         div()
-            // Single column, flush against the far-left edge, from below
-            // the second topbar to the bottom of the canvas area.
+            // Single column hugging the layers panel's right edge: far-left
+            // when the panel is closed, riding the slide while it opens.
+            // (Same smoothstepped tween the panel reads — rail and panel
+            // share an edge every frame, never overlap.)
             .absolute()
-            .left_0()
+            .left(px(crate::ui::layers::LAYERS_WIDTH * panel_ease(cx, &self.shell)))
             .top(px(crate::ui::modebar::MODEBAR_HEIGHT))
             .bottom_0()
             .flex()
@@ -275,8 +277,17 @@ impl Toolbar {
     }
 }
 
-fn divider(t: Theme) -> impl IntoElement {
-    // Horizontal divider for the vertical rail.
+// Layers-panel slide progress, smoothstepped exactly like the panel:
+// the rail shares the panel's right edge every frame of the tween.
+fn panel_ease(cx: &gpui::App, shell: &gpui::WeakEntity<crate::ui::shell::Shell>) -> f32 {
+    let k = shell
+        .upgrade()
+        .map(|s| s.read(cx).fade("layers-panel"))
+        .unwrap_or(1.0);
+    k * k * (3.0 - 2.0 * k)
+}
+
+fn divider(t: Theme) -> impl IntoElement {    // Horizontal divider for the vertical rail.
     div()
         .h(px(2.))
         .w(px(20.))
